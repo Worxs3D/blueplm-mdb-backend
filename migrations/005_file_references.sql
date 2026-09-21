@@ -1,0 +1,21 @@
+CREATE TABLE IF NOT EXISTS file_references (
+  id CHAR(36) NOT NULL PRIMARY KEY,
+  organization_id CHAR(36) NOT NULL,
+  vault_id CHAR(36) NOT NULL,
+  parent_file_id CHAR(36) NOT NULL,
+  child_file_id CHAR(36) NOT NULL,
+  reference_type ENUM('component', 'derived', 'reference') NOT NULL DEFAULT 'component',
+  quantity DECIMAL(18,6) NOT NULL DEFAULT 1,
+  configuration VARCHAR(255) NOT NULL DEFAULT '',
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  UNIQUE KEY uq_file_reference (parent_file_id, child_file_id, configuration),
+  KEY idx_file_reference_child (child_file_id),
+  KEY idx_file_reference_vault_parent (vault_id, parent_file_id),
+  CONSTRAINT fk_file_reference_organization FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE,
+  CONSTRAINT fk_file_reference_vault FOREIGN KEY (vault_id) REFERENCES vaults(id) ON DELETE CASCADE,
+  CONSTRAINT fk_file_reference_parent FOREIGN KEY (parent_file_id) REFERENCES files(id) ON DELETE CASCADE,
+  CONSTRAINT fk_file_reference_child FOREIGN KEY (child_file_id) REFERENCES files(id) ON DELETE CASCADE,
+  CONSTRAINT chk_file_reference_no_self CHECK (parent_file_id <> child_file_id),
+  CONSTRAINT chk_file_reference_quantity CHECK (quantity > 0)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

@@ -1,0 +1,181 @@
+-- Workflow domain.  This is intentionally a separate migration: an existing
+-- Community installation that already applied 001_init.sql gains the workflow
+-- tables on the next backend start without rebuilding its MariaDB volume.
+
+CREATE TABLE IF NOT EXISTS workflow_templates (
+  id CHAR(36) NOT NULL PRIMARY KEY,
+  organization_id CHAR(36) NOT NULL,
+  name VARCHAR(200) NOT NULL,
+  description TEXT NULL,
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  is_default BOOLEAN NOT NULL DEFAULT FALSE,
+  canvas_config JSON NULL,
+  created_by CHAR(36) NOT NULL,
+  updated_by CHAR(36) NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  UNIQUE KEY uq_workflow_name (organization_id, name),
+  INDEX idx_workflow_templates_active (organization_id, is_active, is_default),
+  CONSTRAINT fk_workflow_template_organization FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE,
+  CONSTRAINT fk_workflow_template_creator FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE RESTRICT,
+  CONSTRAINT fk_workflow_template_updater FOREIGN KEY (updated_by) REFERENCES users(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS workflow_states (
+  id CHAR(36) NOT NULL PRIMARY KEY,
+  workflow_id CHAR(36) NOT NULL,
+  name VARCHAR(200) NOT NULL,
+  label VARCHAR(200) NULL,
+  description TEXT NULL,
+  state_type ENUM('state', 'gate') NOT NULL DEFAULT 'state',
+  shape ENUM('rectangle', 'diamond', 'hexagon', 'ellipse') NOT NULL DEFAULT 'rectangle',
+  color VARCHAR(32) NOT NULL DEFAULT '#6B7280',
+  fill_opacity DECIMAL(4,3) NOT NULL DEFAULT 1,
+  border_color VARCHAR(32) NULL,
+  border_opacity DECIMAL(4,3) NOT NULL DEFAULT 1,
+  border_thickness DECIMAL(6,2) NOT NULL DEFAULT 2,
+  corner_radius DECIMAL(6,2) NOT NULL DEFAULT 8,
+  icon VARCHAR(100) NOT NULL DEFAULT 'circle',
+  position_x DECIMAL(12,3) NOT NULL DEFAULT 0,
+  position_y DECIMAL(12,3) NOT NULL DEFAULT 0,
+  width DECIMAL(12,3) NOT NULL DEFAULT 120,
+  height DECIMAL(12,3) NOT NULL DEFAULT 60,
+  is_editable BOOLEAN NOT NULL DEFAULT TRUE,
+  requires_checkout BOOLEAN NOT NULL DEFAULT TRUE,
+  auto_increment_revision BOOLEAN NOT NULL DEFAULT FALSE,
+  triggers_review BOOLEAN NOT NULL DEFAULT FALSE,
+  required_workflow_roles JSON NULL,
+  gate_config JSON NULL,
+  sort_order INT NOT NULL DEFAULT 0,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  UNIQUE KEY uq_workflow_state_name (workflow_id, name),
+  INDEX idx_workflow_states_order (workflow_id, sort_order),
+  CONSTRAINT fk_workflow_state_template FOREIGN KEY (workflow_id) REFERENCES workflow_templates(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS workflow_transitions (
+  id CHAR(36) NOT NULL PRIMARY KEY,
+  workflow_id CHAR(36) NOT NULL,
+  from_state_id CHAR(36) NOT NULL,
+  to_state_id CHAR(36) NOT NULL,
+  name VARCHAR(200) NULL,
+  description TEXT NULL,
+  allowed_workflow_roles JSON NULL,
+  auto_conditions JSON NULL,
+  line_style ENUM('solid', 'dashed', 'dotted') NOT NULL DEFAULT 'solid',
+  line_color VARCHAR(32) NULL,
+  line_path_type ENUM('straight', 'spline', 'elbow') NOT NULL DEFAULT 'spline',
+  line_arrow_head ENUM('none', 'end', 'start', 'both') NOT NULL DEFAULT 'end',
+  line_thickness DECIMAL(6,2) NULL DEFAULT 2,
+  start_edge ENUM('left', 'right', 'top', 'bottom') NULL,
+  start_fraction DECIMAL(4,3) NULL,
+  end_edge ENUM('left', 'right', 'top', 'bottom') NULL,
+  end_fraction DECIMAL(4,3) NULL,
+  waypoints JSON NOT NULL,
+  label_offset JSON NULL,
+  label_pinned JSON NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  INDEX idx_workflow_transitions_source (workflow_id, from_state_id),
+  CONSTRAINT fk_workflow_transition_template FOREIGN KEY (workflow_id) REFERENCES workflow_templates(id) ON DELETE CASCADE,
+  CONSTRAINT fk_workflow_transition_from_state FOREIGN KEY (from_state_id) REFERENCES workflow_states(id) ON DELETE CASCADE,
+  CONSTRAINT fk_workflow_transition_to_state FOREIGN KEY (to_state_id) REFERENCES workflow_states(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS workflow_gates (
+  id CHAR(36) NOT NULL PRIMARY KEY,
+  transition_id CHAR(36) NOT NULL,
+  name VARCHAR(200) NOT NULL,
+  description TEXT NULL,
+  gate_type ENUM('approval', 'checklist', 'condition') NOT NULL DEFAULT 'approval',
+  approval_mode ENUM('any', 'all', 'majority') NOT NULL DEFAULT 'any',
+  required_approvals INT UNSIGNED NOT NULL DEFAULT 1,
+  checklist_items JSON NULL,
+  conditions JSON NULL,
+  is_blocking BOOLEAN NOT NULL DEFAULT TRUE,
+  can_be_skipped_by JSON NULL,
+  sort_order INT NOT NULL DEFAULT 0,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  INDEX idx_workflow_gates_transition (transition_id, sort_order),
+  CONSTRAINT fk_workflow_gate_transition FOREIGN KEY (transition_id) REFERENCES workflow_transitions(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS workflow_gate_reviewers (
+  id CHAR(36) NOT NULL PRIMARY KEY,
+  gate_id CHAR(36) NOT NULL,
+  reviewer_type ENUM('user', 'role', 'group', 'workflow_role') NOT NULL,
+  user_id CHAR(36) NULL,
+  role ENUM('admin', 'engineer', 'viewer') NULL,
+  group_name VARCHAR(200) NULL,
+  workflow_role_id CHAR(36) NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  INDEX idx_gate_reviewer_gate (gate_id),
+  INDEX idx_gate_reviewer_user (user_id),
+  CONSTRAINT fk_gate_reviewer_gate FOREIGN KEY (gate_id) REFERENCES workflow_gates(id) ON DELETE CASCADE,
+  CONSTRAINT fk_gate_reviewer_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS file_workflow_assignments (
+  id CHAR(36) NOT NULL PRIMARY KEY,
+  file_id CHAR(36) NOT NULL,
+  workflow_id CHAR(36) NOT NULL,
+  current_state_id CHAR(36) NOT NULL,
+  assigned_by CHAR(36) NOT NULL,
+  assigned_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  UNIQUE KEY uq_file_workflow_assignment (file_id),
+  INDEX idx_file_workflow_state (workflow_id, current_state_id),
+  CONSTRAINT fk_file_workflow_assignment_file FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
+  CONSTRAINT fk_file_workflow_assignment_workflow FOREIGN KEY (workflow_id) REFERENCES workflow_templates(id) ON DELETE RESTRICT,
+  CONSTRAINT fk_file_workflow_assignment_state FOREIGN KEY (current_state_id) REFERENCES workflow_states(id) ON DELETE RESTRICT,
+  CONSTRAINT fk_file_workflow_assignment_assigner FOREIGN KEY (assigned_by) REFERENCES users(id) ON DELETE RESTRICT
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS pending_reviews (
+  id CHAR(36) NOT NULL PRIMARY KEY,
+  organization_id CHAR(36) NOT NULL,
+  file_id CHAR(36) NOT NULL,
+  transition_id CHAR(36) NOT NULL,
+  gate_id CHAR(36) NOT NULL,
+  requested_by CHAR(36) NOT NULL,
+  assigned_to CHAR(36) NULL,
+  status ENUM('pending', 'approved', 'rejected', 'cancelled', 'kicked_back') NOT NULL DEFAULT 'pending',
+  review_comment TEXT NULL,
+  checklist_responses JSON NULL,
+  requested_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  reviewed_at DATETIME(3) NULL,
+  reviewed_by CHAR(36) NULL,
+  expires_at DATETIME(3) NULL,
+  UNIQUE KEY uq_pending_review_assignee (file_id, transition_id, gate_id, assigned_to),
+  INDEX idx_pending_reviews_assignee (organization_id, assigned_to, status, requested_at),
+  INDEX idx_pending_reviews_transition (file_id, transition_id, status),
+  CONSTRAINT fk_pending_review_organization FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE,
+  CONSTRAINT fk_pending_review_file FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
+  CONSTRAINT fk_pending_review_transition FOREIGN KEY (transition_id) REFERENCES workflow_transitions(id) ON DELETE CASCADE,
+  CONSTRAINT fk_pending_review_gate FOREIGN KEY (gate_id) REFERENCES workflow_gates(id) ON DELETE CASCADE,
+  CONSTRAINT fk_pending_review_requester FOREIGN KEY (requested_by) REFERENCES users(id) ON DELETE RESTRICT,
+  CONSTRAINT fk_pending_review_assignee FOREIGN KEY (assigned_to) REFERENCES users(id) ON DELETE SET NULL,
+  CONSTRAINT fk_pending_review_reviewer FOREIGN KEY (reviewed_by) REFERENCES users(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS workflow_history (
+  id CHAR(36) NOT NULL PRIMARY KEY,
+  organization_id CHAR(36) NOT NULL,
+  file_id CHAR(36) NOT NULL,
+  workflow_id CHAR(36) NOT NULL,
+  transition_id CHAR(36) NULL,
+  from_state_id CHAR(36) NULL,
+  to_state_id CHAR(36) NULL,
+  performed_by CHAR(36) NULL,
+  comment TEXT NULL,
+  approvals_data JSON NULL,
+  revision_before INT UNSIGNED NULL,
+  revision_after INT UNSIGNED NULL,
+  performed_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  INDEX idx_workflow_history_file (file_id, performed_at),
+  CONSTRAINT fk_workflow_history_organization FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE,
+  CONSTRAINT fk_workflow_history_file FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
+  CONSTRAINT fk_workflow_history_workflow FOREIGN KEY (workflow_id) REFERENCES workflow_templates(id) ON DELETE RESTRICT,
+  CONSTRAINT fk_workflow_history_transition FOREIGN KEY (transition_id) REFERENCES workflow_transitions(id) ON DELETE SET NULL,
+  CONSTRAINT fk_workflow_history_from_state FOREIGN KEY (from_state_id) REFERENCES workflow_states(id) ON DELETE SET NULL,
+  CONSTRAINT fk_workflow_history_to_state FOREIGN KEY (to_state_id) REFERENCES workflow_states(id) ON DELETE SET NULL,
+  CONSTRAINT fk_workflow_history_actor FOREIGN KEY (performed_by) REFERENCES users(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

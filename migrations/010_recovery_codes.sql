@@ -1,0 +1,22 @@
+CREATE TABLE IF NOT EXISTS admin_recovery_codes (
+  id CHAR(36) NOT NULL PRIMARY KEY,
+  organization_id CHAR(36) NOT NULL,
+  code_hash CHAR(64) NOT NULL,
+  description VARCHAR(1024) NULL,
+  created_by CHAR(36) NOT NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  expires_at DATETIME(3) NOT NULL,
+  is_used BOOLEAN NOT NULL DEFAULT FALSE,
+  used_by CHAR(36) NULL,
+  used_at DATETIME(3) NULL,
+  is_revoked BOOLEAN NOT NULL DEFAULT FALSE,
+  revoked_by CHAR(36) NULL,
+  revoked_at DATETIME(3) NULL,
+  revoke_reason VARCHAR(1024) NULL,
+  UNIQUE KEY uq_recovery_code_hash (organization_id, code_hash),
+  KEY idx_recovery_codes_organization (organization_id, created_at),
+  CONSTRAINT fk_recovery_codes_organization FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE,
+  CONSTRAINT fk_recovery_codes_creator FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE RESTRICT,
+  CONSTRAINT fk_recovery_codes_used_by FOREIGN KEY (used_by) REFERENCES users(id) ON DELETE SET NULL,
+  CONSTRAINT fk_recovery_codes_revoked_by FOREIGN KEY (revoked_by) REFERENCES users(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

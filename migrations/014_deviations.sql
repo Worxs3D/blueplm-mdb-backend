@@ -1,0 +1,41 @@
+CREATE TABLE IF NOT EXISTS deviations (
+  id CHAR(36) NOT NULL PRIMARY KEY,
+  organization_id CHAR(36) NOT NULL,
+  deviation_number VARCHAR(128) NOT NULL,
+  title VARCHAR(512) NOT NULL,
+  description TEXT NULL,
+  status ENUM('draft','pending_approval','approved','rejected','closed','expired') NOT NULL DEFAULT 'draft',
+  deviation_type VARCHAR(128) NULL,
+  effective_date DATE NULL,
+  expiration_date DATE NULL,
+  approved_by CHAR(36) NULL,
+  approved_at DATETIME(3) NULL,
+  rejection_reason TEXT NULL,
+  affected_part_numbers JSON NULL,
+  created_by CHAR(36) NOT NULL,
+  updated_by CHAR(36) NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  UNIQUE KEY uq_deviations_org_number (organization_id, deviation_number),
+  KEY idx_deviations_org_status (organization_id, status),
+  CONSTRAINT fk_deviation_org FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE,
+  CONSTRAINT fk_deviation_creator FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE RESTRICT,
+  CONSTRAINT fk_deviation_updater FOREIGN KEY (updated_by) REFERENCES users(id) ON DELETE SET NULL,
+  CONSTRAINT fk_deviation_approver FOREIGN KEY (approved_by) REFERENCES users(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS file_deviations (
+  id CHAR(36) NOT NULL PRIMARY KEY,
+  file_id CHAR(36) NOT NULL,
+  deviation_id CHAR(36) NOT NULL,
+  file_version INT NULL,
+  file_revision VARCHAR(64) NULL,
+  notes TEXT NULL,
+  created_by CHAR(36) NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  UNIQUE KEY uq_file_deviation (file_id, deviation_id),
+  KEY idx_file_deviations_deviation (deviation_id),
+  CONSTRAINT fk_file_deviation_file FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
+  CONSTRAINT fk_file_deviation_deviation FOREIGN KEY (deviation_id) REFERENCES deviations(id) ON DELETE CASCADE,
+  CONSTRAINT fk_file_deviation_creator FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
