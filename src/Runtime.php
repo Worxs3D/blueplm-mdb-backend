@@ -212,7 +212,7 @@ final class Runtime
         // the opaque token; both runtimes persist this derived hash.
         $hash = hash('sha256', $secret . ':' . $matches[1]);
         $query = $db->prepare(
-            'SELECT s.user_id AS userId, s.organization_id AS organizationId, u.email, u.display_name AS displayName, m.role
+            'SELECT s.user_id AS userId, s.organization_id AS organizationId, u.email, u.display_name AS displayName, m.role, u.created_at AS createdAt
              FROM sessions s JOIN users u ON u.id = s.user_id
              JOIN organization_memberships m ON m.user_id = s.user_id AND m.organization_id = s.organization_id
              WHERE s.token_hash = ? AND s.expires_at > UTC_TIMESTAMP(3) AND u.disabled_at IS NULL'
