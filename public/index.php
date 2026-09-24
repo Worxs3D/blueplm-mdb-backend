@@ -380,6 +380,104 @@ try {
         } catch (Throwable $error) { if ($db->inTransaction()) $db->rollBack(); throw $error; }
         Runtime::respond(204);
     }
+    if ($method === 'GET' && preg_match('#^/users/([0-9a-f-]{36})/vault-access$#i', $path, $matches)) {
+        $targetId = $matches[1];
+        if ($targetId !== $principal['userId'] && !in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $member = $db->prepare('SELECT 1 FROM organization_memberships WHERE organization_id = ? AND user_id = ?');
+        $member->execute([$principal['organizationId'], $targetId]);
+        if (!$member->fetch()) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'User not found.']);
+        $query = $db->prepare('SELECT va.vault_id FROM vault_access va JOIN vaults v ON v.id = va.vault_id WHERE va.user_id = ? AND v.organization_id = ? ORDER BY va.vault_id');
+        $query->execute([$targetId, $principal['organizationId']]);
+        Runtime::respond(200, ['vaultIds' => array_column($query->fetchAll(), 'vault_id')]);
+    }
+    if ($method === 'PUT' && preg_match('#^/users/([0-9a-f-]{36})/vault-access$#i', $path, $matches)) {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $targetId = $matches[1];
+        $body = Runtime::jsonBody();
+        $vaultIds = $body['vaultIds'] ?? null;
+        if (!is_array($vaultIds) || count($vaultIds) > 500 || count(array_filter($vaultIds, static fn($id) => !is_string($id) || !preg_match('/^[0-9a-f-]{36}$/i', $id))) > 0) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'vaultIds must be an array of valid IDs.']);
+        $vaultIds = array_values(array_unique($vaultIds));
+        $member = $db->prepare('SELECT 1 FROM organization_memberships WHERE organization_id = ? AND user_id = ?');
+        $member->execute([$principal['organizationId'], $targetId]);
+        if (!$member->fetch()) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'User not found.']);
+        if ($vaultIds !== []) {
+            $placeholders = implode(',', array_fill(0, count($vaultIds), '?'));
+            $vaults = $db->prepare("SELECT COUNT(*) FROM vaults WHERE organization_id = ? AND id IN ($placeholders)");
+            $vaults->execute([$principal['organizationId'], ...$vaultIds]);
+            if ((int)$vaults->fetchColumn() !== count($vaultIds)) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'One or more vaults were not found.']);
+        }
+        $db->beginTransaction();
+        try {
+            $db->prepare('DELETE va FROM vault_access va JOIN vaults v ON v.id = va.vault_id WHERE va.user_id = ? AND v.organization_id = ?')->execute([$targetId, $principal['organizationId']]);
+            $insert = $db->prepare('INSERT INTO vault_access (vault_id, user_id, granted_by) VALUES (?, ?, ?)');
+            foreach ($vaultIds as $vaultId) $insert->execute([$vaultId, $targetId, $principal['userId']]);
+            Runtime::emitEvent($db, $principal['organizationId'], 'user.vault_access_updated', $targetId, ['userId' => $targetId, 'updatedBy' => $principal['userId']]);
+            $db->commit();
+        } catch (Throwable $error) {
+            if ($db->inTransaction()) $db->rollBack();
+            throw $error;
+        }
+        Runtime::respond(200, ['success' => true]);
+    }
+    if ($method === 'GET' && $path === '/vaults/access') {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $query = $db->prepare('SELECT va.user_id, va.vault_id FROM vault_access va JOIN vaults v ON v.id = va.vault_id JOIN organization_memberships m ON m.user_id = va.user_id AND m.organization_id = v.organization_id WHERE v.organization_id = ? ORDER BY va.user_id, va.vault_id');
+        $query->execute([$principal['organizationId']]);
+        $accessMap = [];
+        foreach ($query->fetchAll() as $grant) $accessMap[$grant['user_id']][] = $grant['vault_id'];
+        Runtime::respond(200, ['accessMap' => $accessMap]);
+    }
+    if ($method === 'GET' && preg_match('#^/users/([0-9a-f-]{36})/permissions$#i', $path, $matches)) {
+        $targetId = $matches[1];
+        if ($targetId !== $principal['userId'] && !in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $member = $db->prepare('SELECT 1 FROM organization_memberships WHERE organization_id = ? AND user_id = ?');
+        $member->execute([$principal['organizationId'], $targetId]);
+        if (!$member->fetch()) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'User not found.']);
+        $vaultId = is_string($_GET['vaultId'] ?? null) && $_GET['vaultId'] !== '' ? $_GET['vaultId'] : null;
+        if ($vaultId !== null && !preg_match('/^[0-9a-f-]{36}$/i', $vaultId)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'vaultId must be a valid ID.']);
+        $query = $db->prepare('SELECT resource, actions FROM user_permissions WHERE organization_id = ? AND user_id = ? AND vault_id <=> ? ORDER BY resource');
+        $query->execute([$principal['organizationId'], $targetId, $vaultId]);
+        $permissions = [];
+        foreach ($query->fetchAll() as $permission) $permissions[] = ['resource' => $permission['resource'], 'actions' => json_decode($permission['actions'], true, 16, JSON_THROW_ON_ERROR)];
+        Runtime::respond(200, ['permissions' => $permissions]);
+    }
+    if ($method === 'PUT' && preg_match('#^/users/([0-9a-f-]{36})/permissions$#i', $path, $matches)) {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $targetId = $matches[1];
+        $body = Runtime::jsonBody();
+        $vaultId = is_string($body['vaultId'] ?? null) && $body['vaultId'] !== '' ? $body['vaultId'] : null;
+        $permissionMap = $body['permissions'] ?? null;
+        if ($vaultId !== null && !preg_match('/^[0-9a-f-]{36}$/i', $vaultId)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'vaultId must be a valid ID.']);
+        if (!is_array($permissionMap) || count($permissionMap) > 200) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'permissions must be an object.']);
+        $allowedActions = ['view', 'create', 'edit', 'delete', 'admin'];
+        $normalized = [];
+        foreach ($permissionMap as $resource => $actions) {
+            if (!is_string($resource) || !preg_match('/^[A-Za-z0-9_.:-]{1,200}$/', $resource) || !is_array($actions) || count($actions) > count($allowedActions)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Each permission requires a valid resource and action array.']);
+            $actions = array_values(array_unique($actions));
+            if (count(array_filter($actions, static fn($action) => !is_string($action) || !in_array($action, $allowedActions, true))) > 0) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A permission contains an unsupported action.']);
+            if ($actions !== []) $normalized[$resource] = $actions;
+        }
+        $member = $db->prepare('SELECT 1 FROM organization_memberships WHERE organization_id = ? AND user_id = ?');
+        $member->execute([$principal['organizationId'], $targetId]);
+        if (!$member->fetch()) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'User not found.']);
+        if ($vaultId !== null) {
+            $vault = $db->prepare('SELECT 1 FROM vaults WHERE organization_id = ? AND id = ?');
+            $vault->execute([$principal['organizationId'], $vaultId]);
+            if (!$vault->fetch()) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Vault not found.']);
+        }
+        $db->beginTransaction();
+        try {
+            $db->prepare('DELETE FROM user_permissions WHERE organization_id = ? AND user_id = ? AND vault_id <=> ?')->execute([$principal['organizationId'], $targetId, $vaultId]);
+            $insert = $db->prepare('INSERT INTO user_permissions (id, organization_id, user_id, resource, vault_id, actions, granted_by) VALUES (?, ?, ?, ?, ?, ?, ?)');
+            foreach ($normalized as $resource => $actions) $insert->execute([Runtime::uuid(), $principal['organizationId'], $targetId, $resource, $vaultId, json_encode($actions, JSON_THROW_ON_ERROR), $principal['userId']]);
+            Runtime::emitEvent($db, $principal['organizationId'], 'user.permissions_updated', $targetId, ['userId' => $targetId, 'vaultId' => $vaultId, 'updatedBy' => $principal['userId']]);
+            $db->commit();
+        } catch (Throwable $error) {
+            if ($db->inTransaction()) $db->rollBack();
+            throw $error;
+        }
+        Runtime::respond(200, ['success' => true]);
+    }
     // Team management is a first-class Community API. Keep its response names
     // aligned with src/lib/community.ts so the desktop client never needs a
     // Supabase fallback when MariaDB is selected.
