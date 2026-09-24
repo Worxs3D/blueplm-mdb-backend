@@ -25,6 +25,7 @@ services:
       BLUEPLM_SESSION_SECRET: test-session-secret-must-be-at-least-thirty-two-characters
       BLUEPLM_BOOTSTRAP_TOKEN: integration-bootstrap-token-must-be-at-least-32-chars
       BLUEPLM_MAINTENANCE_TOKEN: integration-maintenance-token-must-be-at-least-32-chars
+      BLUEPLM_INSTALLATION_TOKEN: integration-installation-token-must-be-at-least-32-chars
       BLUEPLM_CORS_ORIGINS: null,file://,http://localhost:5173
     ports:
       - "18080:80"

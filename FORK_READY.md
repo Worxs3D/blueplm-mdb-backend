@@ -1,13 +1,22 @@
-# BluePLM MDB – fork-ready design
+# BluePLM MDB portability constraints
 
-This package is intentionally portable:
+This package is intentionally provider-neutral and suitable for public review:
 
-- The runtime contains no hosting provider URL, customer name, FTP credential, or database secret.
-- `public/setup/` is a one-time server bootstrap. It creates organization, owner, optional TOTP authenticator protection, and network-vault metadata after validating a token held only in the private environment file.
-- The desktop client receives only the public HTTPS endpoint. Database credentials and bootstrap secrets never leave the server/deployment machine.
-- Network-vault paths are metadata. Each Windows client owns its connection credentials through Windows Credential Manager.
-- `scripts/deploy-allinkl.mjs` is an optional All-Inkl deployment adapter; it obtains the target URL from `BLUEPLM_PUBLIC_URL` instead of hard-coding a deployment.
+- No hosting-provider URL, customer name, FTP credential, database credential,
+  token, or private network address is committed.
+- Initial setup and administration are part of the BluePLM desktop app. PHP
+  exposes only authenticated JSON endpoints; browser setup/admin pages return
+  `404`.
+- The desktop installer uses FTPS, inspects the selected MariaDB database, and
+  requires an explicit operator choice before migrating or deleting data.
+- The live `.env` is never overwritten during inspection. A short-lived
+  `.env.install` is promoted only after a successful new installation.
+- The desktop client receives only the public HTTPS endpoint and an opaque
+  session token. MariaDB and deployment credentials remain server-side.
+- Network-vault paths are metadata. User credentials remain in the operating
+  system credential store and are never passed on a command line.
+- No affiliate or referral links are included.
 
-Forks should keep the `Installation` and `Totp` modules provider-neutral and add host-specific upload tooling only as separate scripts.
-
-The setup page can show an explicitly labelled, optional ALL-INKL affiliate link. It does not make ALL-INKL a dependency: any suitable PHP/MariaDB host remains supported.
+Host-specific upload helpers must remain separate from the provider-neutral API.
+Google Drive is intentionally outside this network-vault contribution and can
+be proposed separately after productive testing.

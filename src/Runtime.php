@@ -106,12 +106,17 @@ final class Runtime
         $vault = $query->fetch();
         if (!$vault) self::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Vault not found.']);
         if (in_array($principal['role'], ['owner', 'admin'], true)) return $vault;
-        $access = $db->prepare(
-            'SELECT 1 FROM vault_access a WHERE a.vault_id = ? AND a.user_id = ?
-             UNION SELECT 1 FROM team_vault_access a JOIN team_members m ON m.team_id = a.team_id
-             WHERE a.vault_id = ? AND m.user_id = ? LIMIT 1'
-        );
-        $access->execute([$vaultId, $principal['userId'], $vaultId, $principal['userId']]);
+        if ($principal['role'] === 'guest') {
+            $access = $db->prepare('SELECT 1 FROM vault_access WHERE vault_id = ? AND user_id = ? LIMIT 1');
+            $access->execute([$vaultId, $principal['userId']]);
+        } else {
+            $access = $db->prepare(
+                'SELECT 1 FROM vault_access a WHERE a.vault_id = ? AND a.user_id = ?
+                 UNION SELECT 1 FROM team_vault_access a JOIN team_members m ON m.team_id = a.team_id
+                 WHERE a.vault_id = ? AND m.user_id = ? LIMIT 1'
+            );
+            $access->execute([$vaultId, $principal['userId'], $vaultId, $principal['userId']]);
+        }
         if (!$access->fetchColumn()) self::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Vault not found.']);
         return $vault;
     }
@@ -212,7 +217,7 @@ final class Runtime
         // the opaque token; both runtimes persist this derived hash.
         $hash = hash('sha256', $secret . ':' . $matches[1]);
         $query = $db->prepare(
-            'SELECT s.user_id AS userId, s.organization_id AS organizationId, u.email, u.display_name AS displayName, m.role
+            'SELECT s.user_id AS userId, s.organization_id AS organizationId, u.email, u.display_name AS displayName, m.role, u.created_at AS createdAt
              FROM sessions s JOIN users u ON u.id = s.user_id
              JOIN organization_memberships m ON m.user_id = s.user_id AND m.organization_id = s.organization_id
              WHERE s.token_hash = ? AND s.expires_at > UTC_TIMESTAMP(3) AND u.disabled_at IS NULL'
