@@ -123,8 +123,8 @@ final class Installation
             $db->prepare('INSERT INTO organization_settings (organization_id) VALUES (?)')->execute([$organizationId]);
             if ($vaultName !== '') {
                 $vaultId = Runtime::uuid();
-                $db->prepare('INSERT INTO vaults (id, organization_id, name, network_root, storage_provider, provider_config) VALUES (?, ?, ?, ?, ?, ?)')
-                    ->execute([$vaultId, $organizationId, $vaultName, $networkRoot, 'network', null]);
+                $db->prepare('INSERT INTO vaults (id, organization_id, name, network_root) VALUES (?, ?, ?, ?)')
+                    ->execute([$vaultId, $organizationId, $vaultName, $networkRoot]);
             }
             if ($totpSecret !== null) {
                 $db->prepare('INSERT INTO admin_totp_credentials (user_id, secret_ciphertext) VALUES (?, ?)')

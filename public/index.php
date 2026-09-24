@@ -714,18 +714,18 @@ try {
     }
     if ($method === 'GET' && $path === '/vaults') {
         if (in_array($principal['role'], ['owner', 'admin'], true)) {
-            $query = $db->prepare("SELECT id, name, network_root AS networkRoot, storage_provider AS storageProvider, JSON_UNQUOTE(JSON_EXTRACT(provider_config, '$.googleDriveFolderId')) AS googleDriveFolderId, created_at AS createdAt FROM vaults WHERE organization_id = ? ORDER BY name");
+            $query = $db->prepare("SELECT id, name, network_root AS networkRoot, 'network' AS storageProvider, created_at AS createdAt FROM vaults WHERE organization_id = ? ORDER BY name");
             $query->execute([$principal['organizationId']]);
         } elseif ($principal['role'] === 'guest') {
             $query = $db->prepare(
-                "SELECT v.id, v.name, v.network_root AS networkRoot, v.storage_provider AS storageProvider, JSON_UNQUOTE(JSON_EXTRACT(v.provider_config, '$.googleDriveFolderId')) AS googleDriveFolderId, v.created_at AS createdAt FROM vaults v
+                "SELECT v.id, v.name, v.network_root AS networkRoot, 'network' AS storageProvider, v.created_at AS createdAt FROM vaults v
                  JOIN vault_access a ON a.vault_id = v.id AND a.user_id = ?
                  WHERE v.organization_id = ? ORDER BY v.name"
             );
             $query->execute([$principal['userId'], $principal['organizationId']]);
         } else {
             $query = $db->prepare(
-                "SELECT DISTINCT v.id, v.name, v.network_root AS networkRoot, v.storage_provider AS storageProvider, JSON_UNQUOTE(JSON_EXTRACT(v.provider_config, '$.googleDriveFolderId')) AS googleDriveFolderId, v.created_at AS createdAt FROM vaults v
+                "SELECT DISTINCT v.id, v.name, v.network_root AS networkRoot, 'network' AS storageProvider, v.created_at AS createdAt FROM vaults v
                  LEFT JOIN vault_access a ON a.vault_id = v.id AND a.user_id = ?
                  LEFT JOIN team_vault_access ta ON ta.vault_id = v.id
                  LEFT JOIN team_members tm ON tm.team_id = ta.team_id AND tm.user_id = ?
@@ -737,11 +737,10 @@ try {
     }
     if ($method === 'POST' && $path === '/vaults') {
         if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
-        $body = Runtime::jsonBody(); $name = is_string($body['name'] ?? null) ? trim($body['name']) : ''; $provider = $body['storageProvider'] ?? 'network'; $networkRoot = is_string($body['networkRoot'] ?? null) ? trim($body['networkRoot']) : null; $driveFolderId = is_string($body['googleDriveFolderId'] ?? null) ? trim($body['googleDriveFolderId']) : null;
-        if ($name === '' || strlen($name) > 200 || !in_array($provider, ['network', 'google_drive'], true)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid vault name and storage provider are required.']);
-        if ($provider === 'network' && (!$networkRoot || strlen($networkRoot) > 1024)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'networkRoot is required for a network vault.']);
-        if ($provider === 'google_drive' && (!$driveFolderId || strlen($driveFolderId) > 512)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'googleDriveFolderId is required for a Google Drive vault.']);
-        $id = Runtime::uuid(); $db->prepare('INSERT INTO vaults (id, organization_id, name, network_root, storage_provider, provider_config) VALUES (?, ?, ?, ?, ?, ?)')->execute([$id, $principal['organizationId'], $name, $networkRoot, $provider, $driveFolderId ? json_encode(['googleDriveFolderId' => $driveFolderId], JSON_THROW_ON_ERROR) : null]); Runtime::respond(201, ['id' => $id, 'name' => $name, 'networkRoot' => $networkRoot, 'storageProvider' => $provider, 'googleDriveFolderId' => $driveFolderId, 'createdAt' => gmdate('c')]);
+        $body = Runtime::jsonBody(); $name = is_string($body['name'] ?? null) ? trim($body['name']) : ''; $provider = $body['storageProvider'] ?? 'network'; $networkRoot = is_string($body['networkRoot'] ?? null) ? trim($body['networkRoot']) : '';
+        if ($name === '' || strlen($name) > 200 || $provider !== 'network') Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid network vault name is required.']);
+        if ($networkRoot === '' || strlen($networkRoot) > 1024) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'networkRoot is required for a network vault.']);
+        $id = Runtime::uuid(); $db->prepare('INSERT INTO vaults (id, organization_id, name, network_root) VALUES (?, ?, ?, ?)')->execute([$id, $principal['organizationId'], $name, $networkRoot]); Runtime::respond(201, ['id' => $id, 'name' => $name, 'networkRoot' => $networkRoot, 'storageProvider' => 'network', 'createdAt' => gmdate('c')]);
     }
     if ($method === 'GET' && $path === '/suppliers') {
         $query = $db->prepare('SELECT id, name, code, contact_email, contact_phone, website, city, state, country, is_active, is_approved, erp_id, erp_synced_at, created_at FROM suppliers WHERE organization_id = ? ORDER BY is_active DESC, name'); $query->execute([$principal['organizationId']]); $rows = $query->fetchAll(); foreach ($rows as &$row) { $row['is_active'] = (bool)$row['is_active']; $row['is_approved'] = (bool)$row['is_approved']; } unset($row); Runtime::respond(200, ['suppliers' => $rows]);
