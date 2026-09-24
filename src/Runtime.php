@@ -106,12 +106,17 @@ final class Runtime
         $vault = $query->fetch();
         if (!$vault) self::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Vault not found.']);
         if (in_array($principal['role'], ['owner', 'admin'], true)) return $vault;
-        $access = $db->prepare(
-            'SELECT 1 FROM vault_access a WHERE a.vault_id = ? AND a.user_id = ?
-             UNION SELECT 1 FROM team_vault_access a JOIN team_members m ON m.team_id = a.team_id
-             WHERE a.vault_id = ? AND m.user_id = ? LIMIT 1'
-        );
-        $access->execute([$vaultId, $principal['userId'], $vaultId, $principal['userId']]);
+        if ($principal['role'] === 'guest') {
+            $access = $db->prepare('SELECT 1 FROM vault_access WHERE vault_id = ? AND user_id = ? LIMIT 1');
+            $access->execute([$vaultId, $principal['userId']]);
+        } else {
+            $access = $db->prepare(
+                'SELECT 1 FROM vault_access a WHERE a.vault_id = ? AND a.user_id = ?
+                 UNION SELECT 1 FROM team_vault_access a JOIN team_members m ON m.team_id = a.team_id
+                 WHERE a.vault_id = ? AND m.user_id = ? LIMIT 1'
+            );
+            $access->execute([$vaultId, $principal['userId'], $vaultId, $principal['userId']]);
+        }
         if (!$access->fetchColumn()) self::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Vault not found.']);
         return $vault;
     }

@@ -48,10 +48,20 @@ final class Installation
      */
     public static function retireBootstrapToken(string $environmentPath): bool
     {
+        return self::retireEnvironmentToken($environmentPath, 'BLUEPLM_BOOTSTRAP_TOKEN');
+    }
+
+    public static function retireInstallationToken(string $environmentPath): bool
+    {
+        return self::retireEnvironmentToken($environmentPath, 'BLUEPLM_INSTALLATION_TOKEN');
+    }
+
+    private static function retireEnvironmentToken(string $environmentPath, string $key): bool
+    {
         if (!is_file($environmentPath) || is_link($environmentPath) || !is_writable($environmentPath)) return false;
         $contents = file_get_contents($environmentPath);
         if (!is_string($contents)) return false;
-        $updated = preg_replace('/^[ \t]*BLUEPLM_BOOTSTRAP_TOKEN[ \t]*=.*(?:\R|$)/m', '', $contents, 1, $removed);
+        $updated = preg_replace('/^[ \t]*' . preg_quote($key, '/') . '[ \t]*=.*(?:\R|$)/m', '', $contents, 1, $removed);
         if (!is_string($updated) || $removed !== 1) return false;
 
         $temporaryPath = dirname($environmentPath) . DIRECTORY_SEPARATOR . '.' . basename($environmentPath) . '.blueplm-' . bin2hex(random_bytes(8));
@@ -66,7 +76,7 @@ final class Installation
     }
 
     /**
-     * @param array{organizationName:string,organizationSlug:string,email:string,displayName:string,password:string,vaultName?:string,networkRoot?:string,storageProvider?:string,googleDriveFolderId?:string,enableTotp?:bool} $input
+     * @param array{organizationName:string,organizationSlug:string,email:string,displayName:string,password:string,vaultName?:string,networkRoot?:string,enableTotp?:bool} $input
      * @param array<string, string> $env
      * @return array{userId:string,organizationId:string,totpSecret:?string}
      */
@@ -82,8 +92,6 @@ final class Installation
         $password = $input['password'];
         $vaultName = trim((string)($input['vaultName'] ?? ''));
         $networkRoot = trim((string)($input['networkRoot'] ?? ''));
-        $storageProvider = (string)($input['storageProvider'] ?? 'network');
-        $googleDriveFolderId = trim((string)($input['googleDriveFolderId'] ?? ''));
         if ($organizationName === '' || strlen($organizationName) > 200) {
             throw new \InvalidArgumentException('Company name is required and must not exceed 200 characters.');
         }
@@ -99,16 +107,10 @@ final class Installation
         if (strlen($password) < 12) {
             throw new \InvalidArgumentException('Owner password must contain at least 12 characters.');
         }
-        if (!in_array($storageProvider, ['network', 'google_drive'], true)) {
-            throw new \InvalidArgumentException('Choose either network or Google Drive vault storage.');
-        }
-        if ($storageProvider === 'network' && (($vaultName === '') !== ($networkRoot === ''))) {
+        if (($vaultName === '') !== ($networkRoot === '')) {
             throw new \InvalidArgumentException('Vault name and network archive path must be entered together.');
         }
-        if ($storageProvider === 'google_drive' && (($vaultName === '') !== ($googleDriveFolderId === ''))) {
-            throw new \InvalidArgumentException('Vault name and Google Drive folder ID must be entered together.');
-        }
-        if (strlen($vaultName) > 200 || strlen($networkRoot) > 1024 || strlen($googleDriveFolderId) > 512) throw new \InvalidArgumentException('Vault configuration is too long.');
+        if (strlen($vaultName) > 200 || strlen($networkRoot) > 1024) throw new \InvalidArgumentException('Vault configuration is too long.');
 
         $organizationId = Runtime::uuid();
         $userId = Runtime::uuid();
@@ -121,11 +123,8 @@ final class Installation
             $db->prepare('INSERT INTO organization_settings (organization_id) VALUES (?)')->execute([$organizationId]);
             if ($vaultName !== '') {
                 $vaultId = Runtime::uuid();
-                $providerConfig = $storageProvider === 'google_drive'
-                    ? json_encode(['googleDriveFolderId' => $googleDriveFolderId], JSON_THROW_ON_ERROR)
-                    : null;
                 $db->prepare('INSERT INTO vaults (id, organization_id, name, network_root, storage_provider, provider_config) VALUES (?, ?, ?, ?, ?, ?)')
-                    ->execute([$vaultId, $organizationId, $vaultName, $storageProvider === 'network' ? $networkRoot : null, $storageProvider, $providerConfig]);
+                    ->execute([$vaultId, $organizationId, $vaultName, $networkRoot, 'network', null]);
             }
             if ($totpSecret !== null) {
                 $db->prepare('INSERT INTO admin_totp_credentials (user_id, secret_ciphertext) VALUES (?, ?)')

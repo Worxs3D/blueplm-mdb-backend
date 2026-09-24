@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS organization_memberships (
   organization_id CHAR(36) NOT NULL,
   user_id CHAR(36) NOT NULL,
-  role ENUM('owner', 'admin', 'member') NOT NULL DEFAULT 'member',
+  role ENUM('owner', 'admin', 'member', 'viewer', 'guest') NOT NULL DEFAULT 'member',
   created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   PRIMARY KEY (organization_id, user_id),
   CONSTRAINT fk_membership_org FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE,

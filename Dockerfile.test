@@ -8,5 +8,6 @@ RUN docker-php-ext-install pdo_mysql \
 
 WORKDIR /app
 COPY . /app
+RUN chown -R www-data:www-data /app
 
-CMD ["apache2-foreground"]
+CMD ["sh", "-c", "cp /app/test/install-env.fixture /app/.env.install && chown www-data:www-data /app/.env.install && exec apache2-foreground"]

@@ -1,96 +1,84 @@
-# BluePLM Community auf All-Inkl bereitstellen
+# BluePLM MDB auf Shared Hosting bereitstellen
 
-Der Desktop-Client verbindet sich ausschlieÃŸlich mit der HTTPS-PHP-API. MariaDB
-bleibt intern auf `localhost` des Webspace und ist kein Client-Endpunkt.
+Der BluePLM-Desktop-Client verbindet sich ausschließlich per HTTPS mit der
+PHP-API. MariaDB bleibt intern beim Hoster und ist kein Client-Endpunkt. Die
+Ersteinrichtung und Administration erfolgen in BluePLM; der Server stellt keine
+Browser-Adminoberfläche bereit.
 
-## 1. Verzeichnis und Domain
+## 1. Hosting vorbereiten
 
-Per FTP den gesamten Inhalt dieses Ordners in ein privates Projektverzeichnis
-laden, beispielsweise `blueplm-community-php/`. Die Struktur muss erhalten
-bleiben:
+Beim Hoster werden benötigt:
 
-```
-blueplm-community-php/
-  .env                 # nur auf dem Server, niemals im Webroot
-  bin/
-  migrations/
-  src/
-  public/              # einziger Webroot
-```
+- eine leere oder bereits von BluePLM verwendete MariaDB-Datenbank,
+- ein FTP-Benutzer mit FTPS-Unterstützung,
+- eine Domain oder Subdomain mit gültigem TLS-Zertifikat,
+- PHP 8.2 oder neuer mit PDO MySQL und OpenSSL.
 
-Im KAS der Domain `blueplm.worxs3d.de` als Document Root genau
-`blueplm-community-php/public` festlegen. Das verhindert den Abruf von
-Migrationen, Quellcode und Zugangsdaten. Die Datei `public/.htaccess` muss
-mit hochgeladen werden; sie aktiviert sichere API-Routen wie `/health` und
-reicht den Bearer-Token an PHP weiter.
+Der Dokumentenstamm der Domain muss auf den Ordner `public/` innerhalb des
+BluePLM-MDB-Serverpakets zeigen. `.env`, `src/` und `migrations/` liegen eine
+Ebene darüber und dürfen nicht öffentlich erreichbar sein.
 
-## 2. Server-Konfiguration und Datenbank
+## 2. Einrichtung in BluePLM starten
 
-Lege auf dem Server `blueplm-community-php/.env` an. Als Vorlage dient
-`.env.example`. Bei Nutzung der gemeinsamen Projekt-`.env` werden die Werte
-aus `[Mariadb]` automatisch gelesen. Erforderlich sind insbesondere:
+In der Backend-Auswahl **BluePLM MDB** und anschließend **Neuen MDB-Server
+einrichten** wählen. Einzutragen sind:
 
-```
-MARIADB_HOST=localhost
-MARIADB_DATABASE=<All-Inkl-Datenbankname>
-MARIADB_USER=<All-Inkl-Datenbankbenutzer>
-MARIADB_PASSWORD=<Datenbankpasswort>
-BLUEPLM_SESSION_SECRET=<mindestens 32 zufÃ¤llige Zeichen>
-BLUEPLM_BOOTSTRAP_TOKEN=<anderes Geheimnis mit mindestens 32 Zeichen>
-BLUEPLM_MAINTENANCE_TOKEN=<anderes Geheimnis mit mindestens 32 Zeichen>
-BLUEPLM_CORS_ORIGINS=null,file://,http://localhost:5173
-```
+- die öffentliche HTTPS-URL ohne `/public`,
+- die FTPS-Server-URL einschließlich Port,
+- optional der FTP-Zielordner; leer bedeutet Wurzel des FTP-Benutzers,
+- FTP-Benutzer und FTP-Passwort,
+- MariaDB-Host, Port, Datenbankname, Benutzer und Passwort.
 
-Die drei BluePLM-Secrets erzeugst du vor dem Upload lokal mit
-`node scripts/generate-secrets.mjs`. Die Ausgabe ausschließlich in die private
-Server-`.env` kopieren, niemals in den Webroot, den Client oder ein Git-Repository.
+Unterstützt werden explizites FTPS auf Port 21 und implizites FTPS auf Port 990.
+Die im Client gewählte Verbindungsart muss zum angegebenen Port passen.
+Unverschlüsseltes FTP wird nicht akzeptiert. TLS-Zertifikat und Hostname werden
+bei beiden Varianten geprüft. Zugangsdaten erscheinen weder in der Prozessliste
+noch in den Anwendungslogs.
 
-Auf Shared Hosting ohne SSH werden Migrationen mit dem separaten Wartungs-Token
-ausgefÃ¼hrt:
+## 3. Vorhandene Datenbank prüfen
 
-```powershell
-Invoke-RestMethod -Method Post -Uri 'https://blueplm.worxs3d.de/admin/migrate' `
-  -ContentType 'application/json' -Body '{"maintenanceToken":"<Wartungs-Token>"}'
-```
+Vor jeder Installation prüft BluePLM den ausgewählten Datenbankstand:
 
-Der Endpunkt gibt nur die ausgefÃ¼hrten Migrationsdateien zurÃ¼ck. Es gibt keine
-MariaDB-Zugangsdaten aus. AnschlieÃŸend muss dies funktionieren:
+- **Leer:** Neuinstallation ist möglich.
+- **Versionierte BluePLM-Datenbank:** BluePLM fragt, ob die vorhandenen Daten
+  migriert oder vollständig gelöscht werden sollen.
+- **Altes BluePLM-Schema oder fremde Tabellen:** Eine automatische Migration
+  wird aus Sicherheitsgründen nicht angeboten. Möglich ist nur Löschen und
+  Neuinstallation.
 
-```powershell
-Invoke-RestMethod 'https://blueplm.worxs3d.de/health'
-```
+Die Löschoption entfernt alle Tabellen und Ansichten der ausgewählten
+Datenbank. Sie wird erst freigeschaltet, nachdem exakt
+`DELETE ALL DATABASE DATA` eingegeben wurde. Unmittelbar vor der Ausführung
+prüft der Server den Zustand erneut.
 
-Erwartet wird `ok: true`, `runtime: php` und `supabase: false`.
+Bei einer Migration bleiben bestehende Benutzer, Firmen, Teams, Vaults und
+Dateimetadaten erhalten. Bei einer bereits eingerichteten Installation bleibt
+auch die vorhandene private `.env` unverändert.
 
-## 3. Geführte Server-Ersteinrichtung
+## 4. Firma und ersten Eigentümer anlegen
 
-Nach dem Upload öffne `https://<deine-domain>/setup/`. Der Assistent führt die
-Migrationen aus und legt Firma, ersten Eigentümer sowie einen optionalen
-Netzwerk-/NAS-Vault an. Der Bootstrap-Token wird nur dort eingegeben und nie an
-den Desktop-Client übermittelt. Optional richtet der Assistent ein TOTP-Secret
-für Authenticator-Apps ein. Nach erfolgreichem Abschluss ist `/setup/` dauerhaft
-gesperrt; den Bootstrap-Token anschließend aus der privaten `.env` entfernen.
-Der davon getrennte Wartungs-Token bleibt ausschließlich für spätere
-Schema-Updates auf dem Deployment-Rechner und dem Server.
+Bei einer Neuinstallation oder einer noch nicht eingerichteten Datenbank werden
+Firmenname, Firmenkürzel, Eigentümername, E-Mail, Passwort und optional der
+Netzwerk-Vault direkt in der Desktop-App eingegeben. Das Firmenkürzel darf nur
+Kleinbuchstaben, Ziffern und Bindestriche enthalten. Das Eigentümerpasswort muss
+mindestens zwölf Zeichen lang sein.
 
-## 4. Ersteinrichtung von Client und Vault
+Die Werte werden ausschließlich an die mit einem kurzlebigen Installationstoken
+geschützte HTTPS-Schnittstelle gesendet. Nach erfolgreichem Abschluss werden
+Installationstoken und Bootstrap-Token entfernt. Die temporäre `.env.install`
+wird atomar aktiviert oder bei einem Fehler gelöscht.
 
-Auf dem ersten Windows-Client BluePLM starten und in der Backend-Auswahl **MDB
-(MariaDB/PHP)** wählen. Anschließend die URL
-`https://blueplm.worxs3d.de` eintragen. Kein `/public`, kein `localhost` und
-keine MariaDB-URL eintragen.
+## 5. Prüfung
 
-Der erste Administrator kann mit der CLI eingerichtet werden:
+Nach der Einrichtung muss der öffentliche Health-Check eine MDB-Laufzeit melden:
 
 ```powershell
-blueplm-community configure --server https://blueplm.worxs3d.de --workspace C:\BluePLM-Work
-blueplm-community bootstrap --token <Bootstrap-Token> --organization 'Worxs3D' --slug worxs3d --email <Admin-E-Mail> --name <Admin-Name>
-blueplm-community vault-add --name 'Konstruktionsvault' --network-root '\\server\freigabe\BluePLM-Vault'
-blueplm-community vault-import <Vault-ID>
+Invoke-RestMethod 'https://blueplm.example/health'
 ```
 
-Jeder Benutzer bekommt ein eigenes lokales Arbeitsverzeichnis, etwa
-`C:\BluePLM-Work`. Der Netzwerk-Vault muss für diese Benutzer lesbar und
-schreibbar sein. Checkout kopiert in das lokale Verzeichnis; Check-in legt eine
-unverÃ¤nderliche Revision unter `.blueplm/revisions/` im Netzwerk-Vault an und
-schreibt die Revisionsmetadaten atomar in MariaDB.
+Erwartet werden `ok: true`, `runtime: php` und `supabase: false`. Anschließend
+öffnet BluePLM die Anmeldung beziehungsweise übernimmt bei einer Neuinstallation
+die einmalig ausgestellte Sitzung.
+
+Keine realen Domains, IP-Adressen, Datenbanknamen, Kennwörter, Tokens oder
+Kundendaten in GitHub-Issues, Logs oder Screenshots veröffentlichen.

@@ -1,0 +1,12 @@
+BLUEPLM_ENV=test
+BLUEPLM_CORS_ORIGINS=null,file://,http://localhost:5173
+BLUEPLM_PUBLIC_URL=http://127.0.0.1:18080
+MARIADB_HOST=mariadb
+MARIADB_PORT=3306
+MARIADB_DATABASE=blueplm
+MARIADB_USER=blueplm
+MARIADB_PASSWORD=blueplm-test-password
+BLUEPLM_SESSION_SECRET=test-session-secret-must-be-at-least-thirty-two-characters
+BLUEPLM_BOOTSTRAP_TOKEN=integration-bootstrap-token-must-be-at-least-32-chars
+BLUEPLM_MAINTENANCE_TOKEN=integration-maintenance-token-must-be-at-least-32-chars
+BLUEPLM_INSTALLATION_TOKEN=integration-installation-token-must-be-at-least-32-chars

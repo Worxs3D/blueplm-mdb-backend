@@ -1,44 +1,76 @@
 # BluePLM MDB PHP API
 
-Provider-neutral PHP/MariaDB runtime for BluePLM MDB. Configure the domain's
-document root as `blueplm-community-php/public`, not as the project directory.
-The parent directory holds `.env`, source code and SQL migrations and must not
-be web-accessible.
+Provider-neutral PHP/MariaDB backend for BluePLM MDB. The BluePLM desktop app
+contains initial setup and administration. This package exposes only the
+authenticated JSON API and database migrations; `/setup/` and `/admin/` do not
+serve browser interfaces.
 
-The API reads JSON, returns JSON and authenticates clients with opaque bearer
-tokens. MariaDB credentials are used only by PHP through PDO; they are never
-returned to Electron.
+The domain document root must point to this package's `public/` directory. The
+private parent directory contains `.env`, PHP source, and migrations and must
+not be web-accessible. Clients connect only to the public HTTPS URL. MariaDB
+credentials never leave the PHP host.
 
-For a standalone upload, copy `.env.example` to the private parent directory
-and populate it. In this workspace, the PHP adapter can instead use the
-existing root `.env`: its `[Mariadb]` section is mapped to `MARIADB_*` without
-reading the `[webspaceFTP]` section. In either case,
-`BLUEPLM_SESSION_SECRET`, `BLUEPLM_BOOTSTRAP_TOKEN`, and `BLUEPLM_MAINTENANCE_TOKEN` are mandatory and must
-be separate random values of at least 32 characters. Generate them locally with
-`node scripts/generate-secrets.mjs`, then paste them into the private server `.env`.
+## Desktop installer and existing databases
 
-The matching, versioned MariaDB migrations are included in this package. Run
-`php bin/migrate.php` from the private project directory, then call
-`GET /health`. On shared hosting without SSH, make one authenticated request to
-`POST /admin/migrate` with JSON `{ "maintenanceToken": "..." }`; it uses the
-separate maintenance secret and returns only applied migration filenames. Do not
-place the migration command, `.env`, or `src/` under the domain's document
-root.
+The desktop installer uploads the API over explicit FTPS on port 21 or implicit
+FTPS on port 990. The selected mode and port must match; both modes verify the
+server certificate and hostname. The installer writes a short-lived
+`.env.install` beside the private `.env`. It then authenticates to the installer
+API with a random one-use token and inspects the selected MariaDB database
+before changing it:
 
-`public/.htaccess` is part of the deployment. It routes `/health`, `/auth/*`
-and all other API paths to `public/index.php` while leaving no directory listing
-enabled. On All-Inkl, set the domain document root to the package's `public`
-directory; do not use `/public` in the client URL.
+- **Empty database:** BluePLM offers a new installation.
+- **Versioned BluePLM database:** BluePLM asks whether to migrate it in place or
+  erase it and reinstall. Migration preserves existing records.
+- **Legacy BluePLM schema or foreign tables:** automatic migration is blocked.
+  Only an explicitly confirmed erase-and-reinstall operation is available.
 
-## Vault provider at first setup
+Erasing requires the exact confirmation `DELETE ALL DATABASE DATA`. The server
+checks the database state again immediately before committing, so a stale UI
+decision cannot overwrite a database whose state changed after inspection.
 
-The one-time `/setup/` page creates the primary vault. Choose either an
-**Archive/NAS network path** or a **Google Drive Shared Drive folder**. A Google
-Drive vault stores only its folder ID in MariaDB; every Windows user authorizes
-their own Google account and Shared Drive membership controls file access.
+After a successful new installation, `.env.install` is atomically promoted to
+`.env`; the installation and bootstrap tokens are retired. When an already
+bootstrapped installation is migrated, its existing `.env` remains unchanged.
+Failed or abandoned operations remove the pending environment file.
 
-Google Drive support is **not production-tested**. Validate it using a separate
-database and test Shared Drive before storing production CAD revisions. The
-desktop implementation guide is available in
-[`../bluePLM/docs/mdb-google-drive.md`](../bluePLM/docs/mdb-google-drive.md)
-and [`../bluePLM/docs/mdb-google-drive.de.md`](../bluePLM/docs/mdb-google-drive.de.md).
+## Required server values
+
+The installer creates the private environment. A manual deployment can use
+`.env.example`. These values are required:
+
+```dotenv
+MARIADB_HOST=localhost
+MARIADB_PORT=3306
+MARIADB_DATABASE=<database>
+MARIADB_USER=<user>
+MARIADB_PASSWORD=<password>
+BLUEPLM_SESSION_SECRET=<independent random value, at least 32 characters>
+BLUEPLM_BOOTSTRAP_TOKEN=<independent random value, at least 32 characters>
+BLUEPLM_MAINTENANCE_TOKEN=<independent random value, at least 32 characters>
+BLUEPLM_CORS_ORIGINS=null,file://,http://localhost:5173
+```
+
+Generate manual secrets locally with `node scripts/generate-secrets.mjs`. Never
+commit `.env`, FTP credentials, database credentials, tokens, host-specific
+addresses, or customer data.
+
+`public/.htaccess` routes API requests to `public/index.php` and disables
+directory listings. The health check is `GET /health`; a healthy MDB response
+contains `ok: true`, `runtime: "php"`, and `supabase: false`.
+
+## Tests
+
+The integration test covers installer authorization, new installation,
+database-state detection, in-place migration, login, user and team management,
+network vault operations, and the removal of browser setup/admin pages.
+
+```powershell
+docker compose -f docker-compose.test.yml up --build -d
+node test/integration.mjs
+docker compose -f docker-compose.test.yml exec -T api php test/database-lifecycle.php
+docker compose -f docker-compose.test.yml down -v
+```
+
+All credentials in `test/install-env.fixture` are isolated test values for the
+disposable Docker database.

@@ -6,20 +6,118 @@ require dirname(__DIR__) . '/src/Migrator.php';
 require dirname(__DIR__) . '/src/FileReferences.php';
 require dirname(__DIR__) . '/src/Totp.php';
 require dirname(__DIR__) . '/src/Installation.php';
+require dirname(__DIR__) . '/src/DatabaseLifecycle.php';
 
 use BluePlm\Migrator;
 use BluePlm\FileReferences;
 use BluePlm\Installation;
 use BluePlm\Runtime;
+use BluePlm\DatabaseLifecycle;
+use BluePlm\Totp;
 
 header_remove('X-Powered-By');
-$env = Runtime::env(dirname(__DIR__) . '/.env');
+$root = dirname(__DIR__);
+$path = '/' . trim((string)(parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?? '/'), '/');
+$method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+
+// Inspect and update through a short-lived private environment file. The live
+// .env is not touched until the operator has explicitly chosen an action.
+if (in_array($path, ['/installer/database-status', '/installer/commit'], true)) {
+    $pendingEnvironmentPath = $root . '/.env.install';
+    $pendingEnv = Runtime::env($pendingEnvironmentPath);
+    Runtime::sendCors($pendingEnv);
+    if ($method === 'OPTIONS') Runtime::respond(204);
+    if ($method !== 'POST') Runtime::respond(405, ['error' => 'METHOD_NOT_ALLOWED']);
+    $body = Runtime::jsonBody();
+    $providedToken = is_string($body['installationToken'] ?? null) ? $body['installationToken'] : '';
+    $expectedToken = $pendingEnv['BLUEPLM_INSTALLATION_TOKEN'] ?? '';
+    if (strlen($expectedToken) < 32 || !hash_equals($expectedToken, $providedToken)) {
+        Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Installation authorization failed.']);
+    }
+    try {
+        $db = Runtime::database($pendingEnv);
+        $inspection = DatabaseLifecycle::inspect($db, $root . '/migrations');
+        if ($path === '/installer/database-status') {
+            @unlink($pendingEnvironmentPath);
+            Runtime::respond(200, ['database' => $inspection]);
+        }
+
+        $action = is_string($body['action'] ?? null) ? $body['action'] : '';
+        if ($action === 'migrate') {
+            if ($inspection['state'] !== 'managed') {
+                @unlink($pendingEnvironmentPath);
+                Runtime::respond(409, ['error' => 'MIGRATION_UNSAFE', 'message' => 'Only a versioned BluePLM database can be migrated automatically.']);
+            }
+        } elseif ($action === 'reset') {
+        } elseif ($action !== 'install' || $inspection['state'] !== 'empty') {
+            @unlink($pendingEnvironmentPath);
+            Runtime::respond(409, ['error' => 'DATABASE_STATE_CHANGED', 'message' => 'Inspect the database again before continuing.']);
+        }
+
+        $needsBootstrap = $action !== 'migrate' || !$inspection['bootstrapped'];
+        $bootstrap = [];
+        if ($needsBootstrap) {
+            $bootstrap = is_array($body['bootstrap'] ?? null) ? $body['bootstrap'] : [];
+            foreach (['organizationName', 'organizationSlug', 'email', 'displayName', 'password'] as $key) {
+                if (!is_string($bootstrap[$key] ?? null) || trim($bootstrap[$key]) === '') {
+                    @unlink($pendingEnvironmentPath);
+                    Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => "{$key} is required."]);
+                }
+            }
+        }
+
+        if ($action === 'reset') {
+            DatabaseLifecycle::reset($db, is_string($body['confirmation'] ?? null) ? $body['confirmation'] : '');
+            $inspection = DatabaseLifecycle::inspect($db, $root . '/migrations');
+        }
+
+        $applied = Migrator::apply($db, $root . '/migrations');
+        $sessionToken = null;
+        if ($needsBootstrap) {
+            $result = Installation::bootstrap($db, $pendingEnv, [
+                'organizationName' => $bootstrap['organizationName'],
+                'organizationSlug' => $bootstrap['organizationSlug'],
+                'email' => $bootstrap['email'],
+                'displayName' => $bootstrap['displayName'],
+                'password' => $bootstrap['password'],
+                'vaultName' => is_string($bootstrap['vaultName'] ?? null) ? $bootstrap['vaultName'] : '',
+                'networkRoot' => is_string($bootstrap['networkRoot'] ?? null) ? $bootstrap['networkRoot'] : '',
+                'enableTotp' => false,
+            ]);
+            $sessionToken = Runtime::issueSession($db, $pendingEnv, $result['userId'], $result['organizationId']);
+            if (!Installation::retireBootstrapToken($pendingEnvironmentPath)) {
+                throw new \RuntimeException('The one-time bootstrap token could not be retired.');
+            }
+        }
+
+        $liveEnvironmentPath = $root . '/.env';
+        if (!Installation::retireInstallationToken($pendingEnvironmentPath)) {
+            throw new \RuntimeException('The one-time installation token could not be retired.');
+        }
+        $promoteEnvironment = $action !== 'migrate' || !$inspection['bootstrapped'] || !is_file($liveEnvironmentPath);
+        if ($promoteEnvironment && !@rename($pendingEnvironmentPath, $liveEnvironmentPath)) {
+            throw new \RuntimeException('The private server environment could not be activated.');
+        }
+        if (!$promoteEnvironment) @unlink($pendingEnvironmentPath);
+        Runtime::respond(200, [
+            'applied' => $applied,
+            'bootstrapped' => $needsBootstrap,
+            'token' => $sessionToken,
+        ]);
+    } catch (\InvalidArgumentException $error) {
+        @unlink($pendingEnvironmentPath);
+        Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => $error->getMessage()]);
+    } catch (\Throwable $error) {
+        @unlink($pendingEnvironmentPath);
+        Runtime::respond(500, ['error' => 'INSTALLATION_FAILED', 'message' => $error->getMessage()]);
+    }
+}
+
+$env = Runtime::env($root . '/.env');
 Runtime::sendCors($env);
 if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'OPTIONS') Runtime::respond(204);
 
 try {
-    $path = '/' . trim((string)(parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?? '/'), '/');
-    $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
     if ($path === '/health') Runtime::respond(200, ['ok' => true, 'runtime' => 'php', 'supabase' => false]);
     $db = Runtime::database($env);
 
@@ -53,8 +151,6 @@ try {
                 'email' => $body['email'], 'displayName' => $body['displayName'], 'password' => $body['password'],
                 'vaultName' => is_string($body['vaultName'] ?? null) ? $body['vaultName'] : '',
                 'networkRoot' => is_string($body['networkRoot'] ?? null) ? $body['networkRoot'] : '',
-                'storageProvider' => is_string($body['storageProvider'] ?? null) ? $body['storageProvider'] : 'network',
-                'googleDriveFolderId' => is_string($body['googleDriveFolderId'] ?? null) ? $body['googleDriveFolderId'] : '',
                 'enableTotp' => false,
             ]);
             $token = Runtime::issueSession($db, $env, $result['userId'], $result['organizationId']);
@@ -71,12 +167,115 @@ try {
         $query = $db->prepare('SELECT u.id, u.password_hash, m.organization_id FROM users u JOIN organization_memberships m ON m.user_id = u.id WHERE u.email = ? AND u.disabled_at IS NULL ORDER BY m.created_at LIMIT 1');
         $query->execute([strtolower($body['email'])]); $user = $query->fetch();
         if (!$user || !Runtime::passwordVerify($body['password'], $user['password_hash'])) Runtime::respond(401, ['error' => 'UNAUTHENTICATED', 'message' => 'Invalid email or password.']);
+        $totp = $db->prepare('SELECT 1 FROM admin_totp_credentials WHERE user_id = ?');
+        $totp->execute([$user['id']]);
+        if ($totp->fetchColumn()) {
+            $challengeToken = rtrim(strtr(base64_encode(random_bytes(32)), '+/', '-_'), '=');
+            $db->prepare('DELETE FROM auth_totp_challenges WHERE user_id = ? OR expires_at <= UTC_TIMESTAMP(3)')->execute([$user['id']]);
+            $db->prepare('INSERT INTO auth_totp_challenges (token_hash, user_id, organization_id, expires_at) VALUES (?, ?, ?, DATE_ADD(UTC_TIMESTAMP(3), INTERVAL 5 MINUTE))')
+                ->execute([Runtime::tokenHash($challengeToken, $env), $user['id'], $user['organization_id']]);
+            Runtime::respond(200, ['totpRequired' => true, 'challengeToken' => $challengeToken, 'expiresAt' => gmdate('c', time() + 300)]);
+        }
         Runtime::respond(200, ['token' => Runtime::issueSession($db, $env, $user['id'], $user['organization_id']), 'expiresAt' => gmdate('c', time() + 7 * 86400)]);
+    }
+    if ($method === 'POST' && $path === '/auth/totp/verify') {
+        $body = Runtime::jsonBody();
+        $challengeToken = is_string($body['challengeToken'] ?? null) ? $body['challengeToken'] : '';
+        $code = is_string($body['code'] ?? null) ? trim($body['code']) : '';
+        if (strlen($challengeToken) < 32 || !preg_match('/^\d{6}$/', $code)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid challenge and six-digit code are required.']);
+        $db->beginTransaction();
+        try {
+            $query = $db->prepare('SELECT c.user_id, c.organization_id, c.attempts_remaining, t.secret_ciphertext FROM auth_totp_challenges c JOIN admin_totp_credentials t ON t.user_id = c.user_id WHERE c.token_hash = ? AND c.expires_at > UTC_TIMESTAMP(3) FOR UPDATE');
+            $query->execute([Runtime::tokenHash($challengeToken, $env)]); $challenge = $query->fetch();
+            if (!$challenge || (int)$challenge['attempts_remaining'] < 1) {
+                $db->rollBack();
+                Runtime::respond(401, ['error' => 'TOTP_CHALLENGE_INVALID', 'message' => 'The authenticator challenge is invalid or expired.']);
+            }
+            if (!Totp::verify(Runtime::decryptSecret($challenge['secret_ciphertext'], $env), $code)) {
+                $db->prepare('UPDATE auth_totp_challenges SET attempts_remaining = attempts_remaining - 1 WHERE token_hash = ?')->execute([Runtime::tokenHash($challengeToken, $env)]);
+                $db->commit();
+                Runtime::respond(401, ['error' => 'TOTP_INVALID', 'message' => 'The authenticator code is invalid.']);
+            }
+            $db->prepare('DELETE FROM auth_totp_challenges WHERE user_id = ?')->execute([$challenge['user_id']]);
+            $sessionToken = Runtime::issueSession($db, $env, $challenge['user_id'], $challenge['organization_id']);
+            $db->commit();
+            Runtime::respond(200, ['token' => $sessionToken, 'expiresAt' => gmdate('c', time() + 7 * 86400)]);
+        } catch (Throwable $error) {
+            if ($db->inTransaction()) $db->rollBack();
+            throw $error;
+        }
     }
     if ($method === 'GET' && $path === '/auth/me') {
         Runtime::respond(200, ['user' => Runtime::principal($db, $env)]);
     }
     $principal = Runtime::principal($db, $env);
+    if (in_array($principal['role'], ['viewer', 'guest'], true) && $method !== 'GET') {
+        $personalWrite = $path === '/account'
+            || $path === '/recovery-codes/use'
+            || str_starts_with($path, '/device-sessions/')
+            || str_starts_with($path, '/account/totp');
+        if (!$personalWrite) Runtime::respond(403, ['error' => 'READ_ONLY_ROLE', 'message' => 'Viewer and guest accounts are read-only.']);
+    }
+    if ($method === 'GET' && $path === '/account/totp') {
+        $query = $db->prepare('SELECT enabled_at AS enabledAt FROM admin_totp_credentials WHERE user_id = ?');
+        $query->execute([$principal['userId']]);
+        $credential = $query->fetch();
+        Runtime::respond(200, ['enabled' => (bool)$credential, 'enabledAt' => $credential['enabledAt'] ?? null]);
+    }
+    if ($method === 'POST' && $path === '/account/totp/enrollment') {
+        $secret = Totp::generateSecret();
+        $enrollmentToken = rtrim(strtr(base64_encode(random_bytes(32)), '+/', '-_'), '=');
+        $db->prepare('DELETE FROM totp_enrollments WHERE user_id = ? OR expires_at <= UTC_TIMESTAMP(3)')->execute([$principal['userId']]);
+        $db->prepare('INSERT INTO totp_enrollments (token_hash, user_id, secret_ciphertext, expires_at) VALUES (?, ?, ?, DATE_ADD(UTC_TIMESTAMP(3), INTERVAL 10 MINUTE))')
+            ->execute([Runtime::tokenHash($enrollmentToken, $env), $principal['userId'], Runtime::encryptSecret($secret, $env)]);
+        Runtime::respond(201, [
+            'enrollmentToken' => $enrollmentToken,
+            'secret' => $secret,
+            'provisioningUri' => Totp::provisioningUri('BluePLM MDB', $principal['email'], $secret),
+            'expiresAt' => gmdate('c', time() + 600),
+        ]);
+    }
+    if ($method === 'POST' && $path === '/account/totp/confirm') {
+        $body = Runtime::jsonBody();
+        $enrollmentToken = is_string($body['enrollmentToken'] ?? null) ? $body['enrollmentToken'] : '';
+        $code = is_string($body['code'] ?? null) ? trim($body['code']) : '';
+        if (strlen($enrollmentToken) < 32 || !preg_match('/^\d{6}$/', $code)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid enrollment and six-digit code are required.']);
+        $db->beginTransaction();
+        try {
+            $query = $db->prepare('SELECT secret_ciphertext, attempts_remaining FROM totp_enrollments WHERE token_hash = ? AND user_id = ? AND expires_at > UTC_TIMESTAMP(3) FOR UPDATE');
+            $query->execute([Runtime::tokenHash($enrollmentToken, $env), $principal['userId']]); $enrollment = $query->fetch();
+            if (!$enrollment || (int)$enrollment['attempts_remaining'] < 1) {
+                $db->rollBack();
+                Runtime::respond(401, ['error' => 'TOTP_ENROLLMENT_INVALID', 'message' => 'The authenticator enrollment is invalid or expired.']);
+            }
+            $secret = Runtime::decryptSecret($enrollment['secret_ciphertext'], $env);
+            if (!Totp::verify($secret, $code)) {
+                $db->prepare('UPDATE totp_enrollments SET attempts_remaining = attempts_remaining - 1 WHERE token_hash = ?')->execute([Runtime::tokenHash($enrollmentToken, $env)]);
+                $db->commit();
+                Runtime::respond(401, ['error' => 'TOTP_INVALID', 'message' => 'The authenticator code is invalid.']);
+            }
+            $db->prepare('INSERT INTO admin_totp_credentials (user_id, secret_ciphertext, enabled_at) VALUES (?, ?, UTC_TIMESTAMP(3)) ON DUPLICATE KEY UPDATE secret_ciphertext = VALUES(secret_ciphertext), enabled_at = VALUES(enabled_at)')->execute([$principal['userId'], Runtime::encryptSecret($secret, $env)]);
+            $db->prepare('DELETE FROM totp_enrollments WHERE user_id = ?')->execute([$principal['userId']]);
+            Runtime::emitEvent($db, $principal['organizationId'], 'account.totp_enabled', $principal['userId'], ['userId' => $principal['userId']]);
+            $db->commit();
+            Runtime::respond(200, ['enabled' => true]);
+        } catch (Throwable $error) {
+            if ($db->inTransaction()) $db->rollBack();
+            throw $error;
+        }
+    }
+    if ($method === 'DELETE' && $path === '/account/totp') {
+        $body = Runtime::jsonBody();
+        $code = is_string($body['code'] ?? null) ? trim($body['code']) : '';
+        if (!preg_match('/^\d{6}$/', $code)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A six-digit authenticator code is required.']);
+        $query = $db->prepare('SELECT secret_ciphertext FROM admin_totp_credentials WHERE user_id = ?');
+        $query->execute([$principal['userId']]); $credential = $query->fetch();
+        if (!$credential) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Authenticator protection is not enabled.']);
+        if (!Totp::verify(Runtime::decryptSecret($credential['secret_ciphertext'], $env), $code)) Runtime::respond(401, ['error' => 'TOTP_INVALID', 'message' => 'The authenticator code is invalid.']);
+        $db->prepare('DELETE FROM admin_totp_credentials WHERE user_id = ?')->execute([$principal['userId']]);
+        Runtime::emitEvent($db, $principal['organizationId'], 'account.totp_disabled', $principal['userId'], ['userId' => $principal['userId']]);
+        Runtime::respond(200, ['enabled' => false]);
+    }
     if ($method === 'GET' && $path === '/users') {
         if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
         $query = $db->prepare('SELECT u.id, u.email, u.display_name AS displayName, m.role, u.created_at AS createdAt FROM users u JOIN organization_memberships m ON m.user_id = u.id WHERE m.organization_id = ? AND u.disabled_at IS NULL ORDER BY u.display_name, u.email');
@@ -90,7 +289,7 @@ try {
         $displayName = is_string($body['displayName'] ?? null) ? trim($body['displayName']) : '';
         $password = is_string($body['password'] ?? null) ? $body['password'] : '';
         $role = is_string($body['role'] ?? null) ? $body['role'] : 'member';
-        if (!filter_var($email, FILTER_VALIDATE_EMAIL) || strlen($email) > 320 || $displayName === '' || strlen($displayName) > 200 || strlen($password) < 12 || !in_array($role, ['admin', 'member'], true)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid email, display name, password of at least 12 characters, and role are required.']);
+        if (!filter_var($email, FILTER_VALIDATE_EMAIL) || strlen($email) > 320 || $displayName === '' || strlen($displayName) > 200 || strlen($password) < 12 || !in_array($role, ['admin', 'member', 'viewer', 'guest'], true)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid email, display name, password of at least 12 characters, and role are required.']);
         $userId = Runtime::uuid();
         try {
             $db->beginTransaction();
@@ -115,7 +314,7 @@ try {
         $target = $db->prepare('SELECT u.id FROM users u JOIN organization_memberships m ON m.user_id = u.id WHERE u.id = ? AND m.organization_id = ? AND u.disabled_at IS NULL');
         $target->execute([$targetId, $principal['organizationId']]);
         if (!$target->fetch()) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'User not found.']);
-        $updates = []; $values = []; $changed = []; $revokeSessions = false;
+        $updates = []; $values = []; $changed = []; $revokeSessions = false; $membershipRole = null;
         if (array_key_exists('email', $body)) {
             $email = is_string($body['email']) ? strtolower(trim($body['email'])) : '';
             if (!filter_var($email, FILTER_VALIDATE_EMAIL) || strlen($email) > 320) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid email address is required.']);
@@ -131,11 +330,22 @@ try {
             if (strlen($password) < 12) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'The password must have at least 12 characters.']);
             $updates[] = 'password_hash = ?'; $values[] = Runtime::passwordHash($password); $changed[] = 'password'; $revokeSessions = true;
         }
-        if ($updates === []) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'At least one editable user field is required.']);
+        if (array_key_exists('role', $body)) {
+            $membershipRole = is_string($body['role']) ? $body['role'] : '';
+            if (!in_array($membershipRole, ['admin', 'member', 'viewer', 'guest'], true)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid editable role is required.']);
+            $currentRole = $db->prepare('SELECT role FROM organization_memberships WHERE organization_id = ? AND user_id = ?');
+            $currentRole->execute([$principal['organizationId'], $targetId]);
+            if ($currentRole->fetchColumn() === 'owner') Runtime::respond(409, ['error' => 'OWNER_ROLE_LOCKED', 'message' => 'The owner role cannot be changed through this endpoint.']);
+            $changed[] = 'role'; $revokeSessions = true;
+        }
+        if ($updates === [] && $membershipRole === null) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'At least one editable user field is required.']);
         try {
             $db->beginTransaction();
-            $values[] = $targetId;
-            $db->prepare('UPDATE users SET ' . implode(', ', $updates) . ' WHERE id = ?')->execute($values);
+            if ($updates !== []) {
+                $values[] = $targetId;
+                $db->prepare('UPDATE users SET ' . implode(', ', $updates) . ' WHERE id = ?')->execute($values);
+            }
+            if ($membershipRole !== null) $db->prepare('UPDATE organization_memberships SET role = ? WHERE organization_id = ? AND user_id = ?')->execute([$membershipRole, $principal['organizationId'], $targetId]);
             if ($revokeSessions) $db->prepare('DELETE FROM sessions WHERE user_id = ? AND organization_id = ?')->execute([$targetId, $principal['organizationId']]);
             Runtime::emitEvent($db, $principal['organizationId'], 'user.credentials_updated', $targetId, ['userId' => $targetId, 'changedFields' => $changed, 'changedBy' => $principal['userId']]);
             $db->commit();
@@ -408,6 +618,13 @@ try {
         if (in_array($principal['role'], ['owner', 'admin'], true)) {
             $query = $db->prepare("SELECT id, name, network_root AS networkRoot, storage_provider AS storageProvider, JSON_UNQUOTE(JSON_EXTRACT(provider_config, '$.googleDriveFolderId')) AS googleDriveFolderId, created_at AS createdAt FROM vaults WHERE organization_id = ? ORDER BY name");
             $query->execute([$principal['organizationId']]);
+        } elseif ($principal['role'] === 'guest') {
+            $query = $db->prepare(
+                "SELECT v.id, v.name, v.network_root AS networkRoot, v.storage_provider AS storageProvider, JSON_UNQUOTE(JSON_EXTRACT(v.provider_config, '$.googleDriveFolderId')) AS googleDriveFolderId, v.created_at AS createdAt FROM vaults v
+                 JOIN vault_access a ON a.vault_id = v.id AND a.user_id = ?
+                 WHERE v.organization_id = ? ORDER BY v.name"
+            );
+            $query->execute([$principal['userId'], $principal['organizationId']]);
         } else {
             $query = $db->prepare(
                 "SELECT DISTINCT v.id, v.name, v.network_root AS networkRoot, v.storage_provider AS storageProvider, JSON_UNQUOTE(JSON_EXTRACT(v.provider_config, '$.googleDriveFolderId')) AS googleDriveFolderId, v.created_at AS createdAt FROM vaults v
