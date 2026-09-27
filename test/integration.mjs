@@ -375,6 +375,41 @@ const userTeams = await request(`/users/${createdUser.id}/teams`, {}, token)
 assert.ok(userTeams.teams.some((team) => team.id === createdTeam.id))
 const teamMembers = await request(`/teams/${createdTeam.id}/members`, {}, token)
 assert.ok(teamMembers.members.some((member) => member.userId === createdUser.id))
+const memberProfile = await request(`/users/${createdUser.id}/profile`, {}, token)
+assert.equal(memberProfile.user.id, createdUser.id)
+assert.ok(memberProfile.user.teams.some((team) => team.id === createdTeam.id))
+
+const reviewerWorkflowRole = await request('/workflow-roles', {
+  method: 'POST',
+  body: JSON.stringify({ name: 'Team Reviewer', color: '#16a34a', icon: 'shield-check' }),
+}, token)
+await request(`/teams/${createdTeam.id}/reviewers`, {
+  method: 'POST',
+  body: JSON.stringify({ reviewerType: 'user', userId: createdUser.id }),
+}, token)
+await request(`/teams/${createdTeam.id}/reviewers`, {
+  method: 'POST',
+  body: JSON.stringify({ reviewerType: 'workflow_role', workflowRoleId: reviewerWorkflowRole.role.id }),
+}, token)
+const teamReviewers = await request(`/teams/${createdTeam.id}/reviewers`, {}, token)
+assert.equal(teamReviewers.reviewers.length, 2)
+assert.ok(teamReviewers.reviewers.some((reviewer) => reviewer.user_id === createdUser.id))
+assert.ok(teamReviewers.reviewers.some((reviewer) => reviewer.workflow_role_id === reviewerWorkflowRole.role.id))
+await request(`/team-reviewers/${teamReviewers.reviewers[0].id}`, { method: 'DELETE' }, token)
+
+await request(`/teams/${createdTeam.id}/permissions`, {
+  method: 'PUT',
+  body: JSON.stringify({
+    permissions: [
+      { resource: 'module:explorer', vaultId: null, actions: ['view', 'edit'] },
+      { resource: 'module:history', vaultId: null, actions: ['view'] },
+    ],
+  }),
+}, token)
+const teamPermissions = await request(`/teams/${createdTeam.id}/permissions`, {}, token)
+assert.deepEqual(teamPermissions.permissions.map((permission) => permission.resource), ['module:explorer', 'module:history'])
+const effectivePermissions = await request(`/users/${createdUser.id}/effective-permissions`, {}, updatedMemberLogin.token)
+assert.ok(effectivePermissions.permissions.some((permission) => permission.resource === 'module:explorer' && permission.actions.includes('edit')))
 
 const root = await mkdtemp(join(tmpdir(), 'blueplm-php-vault-'))
 const vaultRoot = join(root, 'vault')
