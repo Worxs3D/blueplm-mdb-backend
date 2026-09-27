@@ -1,6 +1,6 @@
-# BluePLM Community – Begriffe
+# BluePLM MariaDB (MDB) – Begriffe
 
-## Community API
+## MariaDB API
 
 Die authentifizierte PHP-Schnittstelle für BluePLM-Clients. Sie ist kein
 browserbasiertes Administrationsportal und verlangt für geschützte Aufrufe ein
@@ -9,7 +9,7 @@ Anmeldetoken.
 ## Adminportal
 
 Eine browserbasierte Verwaltungsoberfläche für eine Organisation. Sie ist von
-der Community API getrennt und darf deren Zugangsschutz nicht abschwächen.
+der MariaDB API getrennt und darf deren Zugangsschutz nicht abschwächen.
 
 ## Organisation
 

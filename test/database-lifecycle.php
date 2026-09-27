@@ -3,8 +3,10 @@ declare(strict_types=1);
 
 require dirname(__DIR__) . '/src/Runtime.php';
 require dirname(__DIR__) . '/src/DatabaseLifecycle.php';
+require dirname(__DIR__) . '/src/Migrator.php';
 
 use BluePlm\DatabaseLifecycle;
+use BluePlm\Migrator;
 use BluePlm\Runtime;
 
 $root = dirname(__DIR__);
@@ -34,11 +36,23 @@ $foreign = DatabaseLifecycle::inspect($db, $migrations);
 if ($foreign['state'] !== 'foreign') throw new RuntimeException('Expected a foreign database.');
 DatabaseLifecycle::reset($db, 'DELETE ALL DATABASE DATA');
 
-foreach (['organizations', 'users', 'vaults'] as $table) {
-    $db->exec("CREATE TABLE `{$table}` (id INT PRIMARY KEY)");
-}
+Migrator::apply($db, $migrations);
+$legacyOrganizationId = '11111111-1111-4111-8111-111111111111';
+$db->prepare('INSERT INTO organizations (id, name, slug) VALUES (?, ?, ?)')
+    ->execute([$legacyOrganizationId, 'Legacy BluePLM', 'legacy-blueplm']);
+$db->exec('DROP TABLE schema_migrations');
 $legacy = DatabaseLifecycle::inspect($db, $migrations);
 if ($legacy['state'] !== 'legacy') throw new RuntimeException('Expected a legacy BluePLM database.');
+Migrator::apply($db, $migrations);
+$adopted = DatabaseLifecycle::inspect($db, $migrations);
+if ($adopted['state'] !== 'managed' || $adopted['pendingMigrations'] !== 0) {
+    throw new RuntimeException('Expected the legacy BluePLM database to be adopted and fully migrated.');
+}
+$sentinel = $db->prepare('SELECT COUNT(*) FROM organizations WHERE id = ?');
+$sentinel->execute([$legacyOrganizationId]);
+if ((int)$sentinel->fetchColumn() !== 1) {
+    throw new RuntimeException('Legacy BluePLM data was not preserved during migration.');
+}
 DatabaseLifecycle::reset($db, 'DELETE ALL DATABASE DATA');
 
-echo "Database lifecycle classification and guarded reset passed.\n";
+echo "Database lifecycle classification, legacy migration, and guarded reset passed.\n";

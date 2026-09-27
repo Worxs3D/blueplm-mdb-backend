@@ -15,6 +15,83 @@ use BluePlm\Runtime;
 use BluePlm\DatabaseLifecycle;
 use BluePlm\Totp;
 
+const BLUEPLM_API_VERSION = 2;
+
+/** @return array<string, mixed> */
+function decodeOrganizationSetting(mixed $value): array
+{
+    if (!is_string($value) || $value === '') return [];
+    $decoded = json_decode($value, true);
+    return is_array($decoded) ? $decoded : [];
+}
+
+/** @param array<string, mixed> $settings */
+function formatOrganizationSerial(array $settings, int $counter): string
+{
+    $prefix = is_string($settings['prefix'] ?? null) ? $settings['prefix'] : 'PN-';
+    $letterPrefix = is_string($settings['letter_prefix'] ?? null) ? $settings['letter_prefix'] : '';
+    $suffix = is_string($settings['suffix'] ?? null) ? $settings['suffix'] : '';
+    $padding = is_int($settings['padding_digits'] ?? null) ? max(1, min(20, $settings['padding_digits'])) : 5;
+    return $prefix . $letterPrefix . str_pad((string)$counter, $padding, '0', STR_PAD_LEFT) . $suffix;
+}
+
+/** @param array<string, mixed> $settings */
+function nextOrganizationSerialCounter(array $settings, int $current): int
+{
+    $candidate = $current + 1;
+    $zones = is_array($settings['keepout_zones'] ?? null) ? $settings['keepout_zones'] : [];
+    do {
+        $moved = false;
+        foreach ($zones as $zone) {
+            if (!is_array($zone)) continue;
+            $start = $zone['start'] ?? null;
+            $end = $zone['end_num'] ?? null;
+            if (!is_int($start) || !is_int($end) || $end < $start) continue;
+            if ($candidate >= $start && $candidate <= $end) {
+                $candidate = $end + 1;
+                $moved = true;
+            }
+        }
+    } while ($moved);
+    return $candidate;
+}
+
+/** @return array<int, array{id:string,width:int,visible:bool}> */
+function normalizeColumnDefaults(mixed $value): array
+{
+    if (!is_array($value) || count($value) > 100) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'columnDefaults must be an array with at most 100 entries.']);
+    $normalized = [];
+    foreach ($value as $entry) {
+        if (!is_array($entry) || !is_string($entry['id'] ?? null) || !preg_match('/^[A-Za-z][A-Za-z0-9_-]{0,127}$/', $entry['id']) || !is_int($entry['width'] ?? null) || $entry['width'] < 40 || $entry['width'] > 500 || !is_bool($entry['visible'] ?? null)) {
+            Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Each column default needs a valid id, width from 40 to 500, and visible flag.']);
+        }
+        $normalized[] = ['id' => $entry['id'], 'width' => $entry['width'], 'visible' => $entry['visible']];
+    }
+    return $normalized;
+}
+
+/** @param array<string, mixed> $principal */
+function canManageItemDesignations(PDO $db, array $principal, ?string $vaultId = null): bool
+{
+    if (in_array($principal['role'], ['owner', 'admin'], true)) return true;
+    if (in_array($principal['role'], ['viewer', 'guest'], true)) return false;
+    $sql = 'SELECT actions FROM user_permissions WHERE organization_id = ? AND user_id = ? AND resource = ?';
+    $params = [$principal['organizationId'], $principal['userId'], 'system:item-designations'];
+    if ($vaultId === null) {
+        $sql .= ' AND vault_id IS NULL';
+    } else {
+        $sql .= ' AND (vault_id IS NULL OR vault_id = ?)';
+        $params[] = $vaultId;
+    }
+    $query = $db->prepare($sql);
+    $query->execute($params);
+    foreach ($query->fetchAll() as $permission) {
+        $actions = json_decode((string)$permission['actions'], true);
+        if (is_array($actions) && (in_array('edit', $actions, true) || in_array('admin', $actions, true))) return true;
+    }
+    return false;
+}
+
 header_remove('X-Powered-By');
 $root = dirname(__DIR__);
 $path = '/' . trim((string)(parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?? '/'), '/');
@@ -44,9 +121,9 @@ if (in_array($path, ['/installer/database-status', '/installer/commit'], true)) 
 
         $action = is_string($body['action'] ?? null) ? $body['action'] : '';
         if ($action === 'migrate') {
-            if ($inspection['state'] !== 'managed') {
+            if (!in_array($inspection['state'], ['managed', 'legacy'], true)) {
                 @unlink($pendingEnvironmentPath);
-                Runtime::respond(409, ['error' => 'MIGRATION_UNSAFE', 'message' => 'Only a versioned BluePLM database can be migrated automatically.']);
+                Runtime::respond(409, ['error' => 'MIGRATION_UNSAFE', 'message' => 'Only a recognized BluePLM database can be migrated automatically.']);
             }
         } elseif ($action === 'reset') {
         } elseif ($action !== 'install' || $inspection['state'] !== 'empty') {
@@ -90,12 +167,16 @@ if (in_array($path, ['/installer/database-status', '/installer/commit'], true)) 
             }
         }
 
-        $liveEnvironmentPath = $root . '/.env';
+        $activationRoot = is_string($_SERVER['BLUEPLM_LIVE_ROOT'] ?? null)
+            ? rtrim($_SERVER['BLUEPLM_LIVE_ROOT'], '/\\')
+            : $root;
+        $liveEnvironmentPath = $activationRoot . '/.env';
+        $stagedEnvironmentPath = $root . '/.env';
         if (!Installation::retireInstallationToken($pendingEnvironmentPath)) {
             throw new \RuntimeException('The one-time installation token could not be retired.');
         }
         $promoteEnvironment = $action !== 'migrate' || !$inspection['bootstrapped'] || !is_file($liveEnvironmentPath);
-        if ($promoteEnvironment && !@rename($pendingEnvironmentPath, $liveEnvironmentPath)) {
+        if ($promoteEnvironment && !@rename($pendingEnvironmentPath, $stagedEnvironmentPath)) {
             throw new \RuntimeException('The private server environment could not be activated.');
         }
         if (!$promoteEnvironment) @unlink($pendingEnvironmentPath);
@@ -103,6 +184,7 @@ if (in_array($path, ['/installer/database-status', '/installer/commit'], true)) 
             'applied' => $applied,
             'bootstrapped' => $needsBootstrap,
             'token' => $sessionToken,
+            'promoteEnvironment' => $promoteEnvironment,
         ]);
     } catch (\InvalidArgumentException $error) {
         @unlink($pendingEnvironmentPath);
@@ -118,7 +200,12 @@ Runtime::sendCors($env);
 if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'OPTIONS') Runtime::respond(204);
 
 try {
-    if ($path === '/health') Runtime::respond(200, ['ok' => true, 'runtime' => 'php', 'supabase' => false]);
+    if ($path === '/health') Runtime::respond(200, [
+        'ok' => true,
+        'runtime' => 'php',
+        'supabase' => false,
+        'apiVersion' => BLUEPLM_API_VERSION,
+    ]);
     $db = Runtime::database($env);
 
     // Shared hosting commonly has no SSH access. Schema updates therefore use
@@ -212,6 +299,7 @@ try {
     if (in_array($principal['role'], ['viewer', 'guest'], true) && $method !== 'GET') {
         $personalWrite = $path === '/account'
             || $path === '/recovery-codes/use'
+            || $path === '/column-defaults/user'
             || str_starts_with($path, '/device-sessions/')
             || str_starts_with($path, '/account/totp');
         if (!$personalWrite) Runtime::respond(403, ['error' => 'READ_ONLY_ROLE', 'message' => 'Viewer and guest accounts are read-only.']);
@@ -424,7 +512,7 @@ try {
         $query = $db->prepare('SELECT va.user_id, va.vault_id FROM vault_access va JOIN vaults v ON v.id = va.vault_id JOIN organization_memberships m ON m.user_id = va.user_id AND m.organization_id = v.organization_id WHERE v.organization_id = ? ORDER BY va.user_id, va.vault_id');
         $query->execute([$principal['organizationId']]);
         $accessMap = [];
-        foreach ($query->fetchAll() as $grant) $accessMap[$grant['user_id']][] = $grant['vault_id'];
+        foreach ($query->fetchAll() as $grant) $accessMap[$grant['vault_id']][] = $grant['user_id'];
         Runtime::respond(200, ['accessMap' => $accessMap]);
     }
     if ($method === 'GET' && preg_match('#^/users/([0-9a-f-]{36})/permissions$#i', $path, $matches)) {
@@ -653,6 +741,384 @@ try {
         Runtime::emitEvent($db, $principal['organizationId'], 'organization.default_team_updated', $principal['organizationId'], ['defaultNewUserTeamId' => $teamId, 'updatedBy' => $principal['userId']]);
         Runtime::respond(200, ['defaultNewUserTeamId' => $teamId]);
     }
+    if ($method === 'GET' && preg_match('#^/organizations/current/settings/(serialization|export|rfq|auth-providers)$#', $path, $matches)) {
+        $columns = [
+            'serialization' => 'serialization_settings',
+            'export' => 'export_settings',
+            'rfq' => 'rfq_settings',
+            'auth-providers' => 'auth_provider_settings',
+        ];
+        $section = $matches[1];
+        $column = $columns[$section];
+        $query = $db->prepare("SELECT {$column}, serialization_counter FROM organization_settings WHERE organization_id = ?");
+        $query->execute([$principal['organizationId']]);
+        $row = $query->fetch() ?: [];
+        $value = decodeOrganizationSetting($row[$column] ?? null);
+        if ($section === 'serialization') $value['current_counter'] = (int)($row['serialization_counter'] ?? 0);
+        Runtime::respond(200, ['value' => $value]);
+    }
+    if ($method === 'PUT' && preg_match('#^/organizations/current/settings/(serialization|export|rfq|auth-providers)$#', $path, $matches)) {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $columns = [
+            'serialization' => 'serialization_settings',
+            'export' => 'export_settings',
+            'rfq' => 'rfq_settings',
+            'auth-providers' => 'auth_provider_settings',
+        ];
+        $section = $matches[1];
+        $column = $columns[$section];
+        $body = Runtime::jsonBody();
+        $value = $body['value'] ?? null;
+        if (!is_array($value)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'value must be a JSON object.']);
+        $counter = null;
+        if ($section === 'serialization') {
+            if (array_key_exists('current_counter', $value)) {
+                if (!is_int($value['current_counter']) || $value['current_counter'] < 0) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'current_counter must be a non-negative integer.']);
+                if (($body['replaceCounter'] ?? false) === true) $counter = $value['current_counter'];
+                unset($value['current_counter']);
+            }
+        }
+        try {
+            $encoded = json_encode($value, JSON_THROW_ON_ERROR);
+        } catch (\JsonException) {
+            Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'value must contain valid JSON data.']);
+        }
+        if (strlen($encoded) > 65535) Runtime::respond(413, ['error' => 'PAYLOAD_TOO_LARGE', 'message' => 'Settings may not exceed 65535 bytes.']);
+        if ($section === 'serialization' && $counter !== null) {
+            $db->prepare("INSERT INTO organization_settings (organization_id, {$column}, serialization_counter) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE {$column} = VALUES({$column}), serialization_counter = VALUES(serialization_counter)")
+                ->execute([$principal['organizationId'], $encoded, $counter]);
+        } else {
+            $db->prepare("INSERT INTO organization_settings (organization_id, {$column}) VALUES (?, ?) ON DUPLICATE KEY UPDATE {$column} = VALUES({$column})")
+                ->execute([$principal['organizationId'], $encoded]);
+        }
+        if ($section === 'serialization') {
+            $query = $db->prepare('SELECT serialization_counter FROM organization_settings WHERE organization_id = ?');
+            $query->execute([$principal['organizationId']]);
+            $value['current_counter'] = (int)$query->fetchColumn();
+        }
+        Runtime::emitEvent($db, $principal['organizationId'], 'organization.settings_updated', $principal['organizationId'], ['section' => $section, 'updatedBy' => $principal['userId']]);
+        Runtime::respond(200, ['value' => $value]);
+    }
+    if (($method === 'GET' && $path === '/organizations/current/serialization/preview') || ($method === 'POST' && $path === '/organizations/current/serialization/next')) {
+        $mutating = $method === 'POST';
+        if ($mutating) $db->beginTransaction();
+        try {
+            if ($mutating) {
+                $db->prepare('INSERT IGNORE INTO organization_settings (organization_id) VALUES (?)')->execute([$principal['organizationId']]);
+            }
+            $suffix = $mutating ? ' FOR UPDATE' : '';
+            $query = $db->prepare('SELECT serialization_settings, serialization_counter FROM organization_settings WHERE organization_id = ?' . $suffix);
+            $query->execute([$principal['organizationId']]);
+            $row = $query->fetch() ?: [];
+            $settings = decodeOrganizationSetting($row['serialization_settings'] ?? null);
+            if (($settings['enabled'] ?? true) !== true) {
+                if ($mutating) $db->commit();
+                Runtime::respond(200, ['serialNumber' => null]);
+            }
+            $counter = nextOrganizationSerialCounter($settings, (int)($row['serialization_counter'] ?? 0));
+            if ($mutating) {
+                $db->prepare('UPDATE organization_settings SET serialization_counter = ? WHERE organization_id = ?')->execute([$counter, $principal['organizationId']]);
+                Runtime::emitEvent($db, $principal['organizationId'], 'organization.serial_number_allocated', $principal['organizationId'], ['counter' => $counter, 'allocatedBy' => $principal['userId']]);
+                $db->commit();
+            }
+            Runtime::respond(200, ['serialNumber' => formatOrganizationSerial($settings, $counter)]);
+        } catch (\Throwable $error) {
+            if ($db->inTransaction()) $db->rollBack();
+            throw $error;
+        }
+    }
+    if ($method === 'GET' && $path === '/organizations/current/serialization/exists') {
+        $serial = is_string($_GET['serial'] ?? null) ? trim($_GET['serial']) : '';
+        if ($serial === '' || strlen($serial) > 512) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid serial number is required.']);
+        // The unique database key reserves part numbers until permanent deletion,
+        // including while an item is in trash. Report the same availability rule.
+        $query = $db->prepare('SELECT 1 FROM files WHERE organization_id = ? AND part_number = ? LIMIT 1');
+        $query->execute([$principal['organizationId'], $serial]);
+        Runtime::respond(200, ['exists' => (bool)$query->fetchColumn()]);
+    }
+    if ($method === 'GET' && $path === '/organizations/current/serialization/files') {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $query = $db->prepare('SELECT part_number AS partNumber, canonical_path AS filePath FROM files WHERE organization_id = ? AND part_number IS NOT NULL AND deleted_at IS NULL ORDER BY part_number');
+        $query->execute([$principal['organizationId']]);
+        Runtime::respond(200, ['files' => $query->fetchAll()]);
+    }
+    if ($method === 'GET' && $path === '/module-access') {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $query = $db->prepare('SELECT module_id, team_id, user_id FROM module_access WHERE organization_id = ? ORDER BY module_id, granted_at');
+        $query->execute([$principal['organizationId']]);
+        Runtime::respond(200, ['access' => $query->fetchAll()]);
+    }
+    if ($method === 'GET' && $path === '/module-access/denied') {
+        if (in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(200, ['moduleIds' => []]);
+        $query = $db->prepare('SELECT DISTINCT restricted.module_id FROM module_access restricted WHERE restricted.organization_id = ? AND NOT EXISTS (SELECT 1 FROM module_access allowed LEFT JOIN team_members tm ON tm.team_id = allowed.team_id AND tm.user_id = ? WHERE allowed.organization_id = restricted.organization_id AND allowed.module_id = restricted.module_id AND (allowed.user_id = ? OR tm.user_id IS NOT NULL)) ORDER BY restricted.module_id');
+        $query->execute([$principal['organizationId'], $principal['userId'], $principal['userId']]);
+        Runtime::respond(200, ['moduleIds' => array_values(array_map(static fn(array $row): string => $row['module_id'], $query->fetchAll()))]);
+    }
+    if ($method === 'PUT' && preg_match('#^/module-access/([a-z0-9-]{1,128})$#', $path, $matches)) {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $body = Runtime::jsonBody();
+        $teamIds = $body['teamIds'] ?? [];
+        $userIds = $body['userIds'] ?? [];
+        if (!is_array($teamIds) || !is_array($userIds) || count($teamIds) > 500 || count($userIds) > 500) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'teamIds and userIds must be arrays with at most 500 entries.']);
+        $moduleId = $matches[1];
+        $teamIds = array_values(array_unique($teamIds));
+        $userIds = array_values(array_unique($userIds));
+        $teamLookup = $db->prepare('SELECT id FROM teams WHERE id = ? AND organization_id = ?');
+        foreach ($teamIds as $teamId) {
+            if (!is_string($teamId)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Invalid team ID.']);
+            $teamLookup->execute([$teamId, $principal['organizationId']]);
+            if (!$teamLookup->fetch()) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Team not found.']);
+        }
+        $userLookup = $db->prepare('SELECT u.id FROM users u JOIN organization_memberships m ON m.user_id = u.id WHERE u.id = ? AND m.organization_id = ?');
+        foreach ($userIds as $userId) {
+            if (!is_string($userId)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Invalid user ID.']);
+            $userLookup->execute([$userId, $principal['organizationId']]);
+            if (!$userLookup->fetch()) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'User not found.']);
+        }
+        $db->beginTransaction();
+        try {
+            $db->prepare('DELETE FROM module_access WHERE organization_id = ? AND module_id = ?')->execute([$principal['organizationId'], $moduleId]);
+            $insert = $db->prepare('INSERT INTO module_access (id, organization_id, module_id, team_id, user_id, granted_by) VALUES (?, ?, ?, ?, ?, ?)');
+            foreach ($teamIds as $teamId) {
+                $insert->execute([Runtime::uuid(), $principal['organizationId'], $moduleId, $teamId, null, $principal['userId']]);
+            }
+            foreach ($userIds as $userId) {
+                $insert->execute([Runtime::uuid(), $principal['organizationId'], $moduleId, null, $userId, $principal['userId']]);
+            }
+            $db->commit();
+        } catch (\Throwable $error) {
+            if ($db->inTransaction()) $db->rollBack();
+            throw $error;
+        }
+        Runtime::emitEvent($db, $principal['organizationId'], 'organization.module_access_updated', $principal['organizationId'], ['moduleId' => $moduleId, 'updatedBy' => $principal['userId']]);
+        Runtime::respond(200, ['success' => true, 'restricted' => count($teamIds) + count($userIds) > 0]);
+    }
+    if ($method === 'GET' && $path === '/item-designations') {
+        $count = $db->prepare('SELECT COUNT(*) FROM item_designations WHERE organization_id = ?');
+        $count->execute([$principal['organizationId']]);
+        if ((int)$count->fetchColumn() === 0) {
+            $seed = $db->prepare('INSERT IGNORE INTO item_designations (id, organization_id, name, sort_order) VALUES (?, ?, ?, ?)');
+            foreach ([['Part', 0], ['Assembly', 1], ['Packed Assembly', 2]] as [$name, $sortOrder]) {
+                $seed->execute([Runtime::uuid(), $principal['organizationId'], $name, $sortOrder]);
+            }
+        }
+        $query = $db->prepare('SELECT id, name, sort_order FROM item_designations WHERE organization_id = ? ORDER BY sort_order, name');
+        $query->execute([$principal['organizationId']]);
+        Runtime::respond(200, ['designations' => $query->fetchAll()]);
+    }
+    if ($method === 'POST' && $path === '/item-designations') {
+        if (!canManageItemDesignations($db, $principal)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Item designation edit permission required.']);
+        $body = Runtime::jsonBody();
+        $name = is_string($body['name'] ?? null) ? trim($body['name']) : '';
+        $sortOrder = $body['sortOrder'] ?? null;
+        if ($name === '' || strlen($name) > 120 || str_contains($name, "\0") || ($sortOrder !== null && (!is_int($sortOrder) || $sortOrder < 0 || $sortOrder > 2147483647))) {
+            Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'name and an optional non-negative sortOrder are required.']);
+        }
+        if ($sortOrder === null) {
+            $next = $db->prepare('SELECT COALESCE(MAX(sort_order), -1) + 1 FROM item_designations WHERE organization_id = ?');
+            $next->execute([$principal['organizationId']]);
+            $sortOrder = (int)$next->fetchColumn();
+        }
+        $id = Runtime::uuid();
+        try {
+            $db->prepare('INSERT INTO item_designations (id, organization_id, name, sort_order) VALUES (?, ?, ?, ?)')
+                ->execute([$id, $principal['organizationId'], $name, $sortOrder]);
+        } catch (PDOException $error) {
+            if ($error->getCode() === '23000') Runtime::respond(409, ['error' => 'ALREADY_EXISTS', 'message' => 'An item designation with this name already exists.']);
+            throw $error;
+        }
+        $query = $db->prepare('SELECT id, name, sort_order FROM item_designations WHERE id = ? AND organization_id = ?');
+        $query->execute([$id, $principal['organizationId']]);
+        Runtime::respond(201, ['designation' => $query->fetch()]);
+    }
+    if ($method === 'PATCH' && preg_match('#^/item-designations/([0-9a-f-]{36})$#i', $path, $matches)) {
+        if (!canManageItemDesignations($db, $principal)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Item designation edit permission required.']);
+        $body = Runtime::jsonBody();
+        $name = is_string($body['name'] ?? null) ? trim($body['name']) : '';
+        $sortOrder = $body['sortOrder'] ?? null;
+        if ($name === '' || strlen($name) > 120 || str_contains($name, "\0") || ($sortOrder !== null && (!is_int($sortOrder) || $sortOrder < 0 || $sortOrder > 2147483647))) {
+            Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'name and an optional non-negative sortOrder are required.']);
+        }
+        $exists = $db->prepare('SELECT 1 FROM item_designations WHERE id = ? AND organization_id = ?');
+        $exists->execute([$matches[1], $principal['organizationId']]);
+        if (!$exists->fetchColumn()) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Item designation not found.']);
+        try {
+            if ($sortOrder === null) {
+                $db->prepare('UPDATE item_designations SET name = ? WHERE id = ? AND organization_id = ?')
+                    ->execute([$name, $matches[1], $principal['organizationId']]);
+            } else {
+                $db->prepare('UPDATE item_designations SET name = ?, sort_order = ? WHERE id = ? AND organization_id = ?')
+                    ->execute([$name, $sortOrder, $matches[1], $principal['organizationId']]);
+            }
+        } catch (PDOException $error) {
+            if ($error->getCode() === '23000') Runtime::respond(409, ['error' => 'ALREADY_EXISTS', 'message' => 'An item designation with this name already exists.']);
+            throw $error;
+        }
+        $query = $db->prepare('SELECT id, name, sort_order FROM item_designations WHERE id = ? AND organization_id = ?');
+        $query->execute([$matches[1], $principal['organizationId']]);
+        Runtime::respond(200, ['designation' => $query->fetch()]);
+    }
+    if ($method === 'DELETE' && preg_match('#^/item-designations/([0-9a-f-]{36})$#i', $path, $matches)) {
+        if (!canManageItemDesignations($db, $principal)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Item designation edit permission required.']);
+        try {
+            $query = $db->prepare('DELETE FROM item_designations WHERE id = ? AND organization_id = ?');
+            $query->execute([$matches[1], $principal['organizationId']]);
+        } catch (PDOException $error) {
+            if ($error->getCode() === '23000') Runtime::respond(409, ['error' => 'DESIGNATION_IN_USE', 'message' => 'The item designation is still assigned to one or more items.']);
+            throw $error;
+        }
+        if ($query->rowCount() === 0) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Item designation not found.']);
+        Runtime::respond(204);
+    }
+    if ($method === 'GET' && preg_match('#^/vaults/([0-9a-f-]{36})/item-designations$#i', $path, $matches)) {
+        $vaultId = $matches[1];
+        Runtime::requireVault($db, $principal, $vaultId);
+        $query = $db->prepare('SELECT part_number, designation_id FROM item_designation_assignments WHERE organization_id = ? AND vault_id = ? ORDER BY part_number');
+        $query->execute([$principal['organizationId'], $vaultId]);
+        Runtime::respond(200, ['assignments' => $query->fetchAll()]);
+    }
+    if ($method === 'PUT' && preg_match('#^/vaults/([0-9a-f-]{36})/item-designations/([^/]+)$#i', $path, $matches)) {
+        $vaultId = $matches[1];
+        Runtime::requireVault($db, $principal, $vaultId);
+        if (!canManageItemDesignations($db, $principal, $vaultId)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Item designation edit permission required.']);
+        $partNumber = rawurldecode($matches[2]);
+        $body = Runtime::jsonBody();
+        $designationId = $body['designationId'] ?? null;
+        if ($partNumber === '' || strlen($partNumber) > 512 || str_contains($partNumber, "\0") || ($designationId !== null && (!is_string($designationId) || !preg_match('/^[0-9a-f-]{36}$/i', $designationId)))) {
+            Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid part number and designationId are required.']);
+        }
+        if ($designationId === null) {
+            $db->prepare('DELETE FROM item_designation_assignments WHERE organization_id = ? AND vault_id = ? AND part_number = ?')
+                ->execute([$principal['organizationId'], $vaultId, $partNumber]);
+            Runtime::respond(200, ['success' => true]);
+        }
+        $designation = $db->prepare('SELECT id FROM item_designations WHERE id = ? AND organization_id = ?');
+        $designation->execute([$designationId, $principal['organizationId']]);
+        if (!$designation->fetchColumn()) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Item designation not found.']);
+        $db->prepare('INSERT INTO item_designation_assignments (organization_id, vault_id, part_number, designation_id) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE designation_id = VALUES(designation_id), updated_at = CURRENT_TIMESTAMP(3)')
+            ->execute([$principal['organizationId'], $vaultId, $partNumber, $designationId]);
+        Runtime::respond(200, ['success' => true]);
+    }
+    if ($method === 'GET' && $path === '/metadata-columns') {
+        $query = $db->prepare('SELECT id, organization_id AS org_id, name, label, data_type, select_options, width, visible, sortable, required, default_value, sort_order, created_by, updated_by, created_at, updated_at FROM file_metadata_columns WHERE organization_id = ? ORDER BY sort_order, name');
+        $query->execute([$principal['organizationId']]);
+        $rows = $query->fetchAll();
+        foreach ($rows as &$row) {
+            $row['select_options'] = decodeOrganizationSetting($row['select_options']);
+            $row['width'] = (int)$row['width'];
+            $row['sort_order'] = (int)$row['sort_order'];
+            foreach (['visible', 'sortable', 'required'] as $flag) $row[$flag] = (bool)$row[$flag];
+        }
+        unset($row);
+        Runtime::respond(200, ['columns' => $rows]);
+    }
+    if ($method === 'POST' && $path === '/metadata-columns') {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $body = Runtime::jsonBody();
+        $name = is_string($body['name'] ?? null) ? strtolower(trim($body['name'])) : '';
+        $label = is_string($body['label'] ?? null) ? trim($body['label']) : '';
+        $dataType = is_string($body['data_type'] ?? null) ? $body['data_type'] : 'text';
+        $options = $body['select_options'] ?? [];
+        if (!preg_match('/^[a-z][a-z0-9_]{0,127}$/', $name) || $label === '' || strlen($label) > 256 || !in_array($dataType, ['text', 'number', 'date', 'boolean', 'select'], true) || !is_array($options)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Invalid metadata column.']);
+        $id = Runtime::uuid();
+        try {
+            $db->prepare('INSERT INTO file_metadata_columns (id, organization_id, name, label, data_type, select_options, width, visible, sortable, required, default_value, sort_order, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')->execute([$id, $principal['organizationId'], $name, $label, $dataType, json_encode(array_values($options), JSON_THROW_ON_ERROR), max(40, min(1000, (int)($body['width'] ?? 120))), (int)(bool)($body['visible'] ?? true), (int)(bool)($body['sortable'] ?? true), (int)(bool)($body['required'] ?? false), is_string($body['default_value'] ?? null) ? substr($body['default_value'], 0, 20000) : null, (int)($body['sort_order'] ?? 0), $principal['userId']]);
+        } catch (PDOException $error) {
+            if ($error->getCode() === '23000') Runtime::respond(409, ['error' => 'ALREADY_EXISTS', 'message' => 'A metadata column with this name already exists.']);
+            throw $error;
+        }
+        Runtime::respond(201, ['id' => $id]);
+    }
+    if ($method === 'PATCH' && preg_match('#^/metadata-columns/([0-9a-f-]{36})$#i', $path, $matches)) {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $body = Runtime::jsonBody();
+        $mapping = ['name' => 'name', 'label' => 'label', 'data_type' => 'data_type', 'width' => 'width', 'visible' => 'visible', 'sortable' => 'sortable', 'required' => 'required', 'default_value' => 'default_value', 'sort_order' => 'sort_order'];
+        $sets = [];
+        $values = [];
+        foreach ($mapping as $input => $column) {
+            if (!array_key_exists($input, $body)) continue;
+            $value = $body[$input];
+            if ($input === 'name' && (!is_string($value) || !preg_match('/^[a-z][a-z0-9_]{0,127}$/', $value))) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Invalid column name.']);
+            if ($input === 'label' && (!is_string($value) || trim($value) === '' || strlen($value) > 256)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Invalid column label.']);
+            if ($input === 'data_type' && (!is_string($value) || !in_array($value, ['text', 'number', 'date', 'boolean', 'select'], true))) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Invalid column type.']);
+            if ($input === 'width') $value = max(40, min(1000, (int)$value));
+            if (in_array($input, ['visible', 'sortable', 'required'], true)) $value = (int)(bool)$value;
+            if ($input === 'default_value') $value = is_string($value) ? substr($value, 0, 20000) : null;
+            if ($input === 'sort_order') $value = (int)$value;
+            $sets[] = "{$column} = ?";
+            $values[] = $value;
+        }
+        if (array_key_exists('select_options', $body)) {
+            if (!is_array($body['select_options'])) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'select_options must be an array.']);
+            $sets[] = 'select_options = ?';
+            $values[] = json_encode(array_values($body['select_options']), JSON_THROW_ON_ERROR);
+        }
+        if (!$sets) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'At least one field is required.']);
+        $sets[] = 'updated_by = ?';
+        $values[] = $principal['userId'];
+        $values[] = $matches[1];
+        $values[] = $principal['organizationId'];
+        try {
+            $statement = $db->prepare('UPDATE file_metadata_columns SET ' . implode(', ', $sets) . ' WHERE id = ? AND organization_id = ?');
+            $statement->execute($values);
+        } catch (PDOException $error) {
+            if ($error->getCode() === '23000') Runtime::respond(409, ['error' => 'ALREADY_EXISTS', 'message' => 'A metadata column with this name already exists.']);
+            throw $error;
+        }
+        if ($statement->rowCount() === 0) {
+            $exists = $db->prepare('SELECT 1 FROM file_metadata_columns WHERE id = ? AND organization_id = ?');
+            $exists->execute([$matches[1], $principal['organizationId']]);
+            if (!$exists->fetchColumn()) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Metadata column not found.']);
+        }
+        Runtime::respond(200, ['success' => true]);
+    }
+    if ($method === 'GET' && $path === '/column-defaults/organization') {
+        $query = $db->prepare('SELECT column_defaults FROM organization_settings WHERE organization_id = ?');
+        $query->execute([$principal['organizationId']]);
+        $value = $query->fetchColumn();
+        Runtime::respond(200, ['columnDefaults' => decodeOrganizationSetting($value)]);
+    }
+    if ($method === 'PUT' && $path === '/column-defaults/organization') {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $columnDefaults = normalizeColumnDefaults(Runtime::jsonBody()['columnDefaults'] ?? null);
+        $db->prepare('INSERT INTO organization_settings (organization_id, column_defaults) VALUES (?, ?) ON DUPLICATE KEY UPDATE column_defaults = VALUES(column_defaults)')
+            ->execute([$principal['organizationId'], json_encode($columnDefaults, JSON_THROW_ON_ERROR)]);
+        Runtime::respond(200, ['columnDefaults' => $columnDefaults]);
+    }
+    if ($method === 'POST' && $path === '/column-defaults/organization/force') {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $columnDefaults = normalizeColumnDefaults(Runtime::jsonBody()['columnDefaults'] ?? null);
+        $encoded = json_encode($columnDefaults, JSON_THROW_ON_ERROR);
+        $db->beginTransaction();
+        try {
+            $db->prepare('INSERT INTO organization_settings (organization_id, column_defaults) VALUES (?, ?) ON DUPLICATE KEY UPDATE column_defaults = VALUES(column_defaults)')->execute([$principal['organizationId'], $encoded]);
+            $db->prepare('INSERT INTO user_settings (user_id, column_defaults) SELECT user_id, ? FROM organization_memberships WHERE organization_id = ? ON DUPLICATE KEY UPDATE column_defaults = VALUES(column_defaults)')->execute([$encoded, $principal['organizationId']]);
+            $db->commit();
+        } catch (Throwable $error) {
+            if ($db->inTransaction()) $db->rollBack();
+            throw $error;
+        }
+        Runtime::respond(200, ['columnDefaults' => $columnDefaults]);
+    }
+    if ($method === 'GET' && $path === '/column-defaults/user') {
+        $query = $db->prepare('SELECT column_defaults FROM user_settings WHERE user_id = ?');
+        $query->execute([$principal['userId']]);
+        $value = $query->fetchColumn();
+        Runtime::respond(200, ['columnDefaults' => decodeOrganizationSetting($value)]);
+    }
+    if ($method === 'PUT' && $path === '/column-defaults/user') {
+        $columnDefaults = normalizeColumnDefaults(Runtime::jsonBody()['columnDefaults'] ?? null);
+        $db->prepare('INSERT INTO user_settings (user_id, column_defaults) VALUES (?, ?) ON DUPLICATE KEY UPDATE column_defaults = VALUES(column_defaults)')
+            ->execute([$principal['userId'], json_encode($columnDefaults, JSON_THROW_ON_ERROR)]);
+        Runtime::respond(200, ['columnDefaults' => $columnDefaults]);
+    }
+    if ($method === 'DELETE' && preg_match('#^/metadata-columns/([0-9a-f-]{36})$#i', $path, $matches)) {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $statement = $db->prepare('DELETE FROM file_metadata_columns WHERE id = ? AND organization_id = ?');
+        $statement->execute([$matches[1], $principal['organizationId']]);
+        if ($statement->rowCount() === 0) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Metadata column not found.']);
+        Runtime::respond(204);
+    }
     if ($method === 'GET' && $path === '/organizations/current/profile') {
         $q=$db->prepare('SELECT logo_storage_path,phone,website,contact_email FROM organizations WHERE id=?');$q->execute([$principal['organizationId']]);Runtime::respond(200,['profile'=>$q->fetch()?:null]);
     }
@@ -830,7 +1296,7 @@ try {
     if ($method === 'GET' && preg_match('#^/vaults/([0-9a-f-]{36})/files$#i', $path, $matches)) {
         Runtime::requireVault($db, $principal, $matches[1]);
         $query = $db->prepare(
-            'SELECT f.id, f.canonical_path AS canonicalPath, f.file_name AS fileName, f.storage_relative_path AS storageRelativePath,
+            'SELECT f.id, f.canonical_path AS canonicalPath, f.file_name AS fileName, f.part_number AS partNumber, f.storage_relative_path AS storageRelativePath,
                     f.current_revision AS currentRevision, f.state, f.content_hash AS contentHash, f.size_bytes AS sizeBytes,
                     f.created_at AS createdAt, f.updated_at AS updatedAt, c.user_id AS checkedOutByUserId, u.display_name AS checkedOutBy, c.expires_at AS checkoutExpiresAt
              FROM files f LEFT JOIN checkouts c ON c.file_id = f.id AND c.expires_at > UTC_TIMESTAMP(3)
@@ -850,22 +1316,42 @@ try {
         $storageRelativePath = ltrim(str_replace('\\', '/', trim($body['storageRelativePath'])), '/');
         if ($canonicalPath === '' || $storageRelativePath === '' || str_contains($canonicalPath, '../') || str_contains($storageRelativePath, '../')) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'File paths must be normalized vault-relative paths.']);
         $fileName = is_string($body['fileName'] ?? null) && trim($body['fileName']) !== '' ? trim($body['fileName']) : basename($canonicalPath);
+        $partNumber = is_string($body['partNumber'] ?? null) && trim($body['partNumber']) !== '' ? trim($body['partNumber']) : null;
+        if ($partNumber !== null && strlen($partNumber) > 512) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'partNumber is too long.']);
         $contentHash = is_string($body['contentHash'] ?? null) && preg_match('/^[a-f0-9]{64}$/i', $body['contentHash']) ? strtolower($body['contentHash']) : null;
         $sizeBytes = is_int($body['sizeBytes'] ?? null) && $body['sizeBytes'] >= 0 ? $body['sizeBytes'] : null;
-        $existing = $db->prepare('SELECT id FROM files WHERE vault_id = ? AND canonical_path = ? AND deleted_at IS NULL');
+        $existing = $db->prepare('SELECT id, part_number FROM files WHERE vault_id = ? AND canonical_path = ? AND deleted_at IS NULL');
         $existing->execute([$vaultId, $canonicalPath]);
         $record = $existing->fetch();
-        if ($record) Runtime::respond(200, ['id' => $record['id'], 'created' => false]);
+        if ($record) {
+            try {
+                // A rescan after upgrading from a schema without part_number is
+                // the authoritative backfill path for existing vault contents.
+                if ($partNumber !== null && $record['part_number'] !== $partNumber) {
+                    $db->prepare('UPDATE files SET part_number = ? WHERE id = ? AND organization_id = ?')
+                        ->execute([$partNumber, $record['id'], $principal['organizationId']]);
+                }
+            } catch (PDOException $error) {
+                if ($error->getCode() === '23000' && str_contains($error->getMessage(), 'uq_files_org_part_number')) {
+                    Runtime::respond(409, ['error' => 'PART_NUMBER_EXISTS', 'message' => 'This part number is already assigned to another file.']);
+                }
+                throw $error;
+            }
+            Runtime::respond(200, ['id' => $record['id'], 'created' => false]);
+        }
         $fileId = Runtime::uuid();
         $db->beginTransaction();
         try {
-            $db->prepare('INSERT INTO files (id, organization_id, vault_id, canonical_path, file_name, storage_relative_path, current_revision, content_hash, size_bytes) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)')->execute([$fileId, $principal['organizationId'], $vaultId, $canonicalPath, $fileName, $storageRelativePath, $contentHash, $sizeBytes]);
+            $db->prepare('INSERT INTO files (id, organization_id, vault_id, canonical_path, file_name, part_number, storage_relative_path, current_revision, content_hash, size_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)')->execute([$fileId, $principal['organizationId'], $vaultId, $canonicalPath, $fileName, $partNumber, $storageRelativePath, $contentHash, $sizeBytes]);
             $db->prepare('INSERT INTO file_revisions (id, file_id, revision_number, content_hash, storage_relative_path, size_bytes, checked_in_by, comment) VALUES (?, ?, 1, ?, ?, ?, ?, ?)')->execute([Runtime::uuid(), $fileId, $contentHash, $storageRelativePath, $sizeBytes, $principal['userId'], 'Initial vault import']);
             Runtime::emitEvent($db, $principal['organizationId'], 'file.imported', $fileId, ['userId' => $principal['userId'], 'vaultId' => $vaultId]);
             $db->commit();
         } catch (Throwable $error) {
             if ($db->inTransaction()) $db->rollBack();
-            if ($error instanceof PDOException && $error->getCode() === '23000') Runtime::respond(409, ['error' => 'PATH_EXISTS', 'message' => 'A file already exists at this vault path.']);
+            if ($error instanceof PDOException && $error->getCode() === '23000') {
+                if (str_contains($error->getMessage(), 'uq_files_org_part_number')) Runtime::respond(409, ['error' => 'PART_NUMBER_EXISTS', 'message' => 'This part number is already assigned to another file.']);
+                Runtime::respond(409, ['error' => 'PATH_EXISTS', 'message' => 'A file already exists at this vault path.']);
+            }
             throw $error;
         }
         Runtime::respond(201, ['id' => $fileId, 'created' => true]);
@@ -930,7 +1416,10 @@ try {
             }
             Runtime::emitEvent($db, $principal['organizationId'], 'file.inspection_updated', $fileId, ['count' => count($validatedRows), 'userId' => $principal['userId']]);
             $db->commit();
-        } catch (Throwable $error) { if ($db->inTransaction()) $db->rollBack(); throw $error; }
+        } catch (Throwable $error) {
+            if ($db->inTransaction()) $db->rollBack();
+            throw $error;
+        }
         Runtime::respond(200, ['success' => true]);
     }
     if ($method === 'GET' && preg_match('#^/file-revisions/([0-9a-f-]{36})/inspection$#i', $path, $matches)) {
@@ -1023,13 +1512,28 @@ try {
             $hash = is_string($body['contentHash'] ?? null) && preg_match('/^[a-f0-9]{64}$/i', $body['contentHash']) ? $body['contentHash'] : null;
             $size = is_int($body['sizeBytes'] ?? null) && $body['sizeBytes'] >= 0 ? $body['sizeBytes'] : null;
             $comment = is_string($body['comment'] ?? null) ? substr($body['comment'], 0, 4000) : null;
-            $db->prepare('UPDATE files SET current_revision = ?, storage_relative_path = ?, content_hash = ?, size_bytes = ? WHERE id = ?')->execute([$revision, $relativePath, $hash, $size, $fileId]);
+            $partNumberProvided = array_key_exists('partNumber', $body);
+            $partNumber = null;
+            if ($partNumberProvided) {
+                if ($body['partNumber'] !== null && !is_string($body['partNumber'])) { $db->rollBack(); Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'partNumber must be a string or null.']); }
+                $partNumber = is_string($body['partNumber']) && trim($body['partNumber']) !== '' ? trim($body['partNumber']) : null;
+                if ($partNumber !== null && strlen($partNumber) > 512) { $db->rollBack(); Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'partNumber is too long.']); }
+            }
+            if ($partNumberProvided) {
+                $db->prepare('UPDATE files SET current_revision = ?, storage_relative_path = ?, content_hash = ?, size_bytes = ?, part_number = ? WHERE id = ?')->execute([$revision, $relativePath, $hash, $size, $partNumber, $fileId]);
+            } else {
+                $db->prepare('UPDATE files SET current_revision = ?, storage_relative_path = ?, content_hash = ?, size_bytes = ? WHERE id = ?')->execute([$revision, $relativePath, $hash, $size, $fileId]);
+            }
             $revisionId = Runtime::uuid();
             $db->prepare('INSERT INTO file_revisions (id, file_id, revision_number, content_hash, storage_relative_path, size_bytes, checked_in_by, comment) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')->execute([$revisionId, $fileId, $revision, $hash, $relativePath, $size, $principal['userId'], $comment]);
             $db->prepare('INSERT INTO inspection_characteristic_versions (id, file_revision_id, organization_id, sort_order, balloon_number, char_id, zone, char_type, sub_type, nominal_value, unit, plus_tolerance, minus_tolerance, upper_limit, lower_limit, classification, inspection_method, operation, aql, sample_size, supplier_inspection_rate, internal_inspection_rate, reference, comments) SELECT UUID(), ?, organization_id, sort_order, balloon_number, char_id, zone, char_type, sub_type, nominal_value, unit, plus_tolerance, minus_tolerance, upper_limit, lower_limit, classification, inspection_method, operation, aql, sample_size, supplier_inspection_rate, internal_inspection_rate, reference, comments FROM inspection_characteristics WHERE file_id = ?')->execute([$revisionId, $fileId]);
             Runtime::emitEvent($db, $principal['organizationId'], 'file.checked_in', $fileId, ['revision' => $revision, 'userId' => $principal['userId']]);
             $db->prepare('DELETE FROM checkouts WHERE file_id = ?')->execute([$fileId]); $db->commit();
-        } catch (Throwable $error) { if ($db->inTransaction()) $db->rollBack(); throw $error; }
+        } catch (Throwable $error) {
+            if ($db->inTransaction()) $db->rollBack();
+            if ($error instanceof PDOException && $error->getCode() === '23000' && str_contains($error->getMessage(), 'uq_files_org_part_number')) Runtime::respond(409, ['error' => 'PART_NUMBER_EXISTS', 'message' => 'This part number is already assigned to another file.']);
+            throw $error;
+        }
         Runtime::respond(200, ['fileId' => $fileId, 'revision' => $revision]);
     }
     if ($method === 'POST' && preg_match('#^/files/([0-9a-f-]{36})/checkout/renew$#i', $path, $matches)) {

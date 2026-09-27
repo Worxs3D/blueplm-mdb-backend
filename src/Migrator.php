@@ -35,6 +35,7 @@ final class Migrator
             try {
                 $db->exec($sql);
                 if ($migration === '015_eco_metadata.sql') self::ensureEcoMetadataConstraints($db);
+                if ($migration === '024_file_part_numbers.sql') self::ensureFilePartNumberConstraint($db);
             } catch (\Throwable $error) {
                 // The route may safely identify the migration to a holder of
                 // the bootstrap secret, while the underlying database error
@@ -59,6 +60,18 @@ final class Migrator
             'fk_eco_updater',
             'ALTER TABLE ecos ADD CONSTRAINT fk_eco_updater FOREIGN KEY (updated_by) REFERENCES users(id) ON DELETE SET NULL'
         );
+    }
+
+    private static function ensureFilePartNumberConstraint(PDO $db): void
+    {
+        $query = $db->prepare(
+            'SELECT 1 FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ?'
+        );
+        $query->execute(['files', 'uq_files_org_part_number']);
+        if (!$query->fetchColumn()) {
+            $db->exec('ALTER TABLE files ADD UNIQUE KEY uq_files_org_part_number (organization_id, part_number)');
+        }
     }
 
     private static function addForeignKeyIfMissing(PDO $db, string $name, string $statement): void

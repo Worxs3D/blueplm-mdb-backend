@@ -70,7 +70,7 @@ async function waitForHealth() {
   for (let attempt = 0; attempt < 40; attempt += 1) {
     try {
       const health = await request('/health')
-      if (health.ok === true && health.supabase === false) {
+      if (health.ok === true && health.supabase === false && health.apiVersion === 2) {
         const databaseProbe = await fetch(`${server}/installer/database-status`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -279,6 +279,57 @@ const defaultTeam = await request(
 )
 assert.equal(defaultTeam.defaultNewUserTeamId, createdTeam.id)
 
+const serializationSettings = {
+  enabled: true,
+  prefix: 'TEST-',
+  suffix: '-A',
+  padding_digits: 4,
+  letter_prefix: '',
+  keepout_zones: [{ start: 2, end_num: 4, description: 'Reserved' }],
+  current_counter: 0,
+}
+const savedSerialization = await request(
+  '/organizations/current/settings/serialization',
+  {
+    method: 'PUT',
+    body: JSON.stringify({ value: serializationSettings, replaceCounter: true }),
+  },
+  token,
+)
+assert.equal(savedSerialization.value.current_counter, 0)
+const loadedSerialization = await request('/organizations/current/settings/serialization', {}, token)
+assert.equal(loadedSerialization.value.prefix, 'TEST-')
+assert.equal(loadedSerialization.value.current_counter, 0)
+assert.equal(
+  (await request('/organizations/current/serialization/preview', {}, token)).serialNumber,
+  'TEST-0001-A',
+)
+assert.equal(
+  (await request('/organizations/current/serialization/next', { method: 'POST' }, token)).serialNumber,
+  'TEST-0001-A',
+)
+assert.equal(
+  (await request('/organizations/current/serialization/next', { method: 'POST' }, token)).serialNumber,
+  'TEST-0005-A',
+)
+assert.equal(
+  (await request('/organizations/current/settings/serialization', {}, token)).value.current_counter,
+  5,
+)
+
+for (const [section, value] of Object.entries({
+  export: { filename_pattern: '{partNumber}' },
+  rfq: { default_payment_terms: 'Net 30' },
+  'auth-providers': { users: { email: true } },
+})) {
+  await request(
+    `/organizations/current/settings/${section}`,
+    { method: 'PUT', body: JSON.stringify({ value }) },
+    token,
+  )
+  assert.deepEqual((await request(`/organizations/current/settings/${section}`, {}, token)).value, value)
+}
+
 // Viewer accounts inherit team vault grants. Guest accounts deliberately do
 // not: they see only explicitly assigned vaults. Both roles remain read-only.
 const viewer = await request(
@@ -322,6 +373,88 @@ const guestLogin = await request('/auth/login', {
   method: 'POST',
   body: JSON.stringify({ email: 'guest@example.test', password: 'Integration guest password 123!' }),
 })
+await request(
+  '/module-access/customers',
+  { method: 'PUT', body: JSON.stringify({ teamIds: [], userIds: [viewer.id] }) },
+  token,
+)
+const moduleAccess = await request('/module-access', {}, token)
+assert.deepEqual(moduleAccess.access, [
+  { module_id: 'customers', team_id: null, user_id: viewer.id },
+])
+assert.deepEqual((await request('/module-access/denied', {}, viewerLogin.token)).moduleIds, [])
+assert.deepEqual((await request('/module-access/denied', {}, guestLogin.token)).moduleIds, ['customers'])
+
+const columnDefaults = [
+  { id: 'name', width: 320, visible: true },
+  { id: 'revision', width: 70, visible: false },
+]
+await request(
+  '/column-defaults/organization',
+  { method: 'PUT', body: JSON.stringify({ columnDefaults }) },
+  token,
+)
+assert.deepEqual(
+  (await request('/column-defaults/organization', {}, viewerLogin.token)).columnDefaults,
+  columnDefaults,
+)
+await request(
+  '/column-defaults/user',
+  { method: 'PUT', body: JSON.stringify({ columnDefaults: columnDefaults.slice(0, 1) }) },
+  viewerLogin.token,
+)
+assert.deepEqual(
+  (await request('/column-defaults/user', {}, viewerLogin.token)).columnDefaults,
+  columnDefaults.slice(0, 1),
+)
+await request(
+  '/column-defaults/organization/force',
+  { method: 'POST', body: JSON.stringify({ columnDefaults }) },
+  token,
+)
+assert.deepEqual(
+  (await request('/column-defaults/user', {}, guestLogin.token)).columnDefaults,
+  columnDefaults,
+)
+
+const metadataColumn = await request(
+  '/metadata-columns',
+  {
+    method: 'POST',
+    body: JSON.stringify({
+      name: 'material_grade',
+      label: 'Material grade',
+      data_type: 'select',
+      select_options: ['A', 'B'],
+      width: 180,
+      visible: true,
+      sortable: true,
+      required: false,
+      default_value: 'A',
+      sort_order: 0,
+    }),
+  },
+  token,
+)
+let metadataColumns = await request('/metadata-columns', {}, viewerLogin.token)
+assert.equal(metadataColumns.columns[0].id, metadataColumn.id)
+assert.deepEqual(metadataColumns.columns[0].select_options, ['A', 'B'])
+await request(
+  `/metadata-columns/${metadataColumn.id}`,
+  { method: 'PATCH', body: JSON.stringify({ label: 'Material class', visible: false }) },
+  token,
+)
+await request(
+  `/metadata-columns/${metadataColumn.id}`,
+  { method: 'PATCH', body: JSON.stringify({ label: 'Material class', visible: false }) },
+  token,
+)
+metadataColumns = await request('/metadata-columns', {}, token)
+assert.equal(metadataColumns.columns[0].label, 'Material class')
+assert.equal(metadataColumns.columns[0].visible, false)
+await request(`/metadata-columns/${metadataColumn.id}`, { method: 'DELETE' }, token)
+assert.deepEqual((await request('/metadata-columns', {}, token)).columns, [])
+
 assert.ok((await request('/vaults', {}, viewerLogin.token)).vaults.some((entry) => entry.id === vault.id))
 assert.equal((await request('/vaults', {}, guestLogin.token)).vaults.length, 0)
 await request(
@@ -332,7 +465,7 @@ await request(
 assert.deepEqual((await request(`/users/${guest.id}/vault-access`, {}, token)).vaultIds, [vault.id])
 assert.ok((await request('/vaults', {}, guestLogin.token)).vaults.some((entry) => entry.id === vault.id))
 const accessMap = await request('/vaults/access', {}, token)
-assert.deepEqual(accessMap.accessMap[guest.id], [vault.id])
+assert.ok(accessMap.accessMap[vault.id].includes(guest.id))
 await request(
   `/users/${viewer.id}/permissions`,
   {
@@ -386,11 +519,93 @@ const imported = await request(
       vaultId: vault.id,
       canonicalPath: 'drawing.txt',
       fileName: 'drawing.txt',
+      partNumber: 'PN-00042',
       storageRelativePath: 'drawing.txt',
     }),
   },
   token,
 )
+assert.equal(
+  (await request('/organizations/current/serialization/exists?serial=PN-00042', {}, token)).exists,
+  true,
+)
+assert.deepEqual(
+  (await request('/organizations/current/serialization/files', {}, token)).files,
+  [{ partNumber: 'PN-00042', filePath: 'drawing.txt' }],
+)
+assert.equal((await request(`/vaults/${vault.id}/files`, {}, token)).files[0].partNumber, 'PN-00042')
+const legacyFile = await request(
+  '/files/import',
+  {
+    method: 'POST',
+    body: JSON.stringify({
+      vaultId: vault.id,
+      canonicalPath: 'legacy-part.sldprt',
+      fileName: 'legacy-part.sldprt',
+      storageRelativePath: 'legacy-part.sldprt',
+    }),
+  },
+  token,
+)
+const rescannedLegacyFile = await request(
+  '/files/import',
+  {
+    method: 'POST',
+    body: JSON.stringify({
+      vaultId: vault.id,
+      canonicalPath: 'legacy-part.sldprt',
+      fileName: 'legacy-part.sldprt',
+      partNumber: 'PN-LEGACY',
+      storageRelativePath: 'legacy-part.sldprt',
+    }),
+  },
+  token,
+)
+assert.equal(rescannedLegacyFile.id, legacyFile.id)
+assert.equal(rescannedLegacyFile.created, false)
+assert.equal(
+  (await request('/organizations/current/serialization/exists?serial=PN-LEGACY', {}, token)).exists,
+  true,
+)
+const duplicatePartNumberResponse = await fetch(`${server}/files/import`, {
+  method: 'POST',
+  headers: { Accept: 'application/json', 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+  body: JSON.stringify({
+    vaultId: vault.id,
+    canonicalPath: 'duplicate-part-number.sldprt',
+    fileName: 'duplicate-part-number.sldprt',
+    partNumber: 'PN-00042',
+    storageRelativePath: 'duplicate-part-number.sldprt',
+  }),
+})
+assert.equal(duplicatePartNumberResponse.status, 409)
+assert.equal((await duplicatePartNumberResponse.json()).error, 'PART_NUMBER_EXISTS')
+const trashReservedPart = await request(
+  '/files/import',
+  {
+    method: 'POST',
+    body: JSON.stringify({
+      vaultId: vault.id,
+      canonicalPath: 'trash-reserved-part.sldprt',
+      fileName: 'trash-reserved-part.sldprt',
+      partNumber: 'PN-TRASH-RESERVED',
+      storageRelativePath: 'trash-reserved-part.sldprt',
+    }),
+  },
+  token,
+)
+await request(`/files/${trashReservedPart.id}/trash`, { method: 'POST' }, token)
+assert.equal(
+  (
+    await request(
+      '/organizations/current/serialization/exists?serial=PN-TRASH-RESERVED',
+      {},
+      token,
+    )
+  ).exists,
+  true,
+)
+await request(`/files/${trashReservedPart.id}/restore`, { method: 'POST' }, token)
 const referencedPart = await request(
   '/files/import',
   {
@@ -461,10 +676,19 @@ const checkin = await request(
       checkoutToken: checkout.checkoutToken,
       storageRelativePath: 'drawing.txt',
       comment: 'Second revision',
+      partNumber: 'PN-00043',
     }),
   },
   token,
 )
 assert.equal(checkin.revision, 2)
+assert.equal(
+  (await request('/organizations/current/serialization/exists?serial=PN-00042', {}, token)).exists,
+  false,
+)
+assert.equal(
+  (await request('/organizations/current/serialization/exists?serial=PN-00043', {}, token)).exists,
+  true,
+)
 
 console.log('PHP API, installer lifecycle, MariaDB, and network vault integration passed.')

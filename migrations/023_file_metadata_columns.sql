@@ -1,0 +1,23 @@
+CREATE TABLE IF NOT EXISTS file_metadata_columns (
+  id CHAR(36) NOT NULL PRIMARY KEY,
+  organization_id CHAR(36) NOT NULL,
+  name VARCHAR(128) NOT NULL,
+  label VARCHAR(256) NOT NULL,
+  data_type ENUM('text', 'number', 'date', 'boolean', 'select') NOT NULL DEFAULT 'text',
+  select_options JSON NOT NULL,
+  width INT UNSIGNED NOT NULL DEFAULT 120,
+  visible BOOLEAN NOT NULL DEFAULT TRUE,
+  sortable BOOLEAN NOT NULL DEFAULT TRUE,
+  required BOOLEAN NOT NULL DEFAULT FALSE,
+  default_value TEXT NULL,
+  sort_order INT NOT NULL DEFAULT 0,
+  created_by CHAR(36) NOT NULL,
+  updated_by CHAR(36) NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  UNIQUE KEY uq_file_metadata_column_name (organization_id, name),
+  KEY idx_file_metadata_columns_order (organization_id, sort_order),
+  CONSTRAINT fk_file_metadata_column_org FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE,
+  CONSTRAINT fk_file_metadata_column_creator FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE RESTRICT,
+  CONSTRAINT fk_file_metadata_column_updater FOREIGN KEY (updated_by) REFERENCES users(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
