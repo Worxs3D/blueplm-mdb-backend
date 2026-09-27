@@ -424,7 +424,7 @@ try {
         $query = $db->prepare('SELECT va.user_id, va.vault_id FROM vault_access va JOIN vaults v ON v.id = va.vault_id JOIN organization_memberships m ON m.user_id = va.user_id AND m.organization_id = v.organization_id WHERE v.organization_id = ? ORDER BY va.user_id, va.vault_id');
         $query->execute([$principal['organizationId']]);
         $accessMap = [];
-        foreach ($query->fetchAll() as $grant) $accessMap[$grant['user_id']][] = $grant['vault_id'];
+        foreach ($query->fetchAll() as $grant) $accessMap[$grant['vault_id']][] = $grant['user_id'];
         Runtime::respond(200, ['accessMap' => $accessMap]);
     }
     if ($method === 'GET' && preg_match('#^/users/([0-9a-f-]{36})/permissions$#i', $path, $matches)) {

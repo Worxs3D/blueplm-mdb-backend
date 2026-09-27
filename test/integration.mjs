@@ -332,7 +332,7 @@ await request(
 assert.deepEqual((await request(`/users/${guest.id}/vault-access`, {}, token)).vaultIds, [vault.id])
 assert.ok((await request('/vaults', {}, guestLogin.token)).vaults.some((entry) => entry.id === vault.id))
 const accessMap = await request('/vaults/access', {}, token)
-assert.deepEqual(accessMap.accessMap[guest.id], [vault.id])
+assert.ok(accessMap.accessMap[vault.id].includes(guest.id))
 await request(
   `/users/${viewer.id}/permissions`,
   {
