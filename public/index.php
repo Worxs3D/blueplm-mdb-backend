@@ -25,6 +25,33 @@ function decodeOrganizationSetting(mixed $value): array
     return is_array($decoded) ? $decoded : [];
 }
 
+/** @return array<string, mixed> */
+function authProviderSettings(PDO $db, string $organizationId): array
+{
+    $query = $db->prepare('SELECT auth_provider_settings FROM organization_settings WHERE organization_id = ?');
+    $query->execute([$organizationId]);
+    $settings = decodeOrganizationSetting($query->fetchColumn());
+    return [
+        'selfRegistration' => ($settings['selfRegistration'] ?? false) === true,
+        'users' => is_array($settings['users'] ?? null) ? $settings['users'] : [],
+        'suppliers' => is_array($settings['suppliers'] ?? null) ? $settings['suppliers'] : [],
+    ];
+}
+
+/** @return array{id:string,name:string,slug:string}|null */
+function registrationOrganization(PDO $db, mixed $slug = null): ?array
+{
+    if (is_string($slug) && trim($slug) !== '') {
+        $query = $db->prepare('SELECT id, name, slug FROM organizations WHERE slug = ? LIMIT 1');
+        $query->execute([strtolower(trim($slug))]);
+    } else {
+        $query = $db->query('SELECT id, name, slug FROM organizations ORDER BY created_at LIMIT 1');
+    }
+    if (!$query) return null;
+    $organization = $query->fetch();
+    return is_array($organization) ? $organization : null;
+}
+
 /** @param array<string, mixed> $settings */
 function formatOrganizationSerial(array $settings, int $counter): string
 {
@@ -265,6 +292,91 @@ try {
         }
         Runtime::respond(200, ['token' => Runtime::issueSession($db, $env, $user['id'], $user['organization_id']), 'expiresAt' => gmdate('c', time() + 7 * 86400)]);
     }
+    if ($method === 'GET' && $path === '/auth/registration') {
+        $organization = registrationOrganization($db, $_GET['organizationSlug'] ?? null);
+        if (!$organization) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'No organization is configured.']);
+        $settings = authProviderSettings($db, $organization['id']);
+        Runtime::respond(200, [
+            'enabled' => $settings['selfRegistration'] === true,
+            'organizationId' => $organization['id'],
+            'organizationName' => $organization['name'],
+        ]);
+    }
+    if ($method === 'POST' && $path === '/auth/register') {
+        $body = Runtime::jsonBody();
+        $organization = registrationOrganization($db, $body['organizationSlug'] ?? null);
+        if (!$organization) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'No organization is configured.']);
+        if (authProviderSettings($db, $organization['id'])['selfRegistration'] !== true) {
+            Runtime::respond(403, ['error' => 'REGISTRATION_DISABLED', 'message' => 'Self-registration is disabled for this organization.']);
+        }
+        $email = is_string($body['email'] ?? null) ? strtolower(trim($body['email'])) : '';
+        $displayName = is_string($body['displayName'] ?? null) ? trim($body['displayName']) : '';
+        $password = is_string($body['password'] ?? null) ? $body['password'] : '';
+        if (!filter_var($email, FILTER_VALIDATE_EMAIL) || strlen($email) > 320 || $displayName === '' || strlen($displayName) > 200 || strlen($password) < 12) {
+            Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid email, display name, and password of at least 12 characters are required.']);
+        }
+        $existingUser = $db->prepare('SELECT 1 FROM users WHERE email = ? LIMIT 1');
+        $existingUser->execute([$email]);
+        if ($existingUser->fetchColumn()) Runtime::respond(409, ['error' => 'ALREADY_EXISTS', 'message' => 'An account with this email already exists.']);
+        $pending = $db->prepare("SELECT 1 FROM registration_requests WHERE organization_id = ? AND email = ? AND status = 'pending' LIMIT 1");
+        $pending->execute([$organization['id'], $email]);
+        if ($pending->fetchColumn()) Runtime::respond(409, ['error' => 'ALREADY_PENDING', 'message' => 'A registration request for this email is already pending.']);
+        $requestId = Runtime::uuid();
+        $db->prepare('INSERT INTO registration_requests (id, organization_id, email, display_name, password_hash) VALUES (?, ?, ?, ?, ?)')
+            ->execute([$requestId, $organization['id'], $email, $displayName, Runtime::passwordHash($password)]);
+        Runtime::respond(202, ['status' => 'pending', 'requestId' => $requestId]);
+    }
+    if ($method === 'POST' && $path === '/auth/recovery-register') {
+        $body = Runtime::jsonBody();
+        $organization = registrationOrganization($db, $body['organizationSlug'] ?? null);
+        if (!$organization) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'No organization is configured.']);
+        $code = is_string($body['recoveryCode'] ?? null) ? strtoupper(trim($body['recoveryCode'])) : '';
+        $email = is_string($body['email'] ?? null) ? strtolower(trim($body['email'])) : '';
+        $displayName = is_string($body['displayName'] ?? null) ? trim($body['displayName']) : '';
+        $password = is_string($body['password'] ?? null) ? $body['password'] : '';
+        if (!preg_match('/^[A-Z2-9]{4}(?:-[A-Z2-9]{4}){3}$/', $code)
+            || !filter_var($email, FILTER_VALIDATE_EMAIL) || strlen($email) > 320
+            || $displayName === '' || strlen($displayName) > 200 || strlen($password) < 12) {
+            Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid recovery code, email, display name, and password of at least 12 characters are required.']);
+        }
+        $existingUser = $db->prepare('SELECT 1 FROM users WHERE email = ? LIMIT 1');
+        $existingUser->execute([$email]);
+        if ($existingUser->fetchColumn()) Runtime::respond(409, ['error' => 'ALREADY_EXISTS', 'message' => 'An account with this email already exists.']);
+
+        $db->beginTransaction();
+        try {
+            $recovery = $db->prepare('SELECT id FROM admin_recovery_codes WHERE organization_id = ? AND code_hash = ? AND is_used = FALSE AND is_revoked = FALSE AND expires_at > UTC_TIMESTAMP(3) FOR UPDATE');
+            $recovery->execute([$organization['id'], hash('sha256', str_replace('-', '', $code))]);
+            $record = $recovery->fetch();
+            if (!$record) {
+                $db->rollBack();
+                Runtime::respond(401, ['error' => 'RECOVERY_CODE_INVALID', 'message' => 'The recovery code is invalid, expired, used, or revoked.']);
+            }
+            $userId = Runtime::uuid();
+            $db->prepare('INSERT INTO users (id, email, display_name, password_hash) VALUES (?, ?, ?, ?)')
+                ->execute([$userId, $email, $displayName, Runtime::passwordHash($password)]);
+            $db->prepare("INSERT INTO organization_memberships (organization_id, user_id, role) VALUES (?, ?, 'admin')")
+                ->execute([$organization['id'], $userId]);
+            $used = $db->prepare('UPDATE admin_recovery_codes SET is_used = TRUE, used_by = ?, used_at = UTC_TIMESTAMP(3) WHERE id = ? AND is_used = FALSE');
+            $used->execute([$userId, $record['id']]);
+            if ($used->rowCount() === 0) throw new \RuntimeException('Recovery code was already used.');
+            $token = Runtime::issueSession($db, $env, $userId, $organization['id']);
+            Runtime::emitEvent($db, $organization['id'], 'registration.recovery_approved', $userId, ['userId' => $userId, 'recoveryCodeId' => $record['id'], 'role' => 'admin']);
+            $db->commit();
+        } catch (PDOException $error) {
+            if ($db->inTransaction()) $db->rollBack();
+            if ($error->getCode() === '23000') Runtime::respond(409, ['error' => 'ALREADY_EXISTS', 'message' => 'An account with this email already exists.']);
+            throw $error;
+        } catch (Throwable $error) {
+            if ($db->inTransaction()) $db->rollBack();
+            throw $error;
+        }
+        Runtime::respond(201, [
+            'token' => $token,
+            'expiresAt' => gmdate('c', time() + 7 * 86400),
+            'user' => ['id' => $userId, 'email' => $email, 'displayName' => $displayName, 'role' => 'admin'],
+        ]);
+    }
     if ($method === 'POST' && $path === '/auth/totp/verify') {
         $body = Runtime::jsonBody();
         $challengeToken = is_string($body['challengeToken'] ?? null) ? $body['challengeToken'] : '';
@@ -296,6 +408,51 @@ try {
         Runtime::respond(200, ['user' => Runtime::principal($db, $env)]);
     }
     $principal = Runtime::principal($db, $env);
+    if ($method === 'GET' && $path === '/registration-requests') {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $query = $db->prepare("SELECT id, email, display_name AS displayName, status, created_at AS createdAt FROM registration_requests WHERE organization_id = ? AND status = 'pending' ORDER BY created_at");
+        $query->execute([$principal['organizationId']]);
+        Runtime::respond(200, ['requests' => $query->fetchAll()]);
+    }
+    if ($method === 'POST' && preg_match('#^/registration-requests/([0-9a-f-]{36})/(approve|reject)$#i', $path, $matches)) {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $requestId = $matches[1];
+        $action = $matches[2];
+        $query = $db->prepare("SELECT id, organization_id, email, display_name, password_hash FROM registration_requests WHERE id = ? AND organization_id = ? AND status = 'pending'");
+        $query->execute([$requestId, $principal['organizationId']]);
+        $request = $query->fetch();
+        if (!$request) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Registration request not found.']);
+        if ($action === 'reject') {
+            $db->prepare("UPDATE registration_requests SET status = 'rejected', reviewed_by = ?, reviewed_at = UTC_TIMESTAMP(3) WHERE id = ? AND status = 'pending'")
+                ->execute([$principal['userId'], $requestId]);
+            Runtime::emitEvent($db, $principal['organizationId'], 'registration.rejected', $requestId, ['requestId' => $requestId, 'rejectedBy' => $principal['userId']]);
+            Runtime::respond(200, ['status' => 'rejected']);
+        }
+        $body = Runtime::jsonBody();
+        $role = is_string($body['role'] ?? null) ? $body['role'] : '';
+        if (!in_array($role, ['admin', 'member', 'viewer', 'guest'], true)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'An explicit non-owner role is required for approval.']);
+        $userId = Runtime::uuid();
+        $db->beginTransaction();
+        try {
+            $db->prepare('INSERT INTO users (id, email, display_name, password_hash) VALUES (?, ?, ?, ?)')
+                ->execute([$userId, $request['email'], $request['display_name'], $request['password_hash']]);
+            $db->prepare('INSERT INTO organization_memberships (organization_id, user_id, role) VALUES (?, ?, ?)')
+                ->execute([$principal['organizationId'], $userId, $role]);
+            $update = $db->prepare("UPDATE registration_requests SET status = 'approved', reviewed_by = ?, reviewed_at = UTC_TIMESTAMP(3) WHERE id = ? AND status = 'pending'");
+            $update->execute([$principal['userId'], $requestId]);
+            if ($update->rowCount() === 0) throw new \RuntimeException('Registration request was already processed.');
+            $db->commit();
+        } catch (PDOException $error) {
+            if ($db->inTransaction()) $db->rollBack();
+            if ($error->getCode() === '23000') Runtime::respond(409, ['error' => 'ALREADY_EXISTS', 'message' => 'An account with this email already exists.']);
+            throw $error;
+        } catch (Throwable $error) {
+            if ($db->inTransaction()) $db->rollBack();
+            throw $error;
+        }
+        Runtime::emitEvent($db, $principal['organizationId'], 'registration.approved', $userId, ['requestId' => $requestId, 'approvedBy' => $principal['userId'], 'role' => $role]);
+        Runtime::respond(201, ['user' => ['id' => $userId, 'email' => $request['email'], 'displayName' => $request['display_name'], 'role' => $role]]);
+    }
     if (in_array($principal['role'], ['viewer', 'guest'], true) && $method !== 'GET') {
         $personalWrite = $path === '/account'
             || $path === '/recovery-codes/use'
@@ -566,8 +723,8 @@ try {
         }
         Runtime::respond(200, ['success' => true]);
     }
-    // Team management is a first-class Community API. Keep its response names
-    // aligned with src/lib/community.ts so the desktop client never needs a
+    // Team management is a first-class MDB API. Keep its response names
+    // aligned with the MDB client contract so the desktop client never needs a
     // Supabase fallback when MariaDB is selected.
     if ($method === 'GET' && $path === '/teams') {
         $query = $db->prepare(

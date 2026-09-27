@@ -65,6 +65,16 @@ async function request(path, init = {}, token) {
   return body
 }
 
+async function requestStatus(path, init = {}, token) {
+  const headers = new Headers(init.headers)
+  headers.set('Accept', 'application/json')
+  if (init.body) headers.set('Content-Type', 'application/json')
+  if (token) headers.set('Authorization', `Bearer ${token}`)
+  const response = await fetch(`${server}${path}`, { ...init, headers })
+  const body = response.status === 204 ? undefined : await response.json()
+  return { status: response.status, body }
+}
+
 async function waitForHealth() {
   let lastError
   for (let attempt = 0; attempt < 40; attempt += 1) {
@@ -116,6 +126,86 @@ const login = await request('/auth/login', {
   body: JSON.stringify({ email: 'owner@example.test', password }),
 })
 const token = login.token
+
+// Self-registration is opt-in. A request is stored without a membership or
+// role and only becomes usable after an administrator explicitly approves it.
+const registrationBefore = await request('/auth/registration')
+assert.equal(registrationBefore.enabled, false)
+await request(
+  '/organizations/current/settings/auth-providers',
+  {
+    method: 'PUT',
+    body: JSON.stringify({
+      value: {
+        selfRegistration: true,
+        users: { google: false, email: true, phone: false },
+        suppliers: { google: false, email: false, phone: false },
+      },
+    }),
+  },
+  token,
+)
+const registrationAfter = await request('/auth/registration')
+assert.equal(registrationAfter.enabled, true)
+const registration = await request('/auth/register', {
+  method: 'POST',
+  body: JSON.stringify({
+    email: 'self-registered@example.test',
+    displayName: 'Pending User',
+    password: 'Self registered password 123!',
+  }),
+})
+assert.equal(registration.status, 'pending')
+const pendingLogin = await fetch(`${server}/auth/login`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ email: 'self-registered@example.test', password: 'Self registered password 123!' }),
+})
+assert.equal(pendingLogin.status, 401)
+const pendingRequests = await request('/registration-requests', {}, token)
+assert.ok(pendingRequests.requests.some((entry) => entry.email === 'self-registered@example.test'))
+const pendingRequest = pendingRequests.requests.find((entry) => entry.email === 'self-registered@example.test')
+assert.ok(pendingRequest)
+const approved = await request(`/registration-requests/${pendingRequest.id}/approve`, {
+  method: 'POST',
+  body: JSON.stringify({ role: 'viewer' }),
+}, token)
+assert.equal(approved.user.role, 'viewer')
+const approvedLogin = await request('/auth/login', {
+  method: 'POST',
+  body: JSON.stringify({ email: 'self-registered@example.test', password: 'Self registered password 123!' }),
+})
+assert.equal(typeof approvedLogin.token, 'string')
+
+// Emergency registration is a separate recovery flow. It creates an admin
+// directly, consumes the single-use code, and returns an authenticated session.
+const generatedRecoveryCode = await request('/recovery-codes', {
+  method: 'POST',
+  body: JSON.stringify({ description: 'integration emergency registration', expiresInDays: 1 }),
+}, token)
+const emergencyRegistration = await request('/auth/recovery-register', {
+  method: 'POST',
+  body: JSON.stringify({
+    recoveryCode: generatedRecoveryCode.code,
+    email: 'emergency-admin@example.test',
+    displayName: 'Emergency Admin',
+    password: 'Emergency admin password 123!',
+  }),
+})
+assert.equal(emergencyRegistration.user.role, 'admin')
+const emergencyPrincipal = await request('/auth/me', {}, emergencyRegistration.token)
+assert.equal(emergencyPrincipal.user.role, 'admin')
+const reusedRecoveryCode = await fetch(`${server}/auth/recovery-register`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    recoveryCode: generatedRecoveryCode.code,
+    email: 'second-emergency-admin@example.test',
+    displayName: 'Second Emergency Admin',
+    password: 'Emergency admin password 123!',
+  }),
+})
+assert.equal(reusedRecoveryCode.status, 401)
 
 // Authenticator enrollment and challenge verification are public client API
 // contracts. The secret is returned once during enrollment and never stored by
@@ -373,6 +463,50 @@ const guestLogin = await request('/auth/login', {
   method: 'POST',
   body: JSON.stringify({ email: 'guest@example.test', password: 'Integration guest password 123!' }),
 })
+
+// Registration moderation is admin-only. A viewer or guest may not inspect,
+// approve, or reject pending requests.
+await request(
+  '/organizations/current/settings/auth-providers',
+  {
+    method: 'PUT',
+    body: JSON.stringify({
+      value: {
+        selfRegistration: true,
+        users: { google: false, email: true, phone: false },
+        suppliers: { google: false, email: false, phone: false },
+      },
+    }),
+  },
+  token,
+)
+const restrictedRegistration = await request('/auth/register', {
+  method: 'POST',
+  body: JSON.stringify({
+    email: 'moderation-target@example.test',
+    displayName: 'Moderation Target',
+    password: 'Moderation target password 123!',
+  }),
+})
+assert.equal(restrictedRegistration.status, 'pending')
+assert.equal((await requestStatus('/registration-requests', {}, viewerLogin.token)).status, 403)
+assert.equal((await requestStatus('/registration-requests', {}, guestLogin.token)).status, 403)
+const moderationRequests = await request('/registration-requests', {}, token)
+const moderationRequest = moderationRequests.requests.find((entry) => entry.email === 'moderation-target@example.test')
+assert.ok(moderationRequest)
+assert.equal((await requestStatus(`/registration-requests/${moderationRequest.id}/approve`, {
+  method: 'POST',
+  body: JSON.stringify({ role: 'admin' }),
+}, viewerLogin.token)).status, 403)
+assert.equal((await requestStatus(`/registration-requests/${moderationRequest.id}/reject`, {
+  method: 'POST',
+}, guestLogin.token)).status, 403)
+const moderationApproval = await request(`/registration-requests/${moderationRequest.id}/approve`, {
+  method: 'POST',
+  body: JSON.stringify({ role: 'member' }),
+}, token)
+assert.equal(moderationApproval.user.role, 'member')
+
 await request(
   '/module-access/customers',
   { method: 'PUT', body: JSON.stringify({ teamIds: [], userIds: [viewer.id] }) },
