@@ -99,9 +99,9 @@ if (in_array($path, ['/installer/database-status', '/installer/commit'], true)) 
 
         $action = is_string($body['action'] ?? null) ? $body['action'] : '';
         if ($action === 'migrate') {
-            if ($inspection['state'] !== 'managed') {
+            if (!in_array($inspection['state'], ['managed', 'legacy'], true)) {
                 @unlink($pendingEnvironmentPath);
-                Runtime::respond(409, ['error' => 'MIGRATION_UNSAFE', 'message' => 'Only a versioned BluePLM database can be migrated automatically.']);
+                Runtime::respond(409, ['error' => 'MIGRATION_UNSAFE', 'message' => 'Only a recognized BluePLM database can be migrated automatically.']);
             }
         } elseif ($action === 'reset') {
         } elseif ($action !== 'install' || $inspection['state'] !== 'empty') {
@@ -808,7 +808,9 @@ try {
     if ($method === 'GET' && $path === '/organizations/current/serialization/exists') {
         $serial = is_string($_GET['serial'] ?? null) ? trim($_GET['serial']) : '';
         if ($serial === '' || strlen($serial) > 512) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid serial number is required.']);
-        $query = $db->prepare('SELECT 1 FROM files WHERE organization_id = ? AND part_number = ? AND deleted_at IS NULL LIMIT 1');
+        // The unique database key reserves part numbers until permanent deletion,
+        // including while an item is in trash. Report the same availability rule.
+        $query = $db->prepare('SELECT 1 FROM files WHERE organization_id = ? AND part_number = ? LIMIT 1');
         $query->execute([$principal['organizationId'], $serial]);
         Runtime::respond(200, ['exists' => (bool)$query->fetchColumn()]);
     }

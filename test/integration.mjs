@@ -580,6 +580,32 @@ const duplicatePartNumberResponse = await fetch(`${server}/files/import`, {
 })
 assert.equal(duplicatePartNumberResponse.status, 409)
 assert.equal((await duplicatePartNumberResponse.json()).error, 'PART_NUMBER_EXISTS')
+const trashReservedPart = await request(
+  '/files/import',
+  {
+    method: 'POST',
+    body: JSON.stringify({
+      vaultId: vault.id,
+      canonicalPath: 'trash-reserved-part.sldprt',
+      fileName: 'trash-reserved-part.sldprt',
+      partNumber: 'PN-TRASH-RESERVED',
+      storageRelativePath: 'trash-reserved-part.sldprt',
+    }),
+  },
+  token,
+)
+await request(`/files/${trashReservedPart.id}/trash`, { method: 'POST' }, token)
+assert.equal(
+  (
+    await request(
+      '/organizations/current/serialization/exists?serial=PN-TRASH-RESERVED',
+      {},
+      token,
+    )
+  ).exists,
+  true,
+)
+await request(`/files/${trashReservedPart.id}/restore`, { method: 'POST' }, token)
 const referencedPart = await request(
   '/files/import',
   {

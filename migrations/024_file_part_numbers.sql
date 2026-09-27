@@ -1,3 +1,5 @@
 ALTER TABLE files
-  ADD COLUMN part_number VARCHAR(512) NULL AFTER file_name,
-  ADD UNIQUE KEY uq_files_org_part_number (organization_id, part_number);
+  ADD COLUMN IF NOT EXISTS part_number VARCHAR(512) NULL AFTER file_name;
+
+-- The unique key is added idempotently by Migrator after legacy schemas have
+-- been adopted. This keeps a retry safe while still rejecting duplicate data.
