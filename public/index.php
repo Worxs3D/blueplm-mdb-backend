@@ -70,6 +70,28 @@ function normalizeColumnDefaults(mixed $value): array
     return $normalized;
 }
 
+/** @param array<string, mixed> $principal */
+function canManageItemDesignations(PDO $db, array $principal, ?string $vaultId = null): bool
+{
+    if (in_array($principal['role'], ['owner', 'admin'], true)) return true;
+    if (in_array($principal['role'], ['viewer', 'guest'], true)) return false;
+    $sql = 'SELECT actions FROM user_permissions WHERE organization_id = ? AND user_id = ? AND resource = ?';
+    $params = [$principal['organizationId'], $principal['userId'], 'system:item-designations'];
+    if ($vaultId === null) {
+        $sql .= ' AND vault_id IS NULL';
+    } else {
+        $sql .= ' AND (vault_id IS NULL OR vault_id = ?)';
+        $params[] = $vaultId;
+    }
+    $query = $db->prepare($sql);
+    $query->execute($params);
+    foreach ($query->fetchAll() as $permission) {
+        $actions = json_decode((string)$permission['actions'], true);
+        if (is_array($actions) && (in_array('edit', $actions, true) || in_array('admin', $actions, true))) return true;
+    }
+    return false;
+}
+
 header_remove('X-Powered-By');
 $root = dirname(__DIR__);
 $path = '/' . trim((string)(parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?? '/'), '/');
@@ -870,6 +892,112 @@ try {
         }
         Runtime::emitEvent($db, $principal['organizationId'], 'organization.module_access_updated', $principal['organizationId'], ['moduleId' => $moduleId, 'updatedBy' => $principal['userId']]);
         Runtime::respond(200, ['success' => true, 'restricted' => count($teamIds) + count($userIds) > 0]);
+    }
+    if ($method === 'GET' && $path === '/item-designations') {
+        $count = $db->prepare('SELECT COUNT(*) FROM item_designations WHERE organization_id = ?');
+        $count->execute([$principal['organizationId']]);
+        if ((int)$count->fetchColumn() === 0) {
+            $seed = $db->prepare('INSERT IGNORE INTO item_designations (id, organization_id, name, sort_order) VALUES (?, ?, ?, ?)');
+            foreach ([['Part', 0], ['Assembly', 1], ['Packed Assembly', 2]] as [$name, $sortOrder]) {
+                $seed->execute([Runtime::uuid(), $principal['organizationId'], $name, $sortOrder]);
+            }
+        }
+        $query = $db->prepare('SELECT id, name, sort_order FROM item_designations WHERE organization_id = ? ORDER BY sort_order, name');
+        $query->execute([$principal['organizationId']]);
+        Runtime::respond(200, ['designations' => $query->fetchAll()]);
+    }
+    if ($method === 'POST' && $path === '/item-designations') {
+        if (!canManageItemDesignations($db, $principal)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Item designation edit permission required.']);
+        $body = Runtime::jsonBody();
+        $name = is_string($body['name'] ?? null) ? trim($body['name']) : '';
+        $sortOrder = $body['sortOrder'] ?? null;
+        if ($name === '' || strlen($name) > 120 || str_contains($name, "\0") || ($sortOrder !== null && (!is_int($sortOrder) || $sortOrder < 0 || $sortOrder > 2147483647))) {
+            Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'name and an optional non-negative sortOrder are required.']);
+        }
+        if ($sortOrder === null) {
+            $next = $db->prepare('SELECT COALESCE(MAX(sort_order), -1) + 1 FROM item_designations WHERE organization_id = ?');
+            $next->execute([$principal['organizationId']]);
+            $sortOrder = (int)$next->fetchColumn();
+        }
+        $id = Runtime::uuid();
+        try {
+            $db->prepare('INSERT INTO item_designations (id, organization_id, name, sort_order) VALUES (?, ?, ?, ?)')
+                ->execute([$id, $principal['organizationId'], $name, $sortOrder]);
+        } catch (PDOException $error) {
+            if ($error->getCode() === '23000') Runtime::respond(409, ['error' => 'ALREADY_EXISTS', 'message' => 'An item designation with this name already exists.']);
+            throw $error;
+        }
+        $query = $db->prepare('SELECT id, name, sort_order FROM item_designations WHERE id = ? AND organization_id = ?');
+        $query->execute([$id, $principal['organizationId']]);
+        Runtime::respond(201, ['designation' => $query->fetch()]);
+    }
+    if ($method === 'PATCH' && preg_match('#^/item-designations/([0-9a-f-]{36})$#i', $path, $matches)) {
+        if (!canManageItemDesignations($db, $principal)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Item designation edit permission required.']);
+        $body = Runtime::jsonBody();
+        $name = is_string($body['name'] ?? null) ? trim($body['name']) : '';
+        $sortOrder = $body['sortOrder'] ?? null;
+        if ($name === '' || strlen($name) > 120 || str_contains($name, "\0") || ($sortOrder !== null && (!is_int($sortOrder) || $sortOrder < 0 || $sortOrder > 2147483647))) {
+            Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'name and an optional non-negative sortOrder are required.']);
+        }
+        $exists = $db->prepare('SELECT 1 FROM item_designations WHERE id = ? AND organization_id = ?');
+        $exists->execute([$matches[1], $principal['organizationId']]);
+        if (!$exists->fetchColumn()) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Item designation not found.']);
+        try {
+            if ($sortOrder === null) {
+                $db->prepare('UPDATE item_designations SET name = ? WHERE id = ? AND organization_id = ?')
+                    ->execute([$name, $matches[1], $principal['organizationId']]);
+            } else {
+                $db->prepare('UPDATE item_designations SET name = ?, sort_order = ? WHERE id = ? AND organization_id = ?')
+                    ->execute([$name, $sortOrder, $matches[1], $principal['organizationId']]);
+            }
+        } catch (PDOException $error) {
+            if ($error->getCode() === '23000') Runtime::respond(409, ['error' => 'ALREADY_EXISTS', 'message' => 'An item designation with this name already exists.']);
+            throw $error;
+        }
+        $query = $db->prepare('SELECT id, name, sort_order FROM item_designations WHERE id = ? AND organization_id = ?');
+        $query->execute([$matches[1], $principal['organizationId']]);
+        Runtime::respond(200, ['designation' => $query->fetch()]);
+    }
+    if ($method === 'DELETE' && preg_match('#^/item-designations/([0-9a-f-]{36})$#i', $path, $matches)) {
+        if (!canManageItemDesignations($db, $principal)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Item designation edit permission required.']);
+        try {
+            $query = $db->prepare('DELETE FROM item_designations WHERE id = ? AND organization_id = ?');
+            $query->execute([$matches[1], $principal['organizationId']]);
+        } catch (PDOException $error) {
+            if ($error->getCode() === '23000') Runtime::respond(409, ['error' => 'DESIGNATION_IN_USE', 'message' => 'The item designation is still assigned to one or more items.']);
+            throw $error;
+        }
+        if ($query->rowCount() === 0) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Item designation not found.']);
+        Runtime::respond(204);
+    }
+    if ($method === 'GET' && preg_match('#^/vaults/([0-9a-f-]{36})/item-designations$#i', $path, $matches)) {
+        $vaultId = $matches[1];
+        Runtime::requireVault($db, $principal, $vaultId);
+        $query = $db->prepare('SELECT part_number, designation_id FROM item_designation_assignments WHERE organization_id = ? AND vault_id = ? ORDER BY part_number');
+        $query->execute([$principal['organizationId'], $vaultId]);
+        Runtime::respond(200, ['assignments' => $query->fetchAll()]);
+    }
+    if ($method === 'PUT' && preg_match('#^/vaults/([0-9a-f-]{36})/item-designations/([^/]+)$#i', $path, $matches)) {
+        $vaultId = $matches[1];
+        Runtime::requireVault($db, $principal, $vaultId);
+        if (!canManageItemDesignations($db, $principal, $vaultId)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Item designation edit permission required.']);
+        $partNumber = rawurldecode($matches[2]);
+        $body = Runtime::jsonBody();
+        $designationId = $body['designationId'] ?? null;
+        if ($partNumber === '' || strlen($partNumber) > 512 || str_contains($partNumber, "\0") || ($designationId !== null && (!is_string($designationId) || !preg_match('/^[0-9a-f-]{36}$/i', $designationId)))) {
+            Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid part number and designationId are required.']);
+        }
+        if ($designationId === null) {
+            $db->prepare('DELETE FROM item_designation_assignments WHERE organization_id = ? AND vault_id = ? AND part_number = ?')
+                ->execute([$principal['organizationId'], $vaultId, $partNumber]);
+            Runtime::respond(200, ['success' => true]);
+        }
+        $designation = $db->prepare('SELECT id FROM item_designations WHERE id = ? AND organization_id = ?');
+        $designation->execute([$designationId, $principal['organizationId']]);
+        if (!$designation->fetchColumn()) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Item designation not found.']);
+        $db->prepare('INSERT INTO item_designation_assignments (organization_id, vault_id, part_number, designation_id) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE designation_id = VALUES(designation_id), updated_at = CURRENT_TIMESTAMP(3)')
+            ->execute([$principal['organizationId'], $vaultId, $partNumber, $designationId]);
+        Runtime::respond(200, ['success' => true]);
     }
     if ($method === 'GET' && $path === '/metadata-columns') {
         $query = $db->prepare('SELECT id, organization_id AS org_id, name, label, data_type, select_options, width, visible, sortable, required, default_value, sort_order, created_by, updated_by, created_at, updated_at FROM file_metadata_columns WHERE organization_id = ? ORDER BY sort_order, name');
