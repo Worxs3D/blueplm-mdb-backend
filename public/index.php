@@ -15,6 +15,8 @@ use BluePlm\Runtime;
 use BluePlm\DatabaseLifecycle;
 use BluePlm\Totp;
 
+const BLUEPLM_API_VERSION = 2;
+
 /** @return array<string, mixed> */
 function decodeOrganizationSetting(mixed $value): array
 {
@@ -129,12 +131,16 @@ if (in_array($path, ['/installer/database-status', '/installer/commit'], true)) 
             }
         }
 
-        $liveEnvironmentPath = $root . '/.env';
+        $activationRoot = is_string($_SERVER['BLUEPLM_LIVE_ROOT'] ?? null)
+            ? rtrim($_SERVER['BLUEPLM_LIVE_ROOT'], '/\\')
+            : $root;
+        $liveEnvironmentPath = $activationRoot . '/.env';
+        $stagedEnvironmentPath = $root . '/.env';
         if (!Installation::retireInstallationToken($pendingEnvironmentPath)) {
             throw new \RuntimeException('The one-time installation token could not be retired.');
         }
         $promoteEnvironment = $action !== 'migrate' || !$inspection['bootstrapped'] || !is_file($liveEnvironmentPath);
-        if ($promoteEnvironment && !@rename($pendingEnvironmentPath, $liveEnvironmentPath)) {
+        if ($promoteEnvironment && !@rename($pendingEnvironmentPath, $stagedEnvironmentPath)) {
             throw new \RuntimeException('The private server environment could not be activated.');
         }
         if (!$promoteEnvironment) @unlink($pendingEnvironmentPath);
@@ -142,6 +148,7 @@ if (in_array($path, ['/installer/database-status', '/installer/commit'], true)) 
             'applied' => $applied,
             'bootstrapped' => $needsBootstrap,
             'token' => $sessionToken,
+            'promoteEnvironment' => $promoteEnvironment,
         ]);
     } catch (\InvalidArgumentException $error) {
         @unlink($pendingEnvironmentPath);
@@ -157,7 +164,12 @@ Runtime::sendCors($env);
 if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'OPTIONS') Runtime::respond(204);
 
 try {
-    if ($path === '/health') Runtime::respond(200, ['ok' => true, 'runtime' => 'php', 'supabase' => false]);
+    if ($path === '/health') Runtime::respond(200, [
+        'ok' => true,
+        'runtime' => 'php',
+        'supabase' => false,
+        'apiVersion' => BLUEPLM_API_VERSION,
+    ]);
     $db = Runtime::database($env);
 
     // Shared hosting commonly has no SSH access. Schema updates therefore use
@@ -778,6 +790,19 @@ try {
             throw $error;
         }
     }
+    if ($method === 'GET' && $path === '/organizations/current/serialization/exists') {
+        $serial = is_string($_GET['serial'] ?? null) ? trim($_GET['serial']) : '';
+        if ($serial === '' || strlen($serial) > 512) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid serial number is required.']);
+        $query = $db->prepare('SELECT 1 FROM files WHERE organization_id = ? AND part_number = ? AND deleted_at IS NULL LIMIT 1');
+        $query->execute([$principal['organizationId'], $serial]);
+        Runtime::respond(200, ['exists' => (bool)$query->fetchColumn()]);
+    }
+    if ($method === 'GET' && $path === '/organizations/current/serialization/files') {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $query = $db->prepare('SELECT part_number AS partNumber, canonical_path AS filePath FROM files WHERE organization_id = ? AND part_number IS NOT NULL AND deleted_at IS NULL ORDER BY part_number');
+        $query->execute([$principal['organizationId']]);
+        Runtime::respond(200, ['files' => $query->fetchAll()]);
+    }
     if ($method === 'GET' && $path === '/module-access') {
         if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
         $query = $db->prepare('SELECT module_id, team_id, user_id FROM module_access WHERE organization_id = ? ORDER BY module_id, granted_at');
@@ -895,7 +920,11 @@ try {
             if ($error->getCode() === '23000') Runtime::respond(409, ['error' => 'ALREADY_EXISTS', 'message' => 'A metadata column with this name already exists.']);
             throw $error;
         }
-        if ($statement->rowCount() === 0) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Metadata column not found.']);
+        if ($statement->rowCount() === 0) {
+            $exists = $db->prepare('SELECT 1 FROM file_metadata_columns WHERE id = ? AND organization_id = ?');
+            $exists->execute([$matches[1], $principal['organizationId']]);
+            if (!$exists->fetchColumn()) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Metadata column not found.']);
+        }
         Runtime::respond(200, ['success' => true]);
     }
     if ($method === 'DELETE' && preg_match('#^/metadata-columns/([0-9a-f-]{36})$#i', $path, $matches)) {
@@ -1082,7 +1111,7 @@ try {
     if ($method === 'GET' && preg_match('#^/vaults/([0-9a-f-]{36})/files$#i', $path, $matches)) {
         Runtime::requireVault($db, $principal, $matches[1]);
         $query = $db->prepare(
-            'SELECT f.id, f.canonical_path AS canonicalPath, f.file_name AS fileName, f.storage_relative_path AS storageRelativePath,
+            'SELECT f.id, f.canonical_path AS canonicalPath, f.file_name AS fileName, f.part_number AS partNumber, f.storage_relative_path AS storageRelativePath,
                     f.current_revision AS currentRevision, f.state, f.content_hash AS contentHash, f.size_bytes AS sizeBytes,
                     f.created_at AS createdAt, f.updated_at AS updatedAt, c.user_id AS checkedOutByUserId, u.display_name AS checkedOutBy, c.expires_at AS checkoutExpiresAt
              FROM files f LEFT JOIN checkouts c ON c.file_id = f.id AND c.expires_at > UTC_TIMESTAMP(3)
@@ -1102,22 +1131,42 @@ try {
         $storageRelativePath = ltrim(str_replace('\\', '/', trim($body['storageRelativePath'])), '/');
         if ($canonicalPath === '' || $storageRelativePath === '' || str_contains($canonicalPath, '../') || str_contains($storageRelativePath, '../')) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'File paths must be normalized vault-relative paths.']);
         $fileName = is_string($body['fileName'] ?? null) && trim($body['fileName']) !== '' ? trim($body['fileName']) : basename($canonicalPath);
+        $partNumber = is_string($body['partNumber'] ?? null) && trim($body['partNumber']) !== '' ? trim($body['partNumber']) : null;
+        if ($partNumber !== null && strlen($partNumber) > 512) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'partNumber is too long.']);
         $contentHash = is_string($body['contentHash'] ?? null) && preg_match('/^[a-f0-9]{64}$/i', $body['contentHash']) ? strtolower($body['contentHash']) : null;
         $sizeBytes = is_int($body['sizeBytes'] ?? null) && $body['sizeBytes'] >= 0 ? $body['sizeBytes'] : null;
-        $existing = $db->prepare('SELECT id FROM files WHERE vault_id = ? AND canonical_path = ? AND deleted_at IS NULL');
+        $existing = $db->prepare('SELECT id, part_number FROM files WHERE vault_id = ? AND canonical_path = ? AND deleted_at IS NULL');
         $existing->execute([$vaultId, $canonicalPath]);
         $record = $existing->fetch();
-        if ($record) Runtime::respond(200, ['id' => $record['id'], 'created' => false]);
+        if ($record) {
+            try {
+                // A rescan after upgrading from a schema without part_number is
+                // the authoritative backfill path for existing vault contents.
+                if ($partNumber !== null && $record['part_number'] !== $partNumber) {
+                    $db->prepare('UPDATE files SET part_number = ? WHERE id = ? AND organization_id = ?')
+                        ->execute([$partNumber, $record['id'], $principal['organizationId']]);
+                }
+            } catch (PDOException $error) {
+                if ($error->getCode() === '23000' && str_contains($error->getMessage(), 'uq_files_org_part_number')) {
+                    Runtime::respond(409, ['error' => 'PART_NUMBER_EXISTS', 'message' => 'This part number is already assigned to another file.']);
+                }
+                throw $error;
+            }
+            Runtime::respond(200, ['id' => $record['id'], 'created' => false]);
+        }
         $fileId = Runtime::uuid();
         $db->beginTransaction();
         try {
-            $db->prepare('INSERT INTO files (id, organization_id, vault_id, canonical_path, file_name, storage_relative_path, current_revision, content_hash, size_bytes) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)')->execute([$fileId, $principal['organizationId'], $vaultId, $canonicalPath, $fileName, $storageRelativePath, $contentHash, $sizeBytes]);
+            $db->prepare('INSERT INTO files (id, organization_id, vault_id, canonical_path, file_name, part_number, storage_relative_path, current_revision, content_hash, size_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)')->execute([$fileId, $principal['organizationId'], $vaultId, $canonicalPath, $fileName, $partNumber, $storageRelativePath, $contentHash, $sizeBytes]);
             $db->prepare('INSERT INTO file_revisions (id, file_id, revision_number, content_hash, storage_relative_path, size_bytes, checked_in_by, comment) VALUES (?, ?, 1, ?, ?, ?, ?, ?)')->execute([Runtime::uuid(), $fileId, $contentHash, $storageRelativePath, $sizeBytes, $principal['userId'], 'Initial vault import']);
             Runtime::emitEvent($db, $principal['organizationId'], 'file.imported', $fileId, ['userId' => $principal['userId'], 'vaultId' => $vaultId]);
             $db->commit();
         } catch (Throwable $error) {
             if ($db->inTransaction()) $db->rollBack();
-            if ($error instanceof PDOException && $error->getCode() === '23000') Runtime::respond(409, ['error' => 'PATH_EXISTS', 'message' => 'A file already exists at this vault path.']);
+            if ($error instanceof PDOException && $error->getCode() === '23000') {
+                if (str_contains($error->getMessage(), 'uq_files_org_part_number')) Runtime::respond(409, ['error' => 'PART_NUMBER_EXISTS', 'message' => 'This part number is already assigned to another file.']);
+                Runtime::respond(409, ['error' => 'PATH_EXISTS', 'message' => 'A file already exists at this vault path.']);
+            }
             throw $error;
         }
         Runtime::respond(201, ['id' => $fileId, 'created' => true]);
@@ -1182,7 +1231,10 @@ try {
             }
             Runtime::emitEvent($db, $principal['organizationId'], 'file.inspection_updated', $fileId, ['count' => count($validatedRows), 'userId' => $principal['userId']]);
             $db->commit();
-        } catch (Throwable $error) { if ($db->inTransaction()) $db->rollBack(); throw $error; }
+        } catch (Throwable $error) {
+            if ($db->inTransaction()) $db->rollBack();
+            throw $error;
+        }
         Runtime::respond(200, ['success' => true]);
     }
     if ($method === 'GET' && preg_match('#^/file-revisions/([0-9a-f-]{36})/inspection$#i', $path, $matches)) {
@@ -1275,13 +1327,28 @@ try {
             $hash = is_string($body['contentHash'] ?? null) && preg_match('/^[a-f0-9]{64}$/i', $body['contentHash']) ? $body['contentHash'] : null;
             $size = is_int($body['sizeBytes'] ?? null) && $body['sizeBytes'] >= 0 ? $body['sizeBytes'] : null;
             $comment = is_string($body['comment'] ?? null) ? substr($body['comment'], 0, 4000) : null;
-            $db->prepare('UPDATE files SET current_revision = ?, storage_relative_path = ?, content_hash = ?, size_bytes = ? WHERE id = ?')->execute([$revision, $relativePath, $hash, $size, $fileId]);
+            $partNumberProvided = array_key_exists('partNumber', $body);
+            $partNumber = null;
+            if ($partNumberProvided) {
+                if ($body['partNumber'] !== null && !is_string($body['partNumber'])) { $db->rollBack(); Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'partNumber must be a string or null.']); }
+                $partNumber = is_string($body['partNumber']) && trim($body['partNumber']) !== '' ? trim($body['partNumber']) : null;
+                if ($partNumber !== null && strlen($partNumber) > 512) { $db->rollBack(); Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'partNumber is too long.']); }
+            }
+            if ($partNumberProvided) {
+                $db->prepare('UPDATE files SET current_revision = ?, storage_relative_path = ?, content_hash = ?, size_bytes = ?, part_number = ? WHERE id = ?')->execute([$revision, $relativePath, $hash, $size, $partNumber, $fileId]);
+            } else {
+                $db->prepare('UPDATE files SET current_revision = ?, storage_relative_path = ?, content_hash = ?, size_bytes = ? WHERE id = ?')->execute([$revision, $relativePath, $hash, $size, $fileId]);
+            }
             $revisionId = Runtime::uuid();
             $db->prepare('INSERT INTO file_revisions (id, file_id, revision_number, content_hash, storage_relative_path, size_bytes, checked_in_by, comment) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')->execute([$revisionId, $fileId, $revision, $hash, $relativePath, $size, $principal['userId'], $comment]);
             $db->prepare('INSERT INTO inspection_characteristic_versions (id, file_revision_id, organization_id, sort_order, balloon_number, char_id, zone, char_type, sub_type, nominal_value, unit, plus_tolerance, minus_tolerance, upper_limit, lower_limit, classification, inspection_method, operation, aql, sample_size, supplier_inspection_rate, internal_inspection_rate, reference, comments) SELECT UUID(), ?, organization_id, sort_order, balloon_number, char_id, zone, char_type, sub_type, nominal_value, unit, plus_tolerance, minus_tolerance, upper_limit, lower_limit, classification, inspection_method, operation, aql, sample_size, supplier_inspection_rate, internal_inspection_rate, reference, comments FROM inspection_characteristics WHERE file_id = ?')->execute([$revisionId, $fileId]);
             Runtime::emitEvent($db, $principal['organizationId'], 'file.checked_in', $fileId, ['revision' => $revision, 'userId' => $principal['userId']]);
             $db->prepare('DELETE FROM checkouts WHERE file_id = ?')->execute([$fileId]); $db->commit();
-        } catch (Throwable $error) { if ($db->inTransaction()) $db->rollBack(); throw $error; }
+        } catch (Throwable $error) {
+            if ($db->inTransaction()) $db->rollBack();
+            if ($error instanceof PDOException && $error->getCode() === '23000' && str_contains($error->getMessage(), 'uq_files_org_part_number')) Runtime::respond(409, ['error' => 'PART_NUMBER_EXISTS', 'message' => 'This part number is already assigned to another file.']);
+            throw $error;
+        }
         Runtime::respond(200, ['fileId' => $fileId, 'revision' => $revision]);
     }
     if ($method === 'POST' && preg_match('#^/files/([0-9a-f-]{36})/checkout/renew$#i', $path, $matches)) {

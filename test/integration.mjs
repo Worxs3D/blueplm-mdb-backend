@@ -70,7 +70,7 @@ async function waitForHealth() {
   for (let attempt = 0; attempt < 40; attempt += 1) {
     try {
       const health = await request('/health')
-      if (health.ok === true && health.supabase === false) {
+      if (health.ok === true && health.supabase === false && health.apiVersion === 2) {
         const databaseProbe = await fetch(`${server}/installer/database-status`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -412,6 +412,11 @@ await request(
   { method: 'PATCH', body: JSON.stringify({ label: 'Material class', visible: false }) },
   token,
 )
+await request(
+  `/metadata-columns/${metadataColumn.id}`,
+  { method: 'PATCH', body: JSON.stringify({ label: 'Material class', visible: false }) },
+  token,
+)
 metadataColumns = await request('/metadata-columns', {}, token)
 assert.equal(metadataColumns.columns[0].label, 'Material class')
 assert.equal(metadataColumns.columns[0].visible, false)
@@ -482,11 +487,67 @@ const imported = await request(
       vaultId: vault.id,
       canonicalPath: 'drawing.txt',
       fileName: 'drawing.txt',
+      partNumber: 'PN-00042',
       storageRelativePath: 'drawing.txt',
     }),
   },
   token,
 )
+assert.equal(
+  (await request('/organizations/current/serialization/exists?serial=PN-00042', {}, token)).exists,
+  true,
+)
+assert.deepEqual(
+  (await request('/organizations/current/serialization/files', {}, token)).files,
+  [{ partNumber: 'PN-00042', filePath: 'drawing.txt' }],
+)
+assert.equal((await request(`/vaults/${vault.id}/files`, {}, token)).files[0].partNumber, 'PN-00042')
+const legacyFile = await request(
+  '/files/import',
+  {
+    method: 'POST',
+    body: JSON.stringify({
+      vaultId: vault.id,
+      canonicalPath: 'legacy-part.sldprt',
+      fileName: 'legacy-part.sldprt',
+      storageRelativePath: 'legacy-part.sldprt',
+    }),
+  },
+  token,
+)
+const rescannedLegacyFile = await request(
+  '/files/import',
+  {
+    method: 'POST',
+    body: JSON.stringify({
+      vaultId: vault.id,
+      canonicalPath: 'legacy-part.sldprt',
+      fileName: 'legacy-part.sldprt',
+      partNumber: 'PN-LEGACY',
+      storageRelativePath: 'legacy-part.sldprt',
+    }),
+  },
+  token,
+)
+assert.equal(rescannedLegacyFile.id, legacyFile.id)
+assert.equal(rescannedLegacyFile.created, false)
+assert.equal(
+  (await request('/organizations/current/serialization/exists?serial=PN-LEGACY', {}, token)).exists,
+  true,
+)
+const duplicatePartNumberResponse = await fetch(`${server}/files/import`, {
+  method: 'POST',
+  headers: { Accept: 'application/json', 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+  body: JSON.stringify({
+    vaultId: vault.id,
+    canonicalPath: 'duplicate-part-number.sldprt',
+    fileName: 'duplicate-part-number.sldprt',
+    partNumber: 'PN-00042',
+    storageRelativePath: 'duplicate-part-number.sldprt',
+  }),
+})
+assert.equal(duplicatePartNumberResponse.status, 409)
+assert.equal((await duplicatePartNumberResponse.json()).error, 'PART_NUMBER_EXISTS')
 const referencedPart = await request(
   '/files/import',
   {
@@ -557,10 +618,19 @@ const checkin = await request(
       checkoutToken: checkout.checkoutToken,
       storageRelativePath: 'drawing.txt',
       comment: 'Second revision',
+      partNumber: 'PN-00043',
     }),
   },
   token,
 )
 assert.equal(checkin.revision, 2)
+assert.equal(
+  (await request('/organizations/current/serialization/exists?serial=PN-00042', {}, token)).exists,
+  false,
+)
+assert.equal(
+  (await request('/organizations/current/serialization/exists?serial=PN-00043', {}, token)).exists,
+  true,
+)
 
 console.log('PHP API, installer lifecycle, MariaDB, and network vault integration passed.')

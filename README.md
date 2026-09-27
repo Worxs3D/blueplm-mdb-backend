@@ -57,7 +57,8 @@ addresses, or customer data.
 
 `public/.htaccess` routes API requests to `public/index.php` and disables
 directory listings. The health check is `GET /health`; a healthy MDB response
-contains `ok: true`, `runtime: "php"`, and `supabase: false`.
+contains `ok: true`, `runtime: "php"`, `supabase: false`, and the supported
+`apiVersion`.
 
 ## Tests
 
