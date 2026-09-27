@@ -83,6 +83,31 @@ function nextOrganizationSerialCounter(array $settings, int $current): int
     return $candidate;
 }
 
+/**
+ * Keep the first MDB organization usable without coupling workflow roles to
+ * account roles. These are ordinary editable records; no user assignment is
+ * created here. The labels are organization data, not translated UI copy.
+ */
+function ensureWorkflowRoleDefaults(PDO $db, string $organizationId, string $createdBy): void
+{
+    $existing = $db->prepare('SELECT 1 FROM workflow_roles WHERE org_id = ? LIMIT 1');
+    $existing->execute([$organizationId]);
+    if ($existing->fetchColumn()) return;
+
+    $defaults = [
+        ['Administrators', '#DC2626', 'shield', 0],
+        ['Engineers', '#2563EB', 'wrench', 1],
+        ['Viewers', '#64748B', 'eye', 2],
+    ];
+    $insert = $db->prepare(
+        'INSERT IGNORE INTO workflow_roles (id, org_id, name, color, icon, sort_order, created_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?)'
+    );
+    foreach ($defaults as [$name, $color, $icon, $sortOrder]) {
+        $insert->execute([Runtime::uuid(), $organizationId, $name, $color, $icon, $sortOrder, $createdBy]);
+    }
+}
+
 /** @return array<int, array{id:string,width:int,visible:bool}> */
 function normalizeColumnDefaults(mixed $value): array
 {
@@ -624,6 +649,120 @@ try {
             $db->commit();
         } catch (Throwable $error) { if ($db->inTransaction()) $db->rollBack(); throw $error; }
         Runtime::respond(204);
+    }
+    if ($method === 'GET' && $path === '/workflow-roles') {
+        ensureWorkflowRoleDefaults($db, $principal['organizationId'], $principal['userId']);
+        $query = $db->prepare(
+            'SELECT id, name, color, icon, description, sort_order
+             FROM workflow_roles
+             WHERE org_id = ? AND is_active = TRUE
+             ORDER BY sort_order, name'
+        );
+        $query->execute([$principal['organizationId']]);
+        Runtime::respond(200, ['roles' => $query->fetchAll()]);
+    }
+    if ($method === 'POST' && $path === '/workflow-roles') {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $body = Runtime::jsonBody();
+        $name = is_string($body['name'] ?? null) ? trim($body['name']) : '';
+        $color = is_string($body['color'] ?? null) ? trim($body['color']) : '#6B7280';
+        $icon = is_string($body['icon'] ?? null) ? trim($body['icon']) : 'badge-check';
+        $description = is_string($body['description'] ?? null) ? trim($body['description']) : null;
+        if ($name === '' || strlen($name) > 200 || $color === '' || strlen($color) > 32 || $icon === '' || strlen($icon) > 64 || ($description !== null && strlen($description) > 2000)) {
+            Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid name, color, icon, and optional description are required.']);
+        }
+        $roleId = Runtime::uuid();
+        try {
+            $db->prepare('INSERT INTO workflow_roles (id, org_id, name, color, icon, description, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)')
+                ->execute([$roleId, $principal['organizationId'], $name, $color, $icon, $description ?: null, $principal['userId']]);
+        } catch (PDOException $error) {
+            if ($error->getCode() === '23000') Runtime::respond(409, ['error' => 'ALREADY_EXISTS', 'message' => 'A workflow role with this name already exists.']);
+            throw $error;
+        }
+        Runtime::emitEvent($db, $principal['organizationId'], 'workflow_role.created', $roleId, ['roleId' => $roleId, 'createdBy' => $principal['userId']]);
+        Runtime::respond(201, ['role' => ['id' => $roleId, 'name' => $name, 'color' => $color, 'icon' => $icon, 'description' => $description ?: null, 'sort_order' => 0]]);
+    }
+    if ($method === 'PATCH' && preg_match('#^/workflow-roles/([0-9a-f-]{36})$#i', $path, $matches)) {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $body = Runtime::jsonBody();
+        $roleId = $matches[1];
+        $current = $db->prepare('SELECT id, name, color, icon, description, sort_order FROM workflow_roles WHERE id = ? AND org_id = ? AND is_active = TRUE');
+        $current->execute([$roleId, $principal['organizationId']]);
+        $role = $current->fetch();
+        if (!$role) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Workflow role not found.']);
+        $name = array_key_exists('name', $body) && is_string($body['name']) ? trim($body['name']) : $role['name'];
+        $color = array_key_exists('color', $body) && is_string($body['color']) ? trim($body['color']) : $role['color'];
+        $icon = array_key_exists('icon', $body) && is_string($body['icon']) ? trim($body['icon']) : $role['icon'];
+        $description = array_key_exists('description', $body) ? (is_string($body['description']) ? trim($body['description']) : null) : $role['description'];
+        if ($name === '' || strlen($name) > 200 || $color === '' || strlen($color) > 32 || $icon === '' || strlen($icon) > 64 || ($description !== null && strlen($description) > 2000)) {
+            Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid name, color, icon, and optional description are required.']);
+        }
+        try {
+            $db->prepare('UPDATE workflow_roles SET name = ?, color = ?, icon = ?, description = ?, updated_by = ? WHERE id = ? AND org_id = ?')
+                ->execute([$name, $color, $icon, $description ?: null, $principal['userId'], $roleId, $principal['organizationId']]);
+        } catch (PDOException $error) {
+            if ($error->getCode() === '23000') Runtime::respond(409, ['error' => 'ALREADY_EXISTS', 'message' => 'A workflow role with this name already exists.']);
+            throw $error;
+        }
+        Runtime::emitEvent($db, $principal['organizationId'], 'workflow_role.updated', $roleId, ['roleId' => $roleId, 'updatedBy' => $principal['userId']]);
+        Runtime::respond(200, ['role' => ['id' => $roleId, 'name' => $name, 'color' => $color, 'icon' => $icon, 'description' => $description, 'sort_order' => (int)$role['sort_order']]]);
+    }
+    if ($method === 'DELETE' && preg_match('#^/workflow-roles/([0-9a-f-]{36})$#i', $path, $matches)) {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $roleId = $matches[1];
+        $query = $db->prepare('DELETE FROM workflow_roles WHERE id = ? AND org_id = ?');
+        $query->execute([$roleId, $principal['organizationId']]);
+        if ($query->rowCount() === 0) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Workflow role not found.']);
+        Runtime::emitEvent($db, $principal['organizationId'], 'workflow_role.deleted', $roleId, ['roleId' => $roleId, 'deletedBy' => $principal['userId']]);
+        Runtime::respond(204);
+    }
+    if ($method === 'GET' && $path === '/workflow-role-assignments') {
+        $query = $db->prepare(
+            'SELECT user_id, workflow_role_id
+             FROM user_workflow_roles uwr
+             JOIN workflow_roles wr ON wr.id = uwr.workflow_role_id AND wr.org_id = uwr.org_id
+             WHERE uwr.org_id = ? AND wr.is_active = TRUE
+             ORDER BY uwr.user_id, uwr.workflow_role_id'
+        );
+        $query->execute([$principal['organizationId']]);
+        $assignments = [];
+        foreach ($query->fetchAll() as $assignment) {
+            $assignments[$assignment['user_id']][] = $assignment['workflow_role_id'];
+        }
+        Runtime::respond(200, ['assignments' => (object)$assignments]);
+    }
+    if ($method === 'PUT' && preg_match('#^/users/([0-9a-f-]{36})/workflow-roles$#i', $path, $matches)) {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $targetId = $matches[1];
+        $body = Runtime::jsonBody();
+        $roleIds = $body['roleIds'] ?? null;
+        if (!is_array($roleIds) || count($roleIds) > 100 || count(array_filter($roleIds, static fn($id) => !is_string($id) || !preg_match('/^[0-9a-f-]{36}$/i', $id))) > 0) {
+            Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'roleIds must be an array of valid IDs.']);
+        }
+        $roleIds = array_values(array_unique($roleIds));
+        $member = $db->prepare('SELECT 1 FROM organization_memberships WHERE organization_id = ? AND user_id = ?');
+        $member->execute([$principal['organizationId'], $targetId]);
+        if (!$member->fetch()) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'User not found.']);
+        if ($roleIds !== []) {
+            $placeholders = implode(',', array_fill(0, count($roleIds), '?'));
+            $roles = $db->prepare("SELECT COUNT(*) FROM workflow_roles WHERE org_id = ? AND is_active = TRUE AND id IN ($placeholders)");
+            $roles->execute([$principal['organizationId'], ...$roleIds]);
+            if ((int)$roles->fetchColumn() !== count($roleIds)) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'One or more workflow roles were not found.']);
+        }
+        $db->beginTransaction();
+        try {
+            $db->prepare('DELETE FROM user_workflow_roles WHERE org_id = ? AND user_id = ?')->execute([$principal['organizationId'], $targetId]);
+            if ($roleIds !== []) {
+                $insert = $db->prepare('INSERT INTO user_workflow_roles (id, org_id, user_id, workflow_role_id, assigned_by) VALUES (?, ?, ?, ?, ?)');
+                foreach ($roleIds as $roleId) $insert->execute([Runtime::uuid(), $principal['organizationId'], $targetId, $roleId, $principal['userId']]);
+            }
+            Runtime::emitEvent($db, $principal['organizationId'], 'workflow_role.assignments_updated', $targetId, ['userId' => $targetId, 'roleIds' => $roleIds, 'updatedBy' => $principal['userId']]);
+            $db->commit();
+        } catch (Throwable $error) {
+            if ($db->inTransaction()) $db->rollBack();
+            throw $error;
+        }
+        Runtime::respond(200, ['success' => true, 'roleIds' => $roleIds]);
     }
     if ($method === 'GET' && preg_match('#^/users/([0-9a-f-]{36})/vault-access$#i', $path, $matches)) {
         $targetId = $matches[1];

@@ -295,6 +295,45 @@ const updatedMemberLogin = await request('/auth/login', {
 })
 assert.equal(typeof updatedMemberLogin.token, 'string')
 
+// Workflow roles are separate organization data. Account roles must not create
+// or imply workflow-role assignments, and only organization administrators may
+// edit the role catalog or assignments.
+const workflowRoles = await request('/workflow-roles', {}, token)
+assert.equal(workflowRoles.roles.length, 3)
+const initialWorkflowAssignments = await request('/workflow-role-assignments', {}, token)
+assert.deepEqual(initialWorkflowAssignments.assignments, {})
+const customWorkflowRole = await request('/workflow-roles', {
+  method: 'POST',
+  body: JSON.stringify({
+    name: 'Quality Reviewers',
+    color: '#0EA5E9',
+    icon: 'check-circle',
+    description: 'Review released quality records',
+  }),
+}, token)
+assert.equal(customWorkflowRole.role.name, 'Quality Reviewers')
+const renamedWorkflowRole = await request(`/workflow-roles/${customWorkflowRole.role.id}`, {
+  method: 'PATCH',
+  body: JSON.stringify({ name: 'Quality Approvers' }),
+}, token)
+assert.equal(renamedWorkflowRole.role.name, 'Quality Approvers')
+await request(`/users/${createdUser.id}/workflow-roles`, {
+  method: 'PUT',
+  body: JSON.stringify({ roleIds: [customWorkflowRole.role.id] }),
+}, token)
+const assignedWorkflowRoles = await request('/workflow-role-assignments', {}, token)
+assert.deepEqual(assignedWorkflowRoles.assignments[createdUser.id], [customWorkflowRole.role.id])
+const memberWorkflowRoles = await request('/workflow-roles', {}, updatedMemberLogin.token)
+assert.ok(memberWorkflowRoles.roles.some((role) => role.id === customWorkflowRole.role.id))
+const deniedWorkflowRoleCreate = await requestStatus('/workflow-roles', {
+  method: 'POST',
+  body: JSON.stringify({ name: 'Should Be Denied' }),
+}, updatedMemberLogin.token)
+assert.equal(deniedWorkflowRoleCreate.status, 403)
+await request(`/workflow-roles/${customWorkflowRole.role.id}`, { method: 'DELETE' }, token)
+const assignmentsAfterDelete = await request('/workflow-role-assignments', {}, token)
+assert.deepEqual(assignmentsAfterDelete.assignments, {})
+
 // Teams are used by the desktop Community backend. A missing GET /teams
 // route makes the client surface "Failed to load teams" immediately after
 // successful login, so retain this as an end-to-end compatibility contract.
