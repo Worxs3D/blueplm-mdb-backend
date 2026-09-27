@@ -56,6 +56,20 @@ function nextOrganizationSerialCounter(array $settings, int $current): int
     return $candidate;
 }
 
+/** @return array<int, array{id:string,width:int,visible:bool}> */
+function normalizeColumnDefaults(mixed $value): array
+{
+    if (!is_array($value) || count($value) > 100) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'columnDefaults must be an array with at most 100 entries.']);
+    $normalized = [];
+    foreach ($value as $entry) {
+        if (!is_array($entry) || !is_string($entry['id'] ?? null) || !preg_match('/^[A-Za-z][A-Za-z0-9_-]{0,127}$/', $entry['id']) || !is_int($entry['width'] ?? null) || $entry['width'] < 40 || $entry['width'] > 500 || !is_bool($entry['visible'] ?? null)) {
+            Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Each column default needs a valid id, width from 40 to 500, and visible flag.']);
+        }
+        $normalized[] = ['id' => $entry['id'], 'width' => $entry['width'], 'visible' => $entry['visible']];
+    }
+    return $normalized;
+}
+
 header_remove('X-Powered-By');
 $root = dirname(__DIR__);
 $path = '/' . trim((string)(parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?? '/'), '/');
@@ -263,6 +277,7 @@ try {
     if (in_array($principal['role'], ['viewer', 'guest'], true) && $method !== 'GET') {
         $personalWrite = $path === '/account'
             || $path === '/recovery-codes/use'
+            || $path === '/column-defaults/user'
             || str_starts_with($path, '/device-sessions/')
             || str_starts_with($path, '/account/totp');
         if (!$personalWrite) Runtime::respond(403, ['error' => 'READ_ONLY_ROLE', 'message' => 'Viewer and guest accounts are read-only.']);
@@ -926,6 +941,46 @@ try {
             if (!$exists->fetchColumn()) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Metadata column not found.']);
         }
         Runtime::respond(200, ['success' => true]);
+    }
+    if ($method === 'GET' && $path === '/column-defaults/organization') {
+        $query = $db->prepare('SELECT column_defaults FROM organization_settings WHERE organization_id = ?');
+        $query->execute([$principal['organizationId']]);
+        $value = $query->fetchColumn();
+        Runtime::respond(200, ['columnDefaults' => decodeOrganizationSetting($value)]);
+    }
+    if ($method === 'PUT' && $path === '/column-defaults/organization') {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $columnDefaults = normalizeColumnDefaults(Runtime::jsonBody()['columnDefaults'] ?? null);
+        $db->prepare('INSERT INTO organization_settings (organization_id, column_defaults) VALUES (?, ?) ON DUPLICATE KEY UPDATE column_defaults = VALUES(column_defaults)')
+            ->execute([$principal['organizationId'], json_encode($columnDefaults, JSON_THROW_ON_ERROR)]);
+        Runtime::respond(200, ['columnDefaults' => $columnDefaults]);
+    }
+    if ($method === 'POST' && $path === '/column-defaults/organization/force') {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $columnDefaults = normalizeColumnDefaults(Runtime::jsonBody()['columnDefaults'] ?? null);
+        $encoded = json_encode($columnDefaults, JSON_THROW_ON_ERROR);
+        $db->beginTransaction();
+        try {
+            $db->prepare('INSERT INTO organization_settings (organization_id, column_defaults) VALUES (?, ?) ON DUPLICATE KEY UPDATE column_defaults = VALUES(column_defaults)')->execute([$principal['organizationId'], $encoded]);
+            $db->prepare('INSERT INTO user_settings (user_id, column_defaults) SELECT user_id, ? FROM organization_memberships WHERE organization_id = ? ON DUPLICATE KEY UPDATE column_defaults = VALUES(column_defaults)')->execute([$encoded, $principal['organizationId']]);
+            $db->commit();
+        } catch (Throwable $error) {
+            if ($db->inTransaction()) $db->rollBack();
+            throw $error;
+        }
+        Runtime::respond(200, ['columnDefaults' => $columnDefaults]);
+    }
+    if ($method === 'GET' && $path === '/column-defaults/user') {
+        $query = $db->prepare('SELECT column_defaults FROM user_settings WHERE user_id = ?');
+        $query->execute([$principal['userId']]);
+        $value = $query->fetchColumn();
+        Runtime::respond(200, ['columnDefaults' => decodeOrganizationSetting($value)]);
+    }
+    if ($method === 'PUT' && $path === '/column-defaults/user') {
+        $columnDefaults = normalizeColumnDefaults(Runtime::jsonBody()['columnDefaults'] ?? null);
+        $db->prepare('INSERT INTO user_settings (user_id, column_defaults) VALUES (?, ?) ON DUPLICATE KEY UPDATE column_defaults = VALUES(column_defaults)')
+            ->execute([$principal['userId'], json_encode($columnDefaults, JSON_THROW_ON_ERROR)]);
+        Runtime::respond(200, ['columnDefaults' => $columnDefaults]);
     }
     if ($method === 'DELETE' && preg_match('#^/metadata-columns/([0-9a-f-]{36})$#i', $path, $matches)) {
         if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);

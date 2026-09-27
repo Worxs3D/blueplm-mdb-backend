@@ -385,6 +385,38 @@ assert.deepEqual(moduleAccess.access, [
 assert.deepEqual((await request('/module-access/denied', {}, viewerLogin.token)).moduleIds, [])
 assert.deepEqual((await request('/module-access/denied', {}, guestLogin.token)).moduleIds, ['customers'])
 
+const columnDefaults = [
+  { id: 'name', width: 320, visible: true },
+  { id: 'revision', width: 70, visible: false },
+]
+await request(
+  '/column-defaults/organization',
+  { method: 'PUT', body: JSON.stringify({ columnDefaults }) },
+  token,
+)
+assert.deepEqual(
+  (await request('/column-defaults/organization', {}, viewerLogin.token)).columnDefaults,
+  columnDefaults,
+)
+await request(
+  '/column-defaults/user',
+  { method: 'PUT', body: JSON.stringify({ columnDefaults: columnDefaults.slice(0, 1) }) },
+  viewerLogin.token,
+)
+assert.deepEqual(
+  (await request('/column-defaults/user', {}, viewerLogin.token)).columnDefaults,
+  columnDefaults.slice(0, 1),
+)
+await request(
+  '/column-defaults/organization/force',
+  { method: 'POST', body: JSON.stringify({ columnDefaults }) },
+  token,
+)
+assert.deepEqual(
+  (await request('/column-defaults/user', {}, guestLogin.token)).columnDefaults,
+  columnDefaults,
+)
+
 const metadataColumn = await request(
   '/metadata-columns',
   {
