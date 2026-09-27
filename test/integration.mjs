@@ -279,6 +279,57 @@ const defaultTeam = await request(
 )
 assert.equal(defaultTeam.defaultNewUserTeamId, createdTeam.id)
 
+const serializationSettings = {
+  enabled: true,
+  prefix: 'TEST-',
+  suffix: '-A',
+  padding_digits: 4,
+  letter_prefix: '',
+  keepout_zones: [{ start: 2, end_num: 4, description: 'Reserved' }],
+  current_counter: 0,
+}
+const savedSerialization = await request(
+  '/organizations/current/settings/serialization',
+  {
+    method: 'PUT',
+    body: JSON.stringify({ value: serializationSettings, replaceCounter: true }),
+  },
+  token,
+)
+assert.equal(savedSerialization.value.current_counter, 0)
+const loadedSerialization = await request('/organizations/current/settings/serialization', {}, token)
+assert.equal(loadedSerialization.value.prefix, 'TEST-')
+assert.equal(loadedSerialization.value.current_counter, 0)
+assert.equal(
+  (await request('/organizations/current/serialization/preview', {}, token)).serialNumber,
+  'TEST-0001-A',
+)
+assert.equal(
+  (await request('/organizations/current/serialization/next', { method: 'POST' }, token)).serialNumber,
+  'TEST-0001-A',
+)
+assert.equal(
+  (await request('/organizations/current/serialization/next', { method: 'POST' }, token)).serialNumber,
+  'TEST-0005-A',
+)
+assert.equal(
+  (await request('/organizations/current/settings/serialization', {}, token)).value.current_counter,
+  5,
+)
+
+for (const [section, value] of Object.entries({
+  export: { filename_pattern: '{partNumber}' },
+  rfq: { default_payment_terms: 'Net 30' },
+  'auth-providers': { users: { email: true } },
+})) {
+  await request(
+    `/organizations/current/settings/${section}`,
+    { method: 'PUT', body: JSON.stringify({ value }) },
+    token,
+  )
+  assert.deepEqual((await request(`/organizations/current/settings/${section}`, {}, token)).value, value)
+}
+
 // Viewer accounts inherit team vault grants. Guest accounts deliberately do
 // not: they see only explicitly assigned vaults. Both roles remain read-only.
 const viewer = await request(
@@ -322,6 +373,51 @@ const guestLogin = await request('/auth/login', {
   method: 'POST',
   body: JSON.stringify({ email: 'guest@example.test', password: 'Integration guest password 123!' }),
 })
+await request(
+  '/module-access/customers',
+  { method: 'PUT', body: JSON.stringify({ teamIds: [], userIds: [viewer.id] }) },
+  token,
+)
+const moduleAccess = await request('/module-access', {}, token)
+assert.deepEqual(moduleAccess.access, [
+  { module_id: 'customers', team_id: null, user_id: viewer.id },
+])
+assert.deepEqual((await request('/module-access/denied', {}, viewerLogin.token)).moduleIds, [])
+assert.deepEqual((await request('/module-access/denied', {}, guestLogin.token)).moduleIds, ['customers'])
+
+const metadataColumn = await request(
+  '/metadata-columns',
+  {
+    method: 'POST',
+    body: JSON.stringify({
+      name: 'material_grade',
+      label: 'Material grade',
+      data_type: 'select',
+      select_options: ['A', 'B'],
+      width: 180,
+      visible: true,
+      sortable: true,
+      required: false,
+      default_value: 'A',
+      sort_order: 0,
+    }),
+  },
+  token,
+)
+let metadataColumns = await request('/metadata-columns', {}, viewerLogin.token)
+assert.equal(metadataColumns.columns[0].id, metadataColumn.id)
+assert.deepEqual(metadataColumns.columns[0].select_options, ['A', 'B'])
+await request(
+  `/metadata-columns/${metadataColumn.id}`,
+  { method: 'PATCH', body: JSON.stringify({ label: 'Material class', visible: false }) },
+  token,
+)
+metadataColumns = await request('/metadata-columns', {}, token)
+assert.equal(metadataColumns.columns[0].label, 'Material class')
+assert.equal(metadataColumns.columns[0].visible, false)
+await request(`/metadata-columns/${metadataColumn.id}`, { method: 'DELETE' }, token)
+assert.deepEqual((await request('/metadata-columns', {}, token)).columns, [])
+
 assert.ok((await request('/vaults', {}, viewerLogin.token)).vaults.some((entry) => entry.id === vault.id))
 assert.equal((await request('/vaults', {}, guestLogin.token)).vaults.length, 0)
 await request(
