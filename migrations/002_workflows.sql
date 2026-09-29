@@ -1,5 +1,5 @@
 -- Workflow domain.  This is intentionally a separate migration: an existing
--- Community installation that already applied 001_init.sql gains the workflow
+-- MDB installation that already applied 001_init.sql gains the workflow
 -- tables on the next backend start without rebuilding its MariaDB volume.
 
 CREATE TABLE IF NOT EXISTS workflow_templates (
