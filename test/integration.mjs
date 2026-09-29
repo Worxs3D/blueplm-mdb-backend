@@ -247,7 +247,7 @@ await request(
   token,
 )
 
-// Community user management must remain a first-class API: no Supabase auth
+// MDB user management must remain a first-class API: no Supabase auth
 // endpoint is involved when an administrator creates or changes an account.
 const createdUser = await request(
   '/users',
@@ -334,7 +334,7 @@ await request(`/workflow-roles/${customWorkflowRole.role.id}`, { method: 'DELETE
 const assignmentsAfterDelete = await request('/workflow-role-assignments', {}, token)
 assert.deepEqual(assignmentsAfterDelete.assignments, {})
 
-// Teams are used by the desktop Community backend. A missing GET /teams
+// Teams are used by the desktop MDB backend. A missing GET /teams
 // route makes the client surface "Failed to load teams" immediately after
 // successful login, so retain this as an end-to-end compatibility contract.
 const initialTeams = await request('/teams', {}, token)
