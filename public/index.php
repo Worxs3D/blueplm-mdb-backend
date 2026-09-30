@@ -1181,35 +1181,40 @@ try {
         Runtime::emitEvent($db, $principal['organizationId'], 'organization.default_team_updated', $principal['organizationId'], ['defaultNewUserTeamId' => $teamId, 'updatedBy' => $principal['userId']]);
         Runtime::respond(200, ['defaultNewUserTeamId' => $teamId]);
     }
-    if ($method === 'GET' && preg_match('#^/organizations/current/settings/(serialization|export|rfq|auth-providers)$#', $path, $matches)) {
+    if ($method === 'GET' && preg_match('#^/organizations/current/settings/(serialization|export|rfq|auth-providers|modules)$#', $path, $matches)) {
         $columns = [
             'serialization' => 'serialization_settings',
             'export' => 'export_settings',
             'rfq' => 'rfq_settings',
             'auth-providers' => 'auth_provider_settings',
+            'modules' => 'module_defaults',
         ];
         $section = $matches[1];
         $column = $columns[$section];
-        $query = $db->prepare("SELECT {$column}, serialization_counter FROM organization_settings WHERE organization_id = ?");
+        $query = $db->prepare("SELECT {$column}, serialization_counter, module_defaults_forced_at FROM organization_settings WHERE organization_id = ?");
         $query->execute([$principal['organizationId']]);
         $row = $query->fetch() ?: [];
         $value = decodeOrganizationSetting($row[$column] ?? null);
         if ($section === 'serialization') $value['current_counter'] = (int)($row['serialization_counter'] ?? 0);
+        if ($section === 'modules') $value['_forcedAt'] = $row['module_defaults_forced_at'] ?? null;
         Runtime::respond(200, ['value' => $value]);
     }
-    if ($method === 'PUT' && preg_match('#^/organizations/current/settings/(serialization|export|rfq|auth-providers)$#', $path, $matches)) {
+    if ($method === 'PUT' && preg_match('#^/organizations/current/settings/(serialization|export|rfq|auth-providers|modules)$#', $path, $matches)) {
         if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
         $columns = [
             'serialization' => 'serialization_settings',
             'export' => 'export_settings',
             'rfq' => 'rfq_settings',
             'auth-providers' => 'auth_provider_settings',
+            'modules' => 'module_defaults',
         ];
         $section = $matches[1];
         $column = $columns[$section];
         $body = Runtime::jsonBody();
         $value = $body['value'] ?? null;
         if (!is_array($value)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'value must be a JSON object.']);
+        $force = ($body['force'] ?? false) === true;
+        if ($section === 'modules' && array_key_exists('_forcedAt', $value)) unset($value['_forcedAt']);
         $counter = null;
         if ($section === 'serialization') {
             if (array_key_exists('current_counter', $value)) {
@@ -1228,8 +1233,13 @@ try {
             $db->prepare("INSERT INTO organization_settings (organization_id, {$column}, serialization_counter) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE {$column} = VALUES({$column}), serialization_counter = VALUES(serialization_counter)")
                 ->execute([$principal['organizationId'], $encoded, $counter]);
         } else {
-            $db->prepare("INSERT INTO organization_settings (organization_id, {$column}) VALUES (?, ?) ON DUPLICATE KEY UPDATE {$column} = VALUES({$column})")
-                ->execute([$principal['organizationId'], $encoded]);
+            if ($section === 'modules' && $force) {
+                $db->prepare("INSERT INTO organization_settings (organization_id, {$column}, module_defaults_forced_at) VALUES (?, ?, UTC_TIMESTAMP(3)) ON DUPLICATE KEY UPDATE {$column} = VALUES({$column}), module_defaults_forced_at = UTC_TIMESTAMP(3)")
+                    ->execute([$principal['organizationId'], $encoded]);
+            } else {
+                $db->prepare("INSERT INTO organization_settings (organization_id, {$column}) VALUES (?, ?) ON DUPLICATE KEY UPDATE {$column} = VALUES({$column})")
+                    ->execute([$principal['organizationId'], $encoded]);
+            }
         }
         if ($section === 'serialization') {
             $query = $db->prepare('SELECT serialization_counter FROM organization_settings WHERE organization_id = ?');
