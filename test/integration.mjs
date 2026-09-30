@@ -81,6 +81,10 @@ async function waitForHealth() {
     try {
       const health = await request('/health')
       if (health.ok === true && health.supabase === false && health.apiVersion === 2) {
+        // A fresh/legacy deployment has no identity until the desktop installer
+        // publishes one; clients must classify this as unknown, never current.
+        assert.equal(health.bundleDigest, null)
+        assert.equal(health.bundleVersion, null)
         const databaseProbe = await fetch(`${server}/installer/database-status`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
