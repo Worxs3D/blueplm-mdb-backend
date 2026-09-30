@@ -664,7 +664,7 @@ try {
     }
     if ($method === 'GET' && $path === '/workflow-reviews/mine') {
         $query = $db->prepare("SELECT pr.id AS review_id, pr.file_id, pr.transition_id, pr.gate_id, pr.status, pr.requested_at, pr.expires_at,
-          f.name AS file_name, f.storage_relative_path AS file_path, f.vault_id, g.name AS gate_name, g.gate_type,
+          f.file_name AS file_name, f.storage_relative_path AS file_path, f.vault_id, g.name AS gate_name, g.gate_type,
           t.name AS transition_name, src.name AS from_state_name, dst.name AS to_state_name,
           pr.requested_by, u.email AS requested_by_email, COALESCE(g.checklist_items, JSON_ARRAY()) AS checklist_items
           FROM pending_reviews pr JOIN files f ON f.id = pr.file_id AND f.organization_id = pr.organization_id
@@ -707,16 +707,21 @@ try {
                 Runtime::emitEvent($db, $principal['organizationId'], 'review.rejected', $review['id'], ['fileId' => $review['file_id'], 'transitionId' => $review['transition_id'], 'userId' => $principal['userId']]);
                 $db->commit(); Runtime::respond(200, ['result' => ['success' => true, 'requires_review' => false, 'new_state_id' => null, 'new_state_name' => null, 'new_revision' => null, 'error_code' => null, 'error_message' => null]]);
             }
+            $isDirectReview = $review['gate_id'] === null || $review['gate_id'] === '';
             $gates = $db->prepare('SELECT id, approval_mode, required_approvals FROM workflow_gates WHERE transition_id = ? AND is_blocking = TRUE'); $gates->execute([$review['transition_id']]);
             $complete = true;
-            foreach ($gates->fetchAll() as $gate) {
+            foreach ($isDirectReview ? [] : $gates->fetchAll() as $gate) {
                 $counts = $db->prepare("SELECT COUNT(*) AS total, SUM(status = 'approved') AS approved, SUM(status IN ('rejected','kicked_back')) AS rejected FROM pending_reviews WHERE file_id = ? AND transition_id = ? AND gate_id = ?");
                 $counts->execute([$review['file_id'], $review['transition_id'], $gate['id']]); $count = $counts->fetch();
                 if ((int)$count['rejected'] > 0) $complete = false;
                 $needed = match ($gate['approval_mode']) { 'all' => (int)$count['total'], 'majority' => intdiv((int)$count['total'], 2) + 1, default => max(1, (int)$gate['required_approvals']) };
                 if ((int)$count['total'] === 0 || (int)$count['approved'] < $needed) $complete = false;
             }
-            if ($review['gate_id'] === null) { $direct = $db->prepare("SELECT COUNT(*) FROM pending_reviews WHERE file_id = ? AND transition_id = ? AND gate_id IS NULL AND status = 'pending'"); $direct->execute([$review['file_id'], $review['transition_id']]); if ((int)$direct->fetchColumn() > 0) $complete = false; }
+            // A plain SELECT in MariaDB's default REPEATABLE READ transaction
+            // can still see the snapshot from before the UPDATE above.  Make
+            // the decision read a locking read so this review is not counted
+            // as its own still-pending direct review.
+            if ($isDirectReview) { $direct = $db->prepare("SELECT id FROM pending_reviews WHERE file_id = ? AND transition_id = ? AND gate_id IS NULL AND status = 'pending' AND id <> ? FOR UPDATE"); $direct->execute([$review['file_id'], $review['transition_id'], $review['id']]); if ($direct->fetch()) $complete = false; }
             if (!$complete) { $db->commit(); Runtime::respond(200, ['result' => ['success' => true, 'requires_review' => true, 'new_state_id' => null, 'new_state_name' => null, 'new_revision' => null, 'error_code' => null, 'error_message' => null]]); }
             $revision = $db->prepare('SELECT current_revision FROM files WHERE id = ? AND organization_id = ? FOR UPDATE'); $revision->execute([$review['file_id'], $principal['organizationId']]); $before = (int)$revision->fetchColumn(); $after = $before + ((bool)$review['auto_increment_revision'] ? 1 : 0);
             if ($after !== $before) $db->prepare('UPDATE files SET current_revision = ? WHERE id = ? AND organization_id = ?')->execute([$after, $review['file_id'], $principal['organizationId']]);

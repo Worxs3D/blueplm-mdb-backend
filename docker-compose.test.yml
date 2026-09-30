@@ -31,7 +31,7 @@ services:
       BLUEPLM_INSTALLATION_TOKEN: integration-installation-token-must-be-at-least-32-chars
       BLUEPLM_CORS_ORIGINS: null,file://,http://localhost:5173
     ports:
-      - "18080:80"
+      - "${BLUEPLM_PHP_TEST_PORT:-18080}:80"
     depends_on:
       mariadb:
         condition: service_healthy
