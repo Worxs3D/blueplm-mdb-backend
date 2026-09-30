@@ -1036,9 +1036,12 @@ try {
     if ($method === 'PUT' && preg_match('#^/teams/([0-9a-f-]{36})/module-defaults$#i', $path, $matches)) {
         if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
         $body = Runtime::jsonBody(); $defaults = $body['defaults'] ?? null;
-        if (!is_array($defaults) || strlen(json_encode($defaults, JSON_THROW_ON_ERROR)) > 500000) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid module defaults object is required.']);
+        if (!is_array($defaults)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid module defaults object is required.']);
+        try { $encodedDefaults = json_encode($defaults, JSON_THROW_ON_ERROR); }
+        catch (JsonException $error) { Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid module defaults object is required.']); }
+        if (strlen($encodedDefaults) > 500000) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid module defaults object is required.']);
         $team = $db->prepare('SELECT id FROM teams WHERE id = ? AND organization_id = ?'); $team->execute([$matches[1], $principal['organizationId']]); if (!$team->fetch()) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Team not found.']);
-        $db->prepare('UPDATE teams SET module_defaults = ?, module_defaults_forced_at = NULL WHERE id = ? AND organization_id = ?')->execute([json_encode($defaults, JSON_THROW_ON_ERROR), $matches[1], $principal['organizationId']]);
+        $db->prepare('UPDATE teams SET module_defaults = ?, module_defaults_forced_at = NULL WHERE id = ? AND organization_id = ?')->execute([$encodedDefaults, $matches[1], $principal['organizationId']]);
         Runtime::emitEvent($db, $principal['organizationId'], 'team.module_defaults_updated', $matches[1], ['teamId' => $matches[1], 'updatedBy' => $principal['userId']]);
         Runtime::respond(200, ['success' => true]);
     }
