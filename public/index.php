@@ -663,8 +663,14 @@ try {
         }
     }
     if ($method === 'GET' && $path === '/workflow-reviews/mine') {
-        $query = $db->prepare('SELECT pr.id AS review_id, pr.file_id, pr.transition_id, pr.gate_id, pr.status, pr.requested_at, pr.expires_at, f.name AS file_name, f.vault_id
+        $query = $db->prepare("SELECT pr.id AS review_id, pr.file_id, pr.transition_id, pr.gate_id, pr.status, pr.requested_at, pr.expires_at,
+          f.name AS file_name, f.storage_relative_path AS file_path, f.vault_id, g.name AS gate_name, g.gate_type,
+          t.name AS transition_name, src.name AS from_state_name, dst.name AS to_state_name,
+          pr.requested_by, u.email AS requested_by_email, COALESCE(g.checklist_items, JSON_ARRAY()) AS checklist_items
           FROM pending_reviews pr JOIN files f ON f.id = pr.file_id AND f.organization_id = pr.organization_id
+          JOIN workflow_transitions t ON t.id = pr.transition_id
+          JOIN workflow_states src ON src.id = t.from_state_id JOIN workflow_states dst ON dst.id = t.to_state_id
+          LEFT JOIN workflow_gates g ON g.id = pr.gate_id LEFT JOIN users u ON u.id = pr.requested_by
           WHERE pr.organization_id = ? AND pr.assigned_to = ? AND pr.status = \'pending\' AND (pr.expires_at IS NULL OR pr.expires_at > UTC_TIMESTAMP(3)) ORDER BY pr.requested_at');
         $query->execute([$principal['organizationId'], $principal['userId']]);
         $reviews = [];
