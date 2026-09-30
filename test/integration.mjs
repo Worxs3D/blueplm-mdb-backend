@@ -785,11 +785,14 @@ assert.equal(staleTransition.status, 409)
 
 const restrictedStateId = randomUUID()
 const restrictedTransitionId = randomUUID()
+const memberTargetStateId = randomUUID()
+const memberTransitionId = randomUUID()
 const restrictedRoleId = randomUUID()
 const restrictedSql = [
-  `INSERT INTO workflow_states (id, workflow_id, name, label) VALUES ('${restrictedStateId}', '${workflowId}', 'Restricted', 'Restricted')`,
+  `INSERT INTO workflow_states (id, workflow_id, name, label) VALUES ('${restrictedStateId}', '${workflowId}', 'Restricted', 'Restricted'), ('${memberTargetStateId}', '${workflowId}', 'Member target', 'Member target')`,
   `INSERT INTO workflow_roles (id, org_id, name) VALUES ('${restrictedRoleId}', '${workflowPrincipal.user.organizationId}', 'Release approver')`,
   `INSERT INTO workflow_transitions (id, workflow_id, from_state_id, to_state_id, name, allowed_workflow_roles, waypoints) VALUES ('${restrictedTransitionId}', '${workflowId}', '${toStateId}', '${restrictedStateId}', 'Restricted release', '["${restrictedRoleId}"]', '[]')`,
+  `INSERT INTO workflow_transitions (id, workflow_id, from_state_id, to_state_id, name, allowed_workflow_roles, waypoints) VALUES ('${memberTransitionId}', '${workflowId}', '${restrictedStateId}', '${memberTargetStateId}', 'Member restricted release', '["${restrictedRoleId}"]', '[]')`,
 ].join('; ')
 execFileSync('docker', [
   'compose', '-f', 'docker-compose.test.yml', 'exec', '-T', 'mariadb',
@@ -800,7 +803,13 @@ const restrictedExecution = await fetch(`${server}/files/${imported.id}/workflow
   headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
   body: JSON.stringify({}),
 })
-assert.equal(restrictedExecution.status, 403)
+assert.equal(restrictedExecution.status, 200)
+const memberRestrictedExecution = await fetch(`${server}/files/${imported.id}/workflow-transitions/${memberTransitionId}/execute`, {
+  method: 'POST',
+  headers: { Authorization: `Bearer ${updatedMemberLogin.token}`, 'Content-Type': 'application/json' },
+  body: JSON.stringify({}),
+})
+assert.equal(memberRestrictedExecution.status, 403)
 const legacyFile = await request(
   '/files/import',
   {

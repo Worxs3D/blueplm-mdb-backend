@@ -517,7 +517,8 @@ try {
         $transitions = [];
         foreach ($query->fetchAll() as $transition) {
             $allowedRoles = json_decode((string)($transition['allowed_workflow_roles'] ?? 'null'), true);
-            $canTransition = !is_array($allowedRoles) || $allowedRoles === []
+            $canTransition = in_array($principal['role'], ['owner', 'admin'], true)
+                || !is_array($allowedRoles) || $allowedRoles === []
                 || array_intersect($ownedRoles, array_map('strval', $allowedRoles)) !== [];
             if (!$canTransition) continue;
             $transitions[] = [
@@ -562,7 +563,7 @@ try {
             $transitionRow = $transition->fetch();
             if (!$transitionRow) { $db->rollBack(); Runtime::respond(409, ['error' => 'TRANSITION_UNAVAILABLE', 'message' => 'The workflow transition is no longer available.']); }
             $allowedRoles = json_decode((string)($transitionRow['allowed_workflow_roles'] ?? 'null'), true);
-            if (is_array($allowedRoles) && $allowedRoles !== []) {
+            if (!in_array($principal['role'], ['owner', 'admin'], true) && is_array($allowedRoles) && $allowedRoles !== []) {
                 $roles = $db->prepare('SELECT uwr.workflow_role_id FROM user_workflow_roles uwr JOIN workflow_roles wr ON wr.id = uwr.workflow_role_id AND wr.org_id = uwr.org_id AND wr.is_active = TRUE WHERE uwr.user_id = ? AND uwr.org_id = ?');
                 $roles->execute([$principal['userId'], $principal['organizationId']]);
                 $ownedRoles = array_map('strval', array_column($roles->fetchAll(), 'workflow_role_id'));
