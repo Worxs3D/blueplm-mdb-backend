@@ -1651,6 +1651,61 @@ try {
     if ($method === 'GET' && $path === '/suppliers') {
         $query = $db->prepare('SELECT id, name, code, contact_email, contact_phone, website, city, state, country, is_active, is_approved, erp_id, erp_synced_at, created_at FROM suppliers WHERE organization_id = ? ORDER BY is_active DESC, name'); $query->execute([$principal['organizationId']]); $rows = $query->fetchAll(); foreach ($rows as &$row) { $row['is_active'] = (bool)$row['is_active']; $row['is_approved'] = (bool)$row['is_approved']; } unset($row); Runtime::respond(200, ['suppliers' => $rows]);
     }
+    if ($method === 'POST' && $path === '/suppliers') {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $body = Runtime::jsonBody();
+        $name = is_string($body['name'] ?? null) ? trim($body['name']) : '';
+        if ($name === '' || strlen($name) > 255) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Supplier name is required.']);
+        $id = Runtime::uuid();
+        $code = is_string($body['code'] ?? null) && trim($body['code']) !== '' ? substr(trim($body['code']), 0, 128) : null;
+        try {
+            $db->prepare('INSERT INTO suppliers (id, organization_id, name, code, contact_email, contact_phone, website, city, state, country, is_active, is_approved, erp_id, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')->execute([
+                $id, $principal['organizationId'], $name, $code,
+                is_string($body['contactEmail'] ?? null) ? substr(trim($body['contactEmail']), 0, 320) : null,
+                is_string($body['contactPhone'] ?? null) ? substr(trim($body['contactPhone']), 0, 128) : null,
+                is_string($body['website'] ?? null) ? substr(trim($body['website']), 0, 2048) : null,
+                is_string($body['city'] ?? null) ? substr(trim($body['city']), 0, 128) : null,
+                is_string($body['state'] ?? null) ? substr(trim($body['state']), 0, 128) : null,
+                is_string($body['country'] ?? null) ? substr(trim($body['country']), 0, 128) : null,
+                array_key_exists('isActive', $body) ? (bool)$body['isActive'] : true,
+                array_key_exists('isApproved', $body) ? (bool)$body['isApproved'] : false,
+                is_string($body['erpId'] ?? null) ? substr(trim($body['erpId']), 0, 255) : null,
+                $principal['userId'],
+            ]);
+        } catch (PDOException $error) {
+            if ($error->getCode() === '23000') Runtime::respond(409, ['error' => 'ALREADY_EXISTS', 'message' => 'Supplier code already exists in this organization.']);
+            throw $error;
+        }
+        $query = $db->prepare('SELECT id, name, code, contact_email, contact_phone, website, city, state, country, is_active, is_approved, erp_id, erp_synced_at, created_at FROM suppliers WHERE id = ? AND organization_id = ?'); $query->execute([$id, $principal['organizationId']]); $row = $query->fetch(); $row['is_active'] = (bool)$row['is_active']; $row['is_approved'] = (bool)$row['is_approved']; Runtime::respond(201, ['supplier' => $row]);
+    }
+    if ($method === 'PATCH' && preg_match('#^/suppliers/([0-9a-f-]{36})$#i', $path, $matches)) {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $body = Runtime::jsonBody();
+        $mapping = ['name' => 'name', 'code' => 'code', 'contactEmail' => 'contact_email', 'contactPhone' => 'contact_phone', 'website' => 'website', 'city' => 'city', 'state' => 'state', 'country' => 'country', 'isActive' => 'is_active', 'isApproved' => 'is_approved', 'erpId' => 'erp_id'];
+        $sets = []; $values = [];
+        foreach ($mapping as $input => $column) {
+            if (!array_key_exists($input, $body)) continue;
+            $value = $body[$input];
+            if (in_array($column, ['name', 'code', 'contact_email', 'contact_phone', 'website', 'city', 'state', 'country', 'erp_id'], true) && $value !== null && !is_string($value)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Supplier fields must be strings.']);
+            if ($column === 'name') { $value = trim((string)$value); if ($value === '') Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Supplier name is required.']); }
+            if ($column === 'is_active' || $column === 'is_approved') $value = (bool)$value;
+            $sets[] = "$column = ?"; $values[] = is_string($value) ? trim($value) : $value;
+        }
+        if (!$sets) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'At least one supplier field is required.']);
+        $exists = $db->prepare('SELECT 1 FROM suppliers WHERE id = ? AND organization_id = ?'); $exists->execute([$matches[1], $principal['organizationId']]);
+        if (!$exists->fetchColumn()) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Supplier not found.']);
+        $values[] = $matches[1]; $values[] = $principal['organizationId'];
+        try { $db->prepare('UPDATE suppliers SET ' . implode(', ', $sets) . ' WHERE id = ? AND organization_id = ?')->execute($values); } catch (PDOException $error) { if ($error->getCode() === '23000') Runtime::respond(409, ['error' => 'ALREADY_EXISTS', 'message' => 'Supplier code already exists in this organization.']); throw $error; }
+        $query = $db->prepare('SELECT id, name, code, contact_email, contact_phone, website, city, state, country, is_active, is_approved, erp_id, erp_synced_at, created_at FROM suppliers WHERE id = ? AND organization_id = ?'); $query->execute([$matches[1], $principal['organizationId']]); $row = $query->fetch(); $row['is_active'] = (bool)$row['is_active']; $row['is_approved'] = (bool)$row['is_approved']; Runtime::respond(200, ['supplier' => $row]);
+    }
+    if ($method === 'DELETE' && preg_match('#^/suppliers/([0-9a-f-]{36})$#i', $path, $matches)) {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        // Deactivate instead of deleting: part_suppliers keeps its historical
+        // assignment and the foreign-key relationship remains intact.
+        $query = $db->prepare('UPDATE suppliers SET is_active = FALSE WHERE id = ? AND organization_id = ?'); $query->execute([$matches[1], $principal['organizationId']]);
+        if ($query->rowCount() === 0) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Supplier not found.']);
+        Runtime::respond(204);
+    }
     if ($method === 'GET' && preg_match('#^/files/([0-9a-f-]{36})/suppliers$#i', $path, $matches)) {
         $file = $db->prepare('SELECT vault_id FROM files WHERE id = ? AND organization_id = ? AND deleted_at IS NULL'); $file->execute([$matches[1], $principal['organizationId']]); $fileRow = $file->fetch(); if (!$fileRow) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'File not found.']); Runtime::requireVault($db, $principal, $fileRow['vault_id']);
         $query = $db->prepare("SELECT ps.*, JSON_OBJECT('id',s.id,'name',s.name,'code',s.code,'contact_email',s.contact_email,'contact_phone',s.contact_phone,'website',s.website,'city',s.city,'state',s.state,'country',s.country,'is_active',s.is_active,'is_approved',s.is_approved,'erp_id',s.erp_id,'erp_synced_at',s.erp_synced_at,'created_at',s.created_at) AS supplier FROM part_suppliers ps JOIN suppliers s ON s.id = ps.supplier_id WHERE ps.file_id = ? AND ps.organization_id = ? AND ps.is_active = TRUE ORDER BY ps.is_preferred DESC, ps.unit_price IS NULL, ps.unit_price ASC"); $query->execute([$matches[1], $principal['organizationId']]); $rows = $query->fetchAll(); foreach ($rows as &$row) { $row['supplier'] = json_decode($row['supplier'], true, 512, JSON_THROW_ON_ERROR); $row['price_breaks'] = $row['price_breaks'] === null ? null : json_decode($row['price_breaks'], true, 512, JSON_THROW_ON_ERROR); foreach (['is_preferred','is_active','is_qualified'] as $key) $row[$key] = (bool)$row[$key]; if ($row['unit_price'] !== null) $row['unit_price'] = (float)$row['unit_price']; } unset($row); Runtime::respond(200, ['partSuppliers' => $rows]);
