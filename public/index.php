@@ -17,6 +17,52 @@ use BluePlm\Totp;
 
 const BLUEPLM_API_VERSION = 2;
 
+/** @return list<string> Reviewer user ids, always constrained to this tenant. */
+function workflowReviewers(PDO $db, string $organizationId, ?string $gateId): array
+{
+    if ($gateId === null) {
+        $q = $db->prepare("SELECT user_id FROM organization_memberships WHERE organization_id = ? AND role IN ('owner', 'admin')");
+        $q->execute([$organizationId]);
+        return array_values(array_unique(array_map('strval', array_column($q->fetchAll(), 'user_id'))));
+    }
+    $q = $db->prepare(
+        "SELECT DISTINCT m.user_id
+         FROM workflow_gate_reviewers r
+         JOIN workflow_gates g ON g.id = r.gate_id
+         JOIN workflow_transitions t ON t.id = g.transition_id
+         JOIN workflow_templates w ON w.id = t.workflow_id AND w.organization_id = ?
+         JOIN organization_memberships m ON m.organization_id = w.organization_id
+         LEFT JOIN user_workflow_roles uwr ON uwr.org_id = w.organization_id AND uwr.user_id = m.user_id
+         LEFT JOIN team_members tm ON tm.user_id = m.user_id
+         LEFT JOIN teams team ON team.id = tm.team_id AND team.organization_id = w.organization_id
+         WHERE r.gate_id = ? AND (
+           (r.reviewer_type = 'user' AND r.user_id = m.user_id)
+           OR (r.reviewer_type = 'role' AND r.role = m.role)
+           OR (r.reviewer_type = 'workflow_role' AND r.workflow_role_id = uwr.workflow_role_id)
+           OR (r.reviewer_type = 'group' AND (r.group_name = team.id OR r.group_name = team.name))
+         )"
+    );
+    $q->execute([$organizationId, $gateId]);
+    return array_values(array_unique(array_map('strval', array_column($q->fetchAll(), 'user_id'))));
+}
+
+/** Insert assigned review rows. A direct review deliberately falls back to an
+ * org administrator and finally the requester, so triggers_review is never a
+ * terminal, unresolvable state. */
+function createWorkflowReviews(PDO $db, array $principal, string $fileId, string $transitionId, array $gates): void
+{
+    if ($gates === []) $gates = [['id' => null]];
+    $insert = $db->prepare("INSERT INTO pending_reviews (id, organization_id, file_id, transition_id, gate_id, requested_by, assigned_to, status)
+      SELECT ?, ?, ?, ?, ?, ?, ?, 'pending' FROM DUAL
+      WHERE NOT EXISTS (SELECT 1 FROM pending_reviews WHERE file_id = ? AND transition_id = ? AND gate_id <=> ? AND assigned_to = ? AND status = 'pending')");
+    foreach ($gates as $gate) {
+        $gateId = $gate['id'];
+        $reviewers = workflowReviewers($db, $principal['organizationId'], $gateId);
+        if ($reviewers === []) $reviewers = [$principal['userId']];
+        foreach ($reviewers as $reviewerId) $insert->execute([Runtime::uuid(), $principal['organizationId'], $fileId, $transitionId, $gateId, $principal['userId'], $reviewerId, $fileId, $transitionId, $gateId, $reviewerId]);
+    }
+}
+
 /** @return array<string, mixed> */
 function decodeOrganizationSetting(mixed $value): array
 {
@@ -576,10 +622,7 @@ try {
             $gate->execute([$transitionRow['id']]);
             $gates = $gate->fetchAll();
             if ($gates || (bool)$transitionRow['triggers_review']) {
-                foreach ($gates as $gateRow) {
-                    $db->prepare('INSERT INTO pending_reviews (id, organization_id, file_id, transition_id, gate_id, requested_by, status) VALUES (?, ?, ?, ?, ?, ?, \'pending\') ON DUPLICATE KEY UPDATE requested_by = VALUES(requested_by), status = \'pending\', requested_at = UTC_TIMESTAMP(3)')
-                        ->execute([Runtime::uuid(), $principal['organizationId'], $matches[1], $transitionRow['id'], $gateRow['id'], $principal['userId']]);
-                }
+                createWorkflowReviews($db, $principal, $matches[1], $transitionRow['id'], $gates);
                 Runtime::emitEvent($db, $principal['organizationId'], 'file.workflow_review_requested', $matches[1], [
                     'fileId' => $matches[1], 'transitionId' => $transitionRow['id'], 'userId' => $principal['userId'],
                 ]);
@@ -618,6 +661,64 @@ try {
             if ($db->inTransaction()) $db->rollBack();
             throw $error;
         }
+    }
+    if ($method === 'GET' && $path === '/workflow-reviews/mine') {
+        $query = $db->prepare('SELECT pr.id AS review_id, pr.file_id, pr.transition_id, pr.gate_id, pr.status, pr.requested_at, pr.expires_at, f.name AS file_name, f.vault_id
+          FROM pending_reviews pr JOIN files f ON f.id = pr.file_id AND f.organization_id = pr.organization_id
+          WHERE pr.organization_id = ? AND pr.assigned_to = ? AND pr.status = \'pending\' AND (pr.expires_at IS NULL OR pr.expires_at > UTC_TIMESTAMP(3)) ORDER BY pr.requested_at');
+        $query->execute([$principal['organizationId'], $principal['userId']]);
+        $reviews = [];
+        foreach ($query->fetchAll() as $review) {
+            try { Runtime::requireVault($db, $principal, $review['vault_id']); $reviews[] = $review; }
+            catch (Throwable) { /* Do not disclose reviews in inaccessible vaults. */ }
+        }
+        Runtime::respond(200, ['reviews' => $reviews]);
+    }
+    if ($method === 'POST' && preg_match('#^/workflow-reviews/([0-9a-f-]{36})/decision$#i', $path, $matches)) {
+        $body = Runtime::jsonBody();
+        $decision = $body['decision'] ?? null;
+        if (!in_array($decision, ['approved', 'rejected', 'kicked_back'], true)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid review decision is required.']);
+        $comment = is_string($body['comment'] ?? null) ? trim($body['comment']) : null;
+        if ($comment !== null && strlen($comment) > 20000) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'comment is too long.']);
+        $db->beginTransaction();
+        try {
+            $reviewQuery = $db->prepare('SELECT pr.*, f.vault_id, a.workflow_id, a.current_state_id, t.from_state_id, t.to_state_id, t.name AS transition_name, s.name AS state_name, s.auto_increment_revision
+              FROM pending_reviews pr JOIN files f ON f.id = pr.file_id AND f.organization_id = pr.organization_id
+              JOIN file_workflow_assignments a ON a.file_id = pr.file_id
+              JOIN workflow_transitions t ON t.id = pr.transition_id AND t.workflow_id = a.workflow_id
+              JOIN workflow_states s ON s.id = t.to_state_id
+              WHERE pr.id = ? AND pr.organization_id = ? FOR UPDATE');
+            $reviewQuery->execute([$matches[1], $principal['organizationId']]); $review = $reviewQuery->fetch();
+            if (!$review) { $db->rollBack(); Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Review not found.']); }
+            Runtime::requireVault($db, $principal, $review['vault_id']);
+            if ($review['assigned_to'] !== $principal['userId']) { $db->rollBack(); Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'You are not assigned to this review.']); }
+            if ($review['status'] !== 'pending') { $db->rollBack(); Runtime::respond(409, ['error' => 'ALREADY_DECIDED', 'message' => 'This review was already decided.']); }
+            if ($review['expires_at'] !== null && strtotime((string)$review['expires_at']) <= time()) { $db->rollBack(); Runtime::respond(409, ['error' => 'REVIEW_EXPIRED', 'message' => 'This review has expired.']); }
+            if ($review['current_state_id'] !== $review['from_state_id']) { $db->prepare("UPDATE pending_reviews SET status = 'cancelled' WHERE file_id = ? AND transition_id = ? AND status = 'pending'")->execute([$review['file_id'], $review['transition_id']]); $db->commit(); Runtime::respond(409, ['error' => 'STALE_REVIEW', 'message' => 'The workflow state changed before this review was completed.']); }
+            $db->prepare('UPDATE pending_reviews SET status = ?, review_comment = ?, reviewed_by = ?, reviewed_at = UTC_TIMESTAMP(3), checklist_responses = ? WHERE id = ? AND status = \'pending\'')->execute([$decision, $comment, $principal['userId'], isset($body['checklistResponses']) ? json_encode($body['checklistResponses'], JSON_THROW_ON_ERROR) : null, $review['id']]);
+            if ($decision !== 'approved') {
+                $db->prepare("UPDATE pending_reviews SET status = 'cancelled' WHERE file_id = ? AND transition_id = ? AND status = 'pending'")->execute([$review['file_id'], $review['transition_id']]);
+                Runtime::emitEvent($db, $principal['organizationId'], 'review.rejected', $review['id'], ['fileId' => $review['file_id'], 'transitionId' => $review['transition_id'], 'userId' => $principal['userId']]);
+                $db->commit(); Runtime::respond(200, ['result' => ['success' => true, 'requires_review' => false, 'new_state_id' => null, 'new_state_name' => null, 'new_revision' => null, 'error_code' => null, 'error_message' => null]]);
+            }
+            $gates = $db->prepare('SELECT id, approval_mode, required_approvals FROM workflow_gates WHERE transition_id = ? AND is_blocking = TRUE'); $gates->execute([$review['transition_id']]);
+            $complete = true;
+            foreach ($gates->fetchAll() as $gate) {
+                $counts = $db->prepare("SELECT COUNT(*) AS total, SUM(status = 'approved') AS approved, SUM(status IN ('rejected','kicked_back')) AS rejected FROM pending_reviews WHERE file_id = ? AND transition_id = ? AND gate_id = ?");
+                $counts->execute([$review['file_id'], $review['transition_id'], $gate['id']]); $count = $counts->fetch();
+                if ((int)$count['rejected'] > 0) $complete = false;
+                $needed = match ($gate['approval_mode']) { 'all' => (int)$count['total'], 'majority' => intdiv((int)$count['total'], 2) + 1, default => max(1, (int)$gate['required_approvals']) };
+                if ((int)$count['total'] === 0 || (int)$count['approved'] < $needed) $complete = false;
+            }
+            if ($review['gate_id'] === null) { $direct = $db->prepare("SELECT COUNT(*) FROM pending_reviews WHERE file_id = ? AND transition_id = ? AND gate_id IS NULL AND status = 'pending'"); $direct->execute([$review['file_id'], $review['transition_id']]); if ((int)$direct->fetchColumn() > 0) $complete = false; }
+            if (!$complete) { $db->commit(); Runtime::respond(200, ['result' => ['success' => true, 'requires_review' => true, 'new_state_id' => null, 'new_state_name' => null, 'new_revision' => null, 'error_code' => null, 'error_message' => null]]); }
+            $revision = $db->prepare('SELECT current_revision FROM files WHERE id = ? AND organization_id = ? FOR UPDATE'); $revision->execute([$review['file_id'], $principal['organizationId']]); $before = (int)$revision->fetchColumn(); $after = $before + ((bool)$review['auto_increment_revision'] ? 1 : 0);
+            if ($after !== $before) $db->prepare('UPDATE files SET current_revision = ? WHERE id = ? AND organization_id = ?')->execute([$after, $review['file_id'], $principal['organizationId']]);
+            $db->prepare('UPDATE file_workflow_assignments SET current_state_id = ?, assigned_by = ?, assigned_at = UTC_TIMESTAMP(3) WHERE file_id = ? AND current_state_id = ?')->execute([$review['to_state_id'], $principal['userId'], $review['file_id'], $review['from_state_id']]);
+            $db->prepare('INSERT INTO workflow_history (id, organization_id, file_id, workflow_id, transition_id, from_state_id, to_state_id, performed_by, comment, approvals_data, revision_before, revision_after) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')->execute([Runtime::uuid(), $principal['organizationId'], $review['file_id'], $review['workflow_id'], $review['transition_id'], $review['from_state_id'], $review['to_state_id'], $principal['userId'], $comment, json_encode(['completedReviewId' => $review['id']], JSON_THROW_ON_ERROR), $before, $after]);
+            Runtime::emitEvent($db, $principal['organizationId'], 'file.workflow_transition_executed', $review['file_id'], ['fileId' => $review['file_id'], 'transitionId' => $review['transition_id'], 'reviewId' => $review['id'], 'userId' => $principal['userId']]);
+            $db->commit(); Runtime::respond(200, ['result' => ['success' => true, 'requires_review' => false, 'new_state_id' => $review['to_state_id'], 'new_state_name' => $review['state_name'], 'new_revision' => $after === $before ? null : (string)$after, 'error_code' => null, 'error_message' => null]]);
+        } catch (Throwable $error) { if ($db->inTransaction()) $db->rollBack(); throw $error; }
     }
     if ($method === 'GET' && $path === '/account/totp') {
         $query = $db->prepare('SELECT enabled_at AS enabledAt FROM admin_totp_credentials WHERE user_id = ?');
