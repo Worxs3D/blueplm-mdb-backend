@@ -295,6 +295,28 @@ const updatedMemberLogin = await request('/auth/login', {
 })
 assert.equal(typeof updatedMemberLogin.token, 'string')
 
+// Supplier CRUD is tenant-scoped and role-gated. The list endpoint exposes
+// active records only; deactivation keeps historical part assignments intact.
+const supplier = await request('/suppliers', {
+  method: 'POST',
+  body: JSON.stringify({ name: 'Integration Supplier', code: 'INT-SUP-1', contactEmail: 'supplier@example.test', website: 'https://supplier.example.test', isActive: true, isApproved: false }),
+}, token)
+assert.equal(supplier.supplier.code, 'INT-SUP-1')
+assert.equal(supplier.supplier.is_active, true)
+assert.equal((await request('/suppliers', {}, token)).suppliers.some((entry) => entry.id === supplier.supplier.id), true)
+const updatedSupplier = await request(`/suppliers/${supplier.supplier.id}`, {
+  method: 'PATCH',
+  body: JSON.stringify({ city: 'Berlin', isApproved: true }),
+}, token)
+assert.equal(updatedSupplier.supplier.city, 'Berlin')
+assert.equal(updatedSupplier.supplier.is_approved, true)
+assert.equal((await requestStatus('/suppliers', { method: 'POST', body: JSON.stringify({ name: 'Denied Supplier' }) }, updatedMemberLogin.token)).status, 403)
+assert.equal((await requestStatus(`/suppliers/${supplier.supplier.id}`, { method: 'PATCH', body: JSON.stringify({ isApproved: 'false' }) }, token)).status, 400)
+assert.equal((await requestStatus('/suppliers', { method: 'POST', body: JSON.stringify({ name: 'Duplicate Supplier', code: 'INT-SUP-1' }) }, token)).status, 409)
+assert.equal((await requestStatus(`/suppliers/00000000-0000-0000-0000-000000000000`, {}, token)).status, 404)
+await request(`/suppliers/${supplier.supplier.id}`, { method: 'DELETE' }, token)
+assert.equal((await request('/suppliers', {}, token)).suppliers.some((entry) => entry.id === supplier.supplier.id), false)
+
 // Workflow roles are separate organization data. Account roles must not create
 // or imply workflow-role assignments, and only organization administrators may
 // edit the role catalog or assignments.
