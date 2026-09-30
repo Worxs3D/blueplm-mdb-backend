@@ -543,6 +543,20 @@ const backupRow = execFileSync('docker', [
 ], { cwd: process.cwd(), encoding: 'utf8' }).trim().split('\t')
 assert.equal(backupRow[0], 'owner@example.test')
 assert.notEqual(backupRow[1], 'cipher-secret')
+assert.equal((await requestStatus('/backup/device/challenge', {
+  method: 'POST', body: JSON.stringify({ deviceId: 'integration-machine', endpoint: 'heartbeat' }),
+}, foreignLogin.token)).status, 403)
+const preRotation = await signedBackupAction('complete')
+const rotatedKey = generateKeyPairSync('ed25519')
+await request('/backup/designate', {
+  method: 'POST',
+  body: JSON.stringify({ machineId: 'integration-machine', machineName: 'Integration Host', platform: 'linux', publicKey: rotatedKey.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('base64url') }),
+}, token)
+assert.equal((await requestStatus(preRotation.path, { method: 'POST', headers: preRotation.headers, body: JSON.stringify({ machineId: 'integration-machine' }) }, token)).status, 403)
+await request('/backup/designate', { method: 'DELETE' }, token)
+assert.equal((await requestStatus('/backup/device/challenge', {
+  method: 'POST', body: JSON.stringify({ deviceId: 'integration-machine', endpoint: 'heartbeat' }),
+}, token)).status, 403)
 
 const auditPage = await request(`/vault-audit/files?vaultId=${encodeURIComponent(vault.id)}&page=1&limit=25`, {}, token)
 assert.equal(auditPage.page, 1)
