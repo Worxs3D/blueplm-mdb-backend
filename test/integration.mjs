@@ -423,6 +423,9 @@ const createdTeam = await request(
 )
 assert.equal(createdTeam.name, 'Integration Team')
 const teamDefaults = { enabled_modules: { explorer: true }, module_order: ['explorer'] }
+assert.equal((await requestStatus(`/teams/${createdTeam.id}/module-defaults`, {
+  method: 'PUT', body: JSON.stringify({ defaults: 'invalid' }),
+}, token)).status, 400)
 const savedTeamDefaults = await request(`/teams/${createdTeam.id}/module-defaults`, {
   method: 'PUT',
   body: JSON.stringify({ defaults: teamDefaults }),
