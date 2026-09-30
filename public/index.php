@@ -457,8 +457,9 @@ try {
                 $row['org_id'] = $row['organization_id'];
                 foreach (['schedule_enabled'] as $flag) $row[$flag] = (bool)$row[$flag];
                 foreach (['retention_daily', 'retention_weekly', 'retention_monthly', 'retention_yearly', 'schedule_hour', 'schedule_minute'] as $number) $row[$number] = (int)$row[$number];
-                if (!in_array($principal['role'], ['owner', 'admin'], true)) {
-                    $row['access_key_encrypted'] = null; $row['secret_key_encrypted'] = null; $row['restic_password_encrypted'] = null;
+                foreach (['access_key_encrypted', 'secret_key_encrypted', 'restic_password_encrypted'] as $secretField) {
+                    $row['has_' . str_replace('_encrypted', '', $secretField)] = is_string($row[$secretField] ?? null) && $row[$secretField] !== '';
+                    unset($row[$secretField]);
                 }
             }
             Runtime::respond(200, ['config' => $row]);
@@ -475,8 +476,18 @@ try {
         if (!$bucket) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A backup bucket is required.']);
         $region = $stringField($body, 'region', 128);
         $endpoint = $stringField($body, 'endpoint', 2048);
+        $existingConfig = $db->prepare('SELECT access_key_encrypted, secret_key_encrypted, restic_password_encrypted FROM backup_config WHERE organization_id = ?');
+        $existingConfig->execute([$principal['organizationId']]);
+        $existingSecrets = $existingConfig->fetch() ?: [];
+        $secretValues = [];
         foreach (['access_key_encrypted', 'secret_key_encrypted', 'restic_password_encrypted'] as $secretField) {
-            if (($body[$secretField] ?? null) !== null && (!is_string($body[$secretField]) || strlen($body[$secretField]) > 20000)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Invalid encrypted backup value.']);
+            $value = $body[$secretField] ?? null;
+            if ($value === null) {
+                $secretValues[$secretField] = $existingSecrets[$secretField] ?? null;
+                continue;
+            }
+            if (!is_string($value) || strlen($value) > 20000 || str_contains($value, "\0") || str_contains($value, "\r") || str_contains($value, "\n")) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Invalid backup secret.']);
+            $secretValues[$secretField] = $value === '' ? null : Runtime::encryptSecret($value, $env);
         }
         $integerField = static function (array $body, string $key, int $default, int $max): int {
             $value = $body[$key] ?? $default;
@@ -488,7 +499,7 @@ try {
         $scheduleTimezone = $stringField($body, 'schedule_timezone', 128) ?: 'UTC';
         $values = [
             $principal['organizationId'], $provider, $bucket, $region, $endpoint,
-            $body['access_key_encrypted'] ?? null, $body['secret_key_encrypted'] ?? null, $body['restic_password_encrypted'] ?? null,
+            $secretValues['access_key_encrypted'], $secretValues['secret_key_encrypted'], $secretValues['restic_password_encrypted'],
             $integerField($body, 'retention_daily', 7, 3650), $integerField($body, 'retention_weekly', 4, 520), $integerField($body, 'retention_monthly', 12, 120), $integerField($body, 'retention_yearly', 3, 100),
             $scheduleEnabled ? 1 : 0, $integerField($body, 'schedule_hour', 0, 23), $integerField($body, 'schedule_minute', 0, 59), $scheduleTimezone,
         ];
@@ -497,6 +508,10 @@ try {
         $query->execute([$principal['organizationId']]);
         $row = $query->fetch();
         $row['id'] = $row['organization_id']; $row['org_id'] = $row['organization_id']; $row['schedule_enabled'] = (bool)$row['schedule_enabled'];
+        foreach (['access_key_encrypted', 'secret_key_encrypted', 'restic_password_encrypted'] as $secretField) {
+            $row['has_' . str_replace('_encrypted', '', $secretField)] = is_string($row[$secretField] ?? null) && $row[$secretField] !== '';
+            unset($row[$secretField]);
+        }
         Runtime::emitEvent($db, $principal['organizationId'], 'backup.config_updated', $principal['organizationId'], ['updatedBy' => $principal['userId']]);
         Runtime::respond(200, ['config' => $row]);
     }
@@ -522,7 +537,7 @@ try {
             Runtime::respond(200, ['active' => $update->rowCount() > 0]);
         }
         if ($path === '/backup/request') {
-            $userEmail = is_string($body['userEmail'] ?? null) ? strtolower(trim($body['userEmail'])) : '';
+            $userEmail = strtolower((string)$principal['email']);
             if (!filter_var($userEmail, FILTER_VALIDATE_EMAIL) || strlen($userEmail) > 320) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid requester email is required.']);
             $update = $db->prepare('UPDATE backup_config SET backup_requested_at = UTC_TIMESTAMP(3), backup_requested_by = ?, updated_at = UTC_TIMESTAMP(3) WHERE organization_id = ? AND designated_machine_id IS NOT NULL');
             $update->execute([$userEmail, $principal['organizationId']]);
@@ -554,6 +569,7 @@ try {
         Runtime::respond(200, ['files' => $files, 'page' => $page, 'limit' => $limit, 'total' => $total]);
     }
     if ($method === 'POST' && $path === '/vault-audit/runs') {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
         $body = Runtime::jsonBody(); $vaultId = is_string($body['vaultId'] ?? null) ? trim($body['vaultId']) : '';
         Runtime::requireVault($db, $principal, $vaultId);
         $pageCount = $body['pageCount'] ?? 0; $findingCount = $body['findingCount'] ?? 0;

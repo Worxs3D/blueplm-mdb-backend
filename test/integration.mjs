@@ -467,10 +467,12 @@ const backupConfig = await request('/backup/config', {
   }),
 }, token)
 assert.equal(backupConfig.config.provider, 'aws_s3')
+assert.equal(Object.hasOwn(backupConfig.config, 'secret_key_encrypted'), false)
+assert.equal(backupConfig.config.has_secret_key, true)
 assert.equal((await request('/backup/config', {}, token)).config.bucket, 'integration-bucket')
 const memberBackupConfig = await request('/backup/config', {}, updatedMemberLogin.token)
 assert.equal(memberBackupConfig.config.bucket, 'integration-bucket')
-assert.equal(memberBackupConfig.config.secret_key_encrypted, null)
+assert.equal(Object.hasOwn(memberBackupConfig.config, 'secret_key_encrypted'), false)
 assert.equal((await requestStatus('/backup/config', {
   method: 'PUT', body: JSON.stringify({ provider: 'aws_s3', bucket: 'member-write' }),
 }, updatedMemberLogin.token)).status, 403)
@@ -484,7 +486,14 @@ await request('/backup/designate', {
 assert.equal((await request('/backup/config', {}, token)).config.designated_machine_id, 'integration-machine')
 assert.equal((await request('/backup/heartbeat', { method: 'POST', body: JSON.stringify({ machineId: 'integration-machine' }) }, token)).active, true)
 assert.equal((await requestStatus('/backup/designate', { method: 'DELETE' }, updatedMemberLogin.token)).status, 403)
-assert.equal((await request('/backup/request', { method: 'POST', body: JSON.stringify({ userEmail: 'owner@example.test' }) }, token)).success, true)
+assert.equal((await request('/backup/request', { method: 'POST', body: JSON.stringify({ userEmail: 'spoof@example.test' }) }, token)).success, true)
+const backupRow = execFileSync('docker', [
+  'compose', '-f', 'docker-compose.test.yml', 'exec', '-T', 'mariadb',
+  'mariadb', '-ublueplm', '-pblueplm-test-password', 'blueplm', '-N', '-B', '-e',
+  "SELECT backup_requested_by, secret_key_encrypted FROM backup_config LIMIT 1",
+], { cwd: process.cwd(), encoding: 'utf8' }).trim().split('\t')
+assert.equal(backupRow[0], 'owner@example.test')
+assert.notEqual(backupRow[1], 'cipher-secret')
 
 const auditPage = await request(`/vault-audit/files?vaultId=${encodeURIComponent(vault.id)}&page=1&limit=25`, {}, token)
 assert.equal(auditPage.page, 1)
@@ -492,12 +501,18 @@ assert.equal(auditPage.limit, 25)
 assert.equal(typeof auditPage.total, 'number')
 const memberAuditPage = await request(`/vault-audit/files?vaultId=${encodeURIComponent(vault.id)}&page=1&limit=25`, {}, updatedMemberLogin.token)
 assert.equal(memberAuditPage.total, auditPage.total)
+assert.equal((await request('/vault-audit/repair', {
+  method: 'POST', body: JSON.stringify({ vaultId: vault.id, updates: [] }),
+}, token)).updated, 0)
 assert.equal((await requestStatus(`/vault-audit/repair`, {
   method: 'POST', body: JSON.stringify({ vaultId: vault.id, updates: [] }),
 }, updatedMemberLogin.token)).status, 403)
+assert.equal((await requestStatus('/vault-audit/runs', {
+  method: 'POST', body: JSON.stringify({ vaultId: vault.id, pageCount: 1, findingCount: 0 }),
+}, updatedMemberLogin.token)).status, 403)
 const auditRun = await request('/vault-audit/runs', {
   method: 'POST', body: JSON.stringify({ vaultId: vault.id, pageCount: 1, findingCount: 0, summary: { source: 'integration' } }),
-}, updatedMemberLogin.token)
+}, token)
 assert.equal(typeof auditRun.id, 'string')
 assert.equal((await requestStatus(`/vault-audit/files?vaultId=00000000-0000-0000-0000-000000000000`, {}, token)).status, 404)
 
