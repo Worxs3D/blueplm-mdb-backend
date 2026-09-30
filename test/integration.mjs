@@ -484,6 +484,10 @@ await request('/backup/designate', {
   body: JSON.stringify({ machineId: 'integration-machine', machineName: 'Integration Host', platform: 'linux', userEmail: 'owner@example.test' }),
 }, token)
 assert.equal((await request('/backup/config', {}, token)).config.designated_machine_id, 'integration-machine')
+const runtimeBackupConfig = await request('/backup/runtime-config?machineId=integration-machine', {}, token)
+assert.equal(runtimeBackupConfig.config.secret_key_encrypted, 'cipher-secret')
+assert.equal((await requestStatus('/backup/runtime-config?machineId=integration-machine', {}, updatedMemberLogin.token)).status, 403)
+assert.equal((await requestStatus('/backup/runtime-config?machineId=wrong-machine', {}, token)).status, 403)
 assert.equal((await request('/backup/heartbeat', { method: 'POST', body: JSON.stringify({ machineId: 'integration-machine' }) }, token)).active, true)
 assert.equal((await requestStatus('/backup/designate', { method: 'DELETE' }, updatedMemberLogin.token)).status, 403)
 assert.equal((await request('/backup/request', { method: 'POST', body: JSON.stringify({ userEmail: 'spoof@example.test' }) }, token)).success, true)

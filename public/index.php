@@ -446,6 +446,19 @@ try {
 
     // Backup control plane. The API stores only opaque client-encrypted provider
     // values and scopes every query to the authenticated organization.
+    if ($method === 'GET' && $path === '/backup/runtime-config') {
+        $machineId = is_string($_GET['machineId'] ?? null) ? trim($_GET['machineId']) : '';
+        if ($machineId === '' || strlen($machineId) > 255) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid machine ID is required.']);
+        $query = $db->prepare('SELECT * FROM backup_config WHERE organization_id = ? AND designated_machine_id = ? AND LOWER(designated_machine_user_email) = LOWER(?)');
+        $query->execute([$principal['organizationId'], $machineId, $principal['email']]);
+        $row = $query->fetch();
+        if (!$row) Runtime::respond(403, ['error' => 'BACKUP_MACHINE_NOT_AUTHORIZED', 'message' => 'The authenticated account is not the designated backup machine.']);
+        foreach (['access_key_encrypted', 'secret_key_encrypted', 'restic_password_encrypted'] as $secretField) {
+            $row[$secretField] = $row[$secretField] === null ? null : Runtime::decryptSecret($row[$secretField], $env);
+        }
+        $row['id'] = $row['organization_id']; $row['org_id'] = $row['organization_id']; $row['schedule_enabled'] = (bool)$row['schedule_enabled'];
+        Runtime::respond(200, ['config' => $row]);
+    }
     if ($path === '/backup/config' && in_array($method, ['GET', 'PUT'], true)) {
         if ($method === 'PUT' && !in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
         if ($method === 'GET') {
