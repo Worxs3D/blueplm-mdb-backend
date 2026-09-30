@@ -671,7 +671,7 @@ try {
           JOIN workflow_transitions t ON t.id = pr.transition_id
           JOIN workflow_states src ON src.id = t.from_state_id JOIN workflow_states dst ON dst.id = t.to_state_id
           LEFT JOIN workflow_gates g ON g.id = pr.gate_id LEFT JOIN users u ON u.id = pr.requested_by
-          WHERE pr.organization_id = ? AND pr.assigned_to = ? AND pr.status = \'pending\' AND (pr.expires_at IS NULL OR pr.expires_at > UTC_TIMESTAMP(3)) ORDER BY pr.requested_at');
+          WHERE pr.organization_id = ? AND pr.assigned_to = ? AND pr.status = 'pending' AND (pr.expires_at IS NULL OR pr.expires_at > UTC_TIMESTAMP(3)) ORDER BY pr.requested_at");
         $query->execute([$principal['organizationId'], $principal['userId']]);
         $reviews = [];
         foreach ($query->fetchAll() as $review) {
