@@ -453,6 +453,54 @@ const defaultTeam = await request(
 )
 assert.equal(defaultTeam.defaultNewUserTeamId, createdTeam.id)
 
+// Backup and Vault Audit are native MDB contracts. Backup credentials are only
+// returned to administrators; audit reads are vault-scoped while repairs are
+// administrator-only and every route is organization-bound.
+const backupConfig = await request('/backup/config', {
+  method: 'PUT',
+  body: JSON.stringify({
+    provider: 'aws_s3', bucket: 'integration-bucket', region: 'eu-central-1',
+    endpoint: null, access_key_encrypted: 'cipher-access', secret_key_encrypted: 'cipher-secret',
+    restic_password_encrypted: 'cipher-restic', retention_daily: 7, retention_weekly: 4,
+    retention_monthly: 12, retention_yearly: 3, schedule_enabled: false,
+    schedule_hour: 0, schedule_minute: 0, schedule_timezone: 'UTC',
+  }),
+}, token)
+assert.equal(backupConfig.config.provider, 'aws_s3')
+assert.equal((await request('/backup/config', {}, token)).config.bucket, 'integration-bucket')
+const memberBackupConfig = await request('/backup/config', {}, updatedMemberLogin.token)
+assert.equal(memberBackupConfig.config.bucket, 'integration-bucket')
+assert.equal(memberBackupConfig.config.secret_key_encrypted, null)
+assert.equal((await requestStatus('/backup/config', {
+  method: 'PUT', body: JSON.stringify({ provider: 'aws_s3', bucket: 'member-write' }),
+}, updatedMemberLogin.token)).status, 403)
+assert.equal((await requestStatus('/backup/config', {
+  method: 'PUT', body: JSON.stringify({ provider: 'aws_s3', bucket: 'bad', schedule_enabled: 'false' }),
+}, token)).status, 400)
+await request('/backup/designate', {
+  method: 'POST',
+  body: JSON.stringify({ machineId: 'integration-machine', machineName: 'Integration Host', platform: 'linux', userEmail: 'owner@example.test' }),
+}, token)
+assert.equal((await request('/backup/config', {}, token)).config.designated_machine_id, 'integration-machine')
+assert.equal((await request('/backup/heartbeat', { method: 'POST', body: JSON.stringify({ machineId: 'integration-machine' }) }, token)).active, true)
+assert.equal((await requestStatus('/backup/designate', { method: 'DELETE' }, updatedMemberLogin.token)).status, 403)
+assert.equal((await request('/backup/request', { method: 'POST', body: JSON.stringify({ userEmail: 'owner@example.test' }) }, token)).success, true)
+
+const auditPage = await request(`/vault-audit/files?vaultId=${encodeURIComponent(vault.id)}&page=1&limit=25`, {}, token)
+assert.equal(auditPage.page, 1)
+assert.equal(auditPage.limit, 25)
+assert.equal(typeof auditPage.total, 'number')
+const memberAuditPage = await request(`/vault-audit/files?vaultId=${encodeURIComponent(vault.id)}&page=1&limit=25`, {}, updatedMemberLogin.token)
+assert.equal(memberAuditPage.total, auditPage.total)
+assert.equal((await requestStatus(`/vault-audit/repair`, {
+  method: 'POST', body: JSON.stringify({ vaultId: vault.id, updates: [] }),
+}, updatedMemberLogin.token)).status, 403)
+const auditRun = await request('/vault-audit/runs', {
+  method: 'POST', body: JSON.stringify({ vaultId: vault.id, pageCount: 1, findingCount: 0, summary: { source: 'integration' } }),
+}, updatedMemberLogin.token)
+assert.equal(typeof auditRun.id, 'string')
+assert.equal((await requestStatus(`/vault-audit/files?vaultId=00000000-0000-0000-0000-000000000000`, {}, token)).status, 404)
+
 const serializationSettings = {
   enabled: true,
   prefix: 'TEST-',

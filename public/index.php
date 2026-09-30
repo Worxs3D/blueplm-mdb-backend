@@ -443,6 +443,143 @@ try {
         Runtime::respond(200, ['user' => Runtime::principal($db, $env)]);
     }
     $principal = Runtime::principal($db, $env);
+
+    // Backup control plane. The API stores only opaque client-encrypted provider
+    // values and scopes every query to the authenticated organization.
+    if ($path === '/backup/config' && in_array($method, ['GET', 'PUT'], true)) {
+        if ($method === 'PUT' && !in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        if ($method === 'GET') {
+            $query = $db->prepare('SELECT * FROM backup_config WHERE organization_id = ?');
+            $query->execute([$principal['organizationId']]);
+            $row = $query->fetch() ?: null;
+            if ($row) {
+                $row['id'] = $row['organization_id'];
+                $row['org_id'] = $row['organization_id'];
+                foreach (['schedule_enabled'] as $flag) $row[$flag] = (bool)$row[$flag];
+                foreach (['retention_daily', 'retention_weekly', 'retention_monthly', 'retention_yearly', 'schedule_hour', 'schedule_minute'] as $number) $row[$number] = (int)$row[$number];
+                if (!in_array($principal['role'], ['owner', 'admin'], true)) {
+                    $row['access_key_encrypted'] = null; $row['secret_key_encrypted'] = null; $row['restic_password_encrypted'] = null;
+                }
+            }
+            Runtime::respond(200, ['config' => $row]);
+        }
+        $body = Runtime::jsonBody();
+        $provider = is_string($body['provider'] ?? null) ? $body['provider'] : 'backblaze_b2';
+        if (!in_array($provider, ['backblaze_b2', 'aws_s3', 'google_cloud'], true)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Unsupported backup provider.']);
+        $stringField = static function (array $body, string $key, int $max): ?string {
+            if (!array_key_exists($key, $body) || $body[$key] === null) return null;
+            if (!is_string($body[$key]) || strlen($body[$key]) > $max || str_contains($body[$key], "\0") || str_contains($body[$key], "\r") || str_contains($body[$key], "\n")) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Invalid backup configuration field.']);
+            return trim($body[$key]);
+        };
+        $bucket = $stringField($body, 'bucket', 512);
+        if (!$bucket) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A backup bucket is required.']);
+        $region = $stringField($body, 'region', 128);
+        $endpoint = $stringField($body, 'endpoint', 2048);
+        foreach (['access_key_encrypted', 'secret_key_encrypted', 'restic_password_encrypted'] as $secretField) {
+            if (($body[$secretField] ?? null) !== null && (!is_string($body[$secretField]) || strlen($body[$secretField]) > 20000)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Invalid encrypted backup value.']);
+        }
+        $integerField = static function (array $body, string $key, int $default, int $max): int {
+            $value = $body[$key] ?? $default;
+            if (!is_int($value) || $value < 0 || $value > $max) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Invalid backup number.']);
+            return $value;
+        };
+        $scheduleEnabled = $body['schedule_enabled'] ?? false;
+        if (!is_bool($scheduleEnabled)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'schedule_enabled must be boolean.']);
+        $scheduleTimezone = $stringField($body, 'schedule_timezone', 128) ?: 'UTC';
+        $values = [
+            $principal['organizationId'], $provider, $bucket, $region, $endpoint,
+            $body['access_key_encrypted'] ?? null, $body['secret_key_encrypted'] ?? null, $body['restic_password_encrypted'] ?? null,
+            $integerField($body, 'retention_daily', 7, 3650), $integerField($body, 'retention_weekly', 4, 520), $integerField($body, 'retention_monthly', 12, 120), $integerField($body, 'retention_yearly', 3, 100),
+            $scheduleEnabled ? 1 : 0, $integerField($body, 'schedule_hour', 0, 23), $integerField($body, 'schedule_minute', 0, 59), $scheduleTimezone,
+        ];
+        $db->prepare('INSERT INTO backup_config (organization_id, provider, bucket, region, endpoint, access_key_encrypted, secret_key_encrypted, restic_password_encrypted, retention_daily, retention_weekly, retention_monthly, retention_yearly, schedule_enabled, schedule_hour, schedule_minute, schedule_timezone) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE provider=VALUES(provider), bucket=VALUES(bucket), region=VALUES(region), endpoint=VALUES(endpoint), access_key_encrypted=VALUES(access_key_encrypted), secret_key_encrypted=VALUES(secret_key_encrypted), restic_password_encrypted=VALUES(restic_password_encrypted), retention_daily=VALUES(retention_daily), retention_weekly=VALUES(retention_weekly), retention_monthly=VALUES(retention_monthly), retention_yearly=VALUES(retention_yearly), schedule_enabled=VALUES(schedule_enabled), schedule_hour=VALUES(schedule_hour), schedule_minute=VALUES(schedule_minute), schedule_timezone=VALUES(schedule_timezone), updated_at=UTC_TIMESTAMP(3)')->execute($values);
+        $query = $db->prepare('SELECT * FROM backup_config WHERE organization_id = ?');
+        $query->execute([$principal['organizationId']]);
+        $row = $query->fetch();
+        $row['id'] = $row['organization_id']; $row['org_id'] = $row['organization_id']; $row['schedule_enabled'] = (bool)$row['schedule_enabled'];
+        Runtime::emitEvent($db, $principal['organizationId'], 'backup.config_updated', $principal['organizationId'], ['updatedBy' => $principal['userId']]);
+        Runtime::respond(200, ['config' => $row]);
+    }
+    if ($path === '/backup/designate' && in_array($method, ['POST', 'DELETE'], true)) {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        if ($method === 'DELETE') {
+            $db->prepare('UPDATE backup_config SET designated_machine_id = NULL, designated_machine_name = NULL, designated_machine_platform = NULL, designated_machine_user_email = NULL, designated_machine_last_seen = NULL, updated_at = UTC_TIMESTAMP(3) WHERE organization_id = ?')->execute([$principal['organizationId']]);
+            Runtime::respond(200, ['success' => true]);
+        }
+        $body = Runtime::jsonBody();
+        foreach (['machineId', 'machineName', 'platform', 'userEmail'] as $key) if (!is_string($body[$key] ?? null) || trim($body[$key]) === '' || strlen($body[$key]) > 320) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Valid machine details are required.']);
+        $db->prepare('INSERT INTO backup_config (organization_id) VALUES (?) ON DUPLICATE KEY UPDATE organization_id=organization_id')->execute([$principal['organizationId']]);
+        $db->prepare('UPDATE backup_config SET designated_machine_id = ?, designated_machine_name = ?, designated_machine_platform = ?, designated_machine_user_email = ?, designated_machine_last_seen = UTC_TIMESTAMP(3), updated_at = UTC_TIMESTAMP(3) WHERE organization_id = ?')->execute([trim($body['machineId']), trim($body['machineName']), trim($body['platform']), strtolower(trim($body['userEmail'])), $principal['organizationId']]);
+        Runtime::respond(200, ['success' => true]);
+    }
+    if ($method === 'POST' && in_array($path, ['/backup/request', '/backup/start', '/backup/complete', '/backup/heartbeat'], true)) {
+        $body = Runtime::jsonBody();
+        $machineId = is_string($body['machineId'] ?? null) ? trim($body['machineId']) : '';
+        if ($path === '/backup/heartbeat') {
+            if ($machineId === '' || strlen($machineId) > 255) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid machine ID is required.']);
+            $update = $db->prepare('UPDATE backup_config SET designated_machine_last_seen = UTC_TIMESTAMP(3), updated_at = UTC_TIMESTAMP(3) WHERE organization_id = ? AND designated_machine_id = ?');
+            $update->execute([$principal['organizationId'], $machineId]);
+            Runtime::respond(200, ['active' => $update->rowCount() > 0]);
+        }
+        if ($path === '/backup/request') {
+            $userEmail = is_string($body['userEmail'] ?? null) ? strtolower(trim($body['userEmail'])) : '';
+            if (!filter_var($userEmail, FILTER_VALIDATE_EMAIL) || strlen($userEmail) > 320) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid requester email is required.']);
+            $update = $db->prepare('UPDATE backup_config SET backup_requested_at = UTC_TIMESTAMP(3), backup_requested_by = ?, updated_at = UTC_TIMESTAMP(3) WHERE organization_id = ? AND designated_machine_id IS NOT NULL');
+            $update->execute([$userEmail, $principal['organizationId']]);
+            if ($update->rowCount() === 0) Runtime::respond(409, ['error' => 'NOT_CONFIGURED', 'message' => 'No designated backup machine is configured.']);
+            Runtime::respond(200, ['success' => true]);
+        }
+        if ($machineId === '' || strlen($machineId) > 255) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid machine ID is required.']);
+        if ($path === '/backup/start') {
+            $update = $db->prepare('UPDATE backup_config SET backup_running_since = UTC_TIMESTAMP(3), backup_requested_at = NULL, backup_requested_by = NULL WHERE organization_id = ? AND designated_machine_id = ?');
+        } else {
+            $update = $db->prepare('UPDATE backup_config SET backup_running_since = NULL WHERE organization_id = ? AND designated_machine_id = ?');
+        }
+        $update->execute([$principal['organizationId'], $machineId]);
+        if ($update->rowCount() === 0) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'This machine is not designated for the organization.']);
+        Runtime::respond(200, ['success' => true]);
+    }
+    if ($method === 'GET' && $path === '/vault-audit/files') {
+        $vaultId = is_string($_GET['vaultId'] ?? null) ? trim($_GET['vaultId']) : '';
+        if (!preg_match('/^[0-9a-f-]{36}$/i', $vaultId)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid vault ID is required.']);
+        Runtime::requireVault($db, $principal, $vaultId);
+        $page = filter_var($_GET['page'] ?? 1, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1, 'max_range' => 100000]]) ?: 1;
+        $limit = filter_var($_GET['limit'] ?? 100, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1, 'max_range' => 500]]) ?: 100;
+        $count = $db->prepare('SELECT COUNT(*) FROM files WHERE organization_id = ? AND vault_id = ? AND deleted_at IS NULL');
+        $count->execute([$principal['organizationId'], $vaultId]);
+        $total = (int)$count->fetchColumn();
+        $query = $db->prepare('SELECT f.id, f.vault_id AS vaultId, f.canonical_path AS canonicalPath, f.file_name AS fileName, f.current_revision AS currentRevision, f.state, f.content_hash AS contentHash, f.updated_at AS updatedAt, m.metadata FROM files f LEFT JOIN vault_audit_file_metadata m ON m.file_id = f.id AND m.organization_id = f.organization_id AND m.vault_id = f.vault_id WHERE f.organization_id = ? AND f.vault_id = ? AND f.deleted_at IS NULL ORDER BY f.canonical_path LIMIT ? OFFSET ?');
+        $query->bindValue(1, $principal['organizationId']); $query->bindValue(2, $vaultId); $query->bindValue(3, $limit, PDO::PARAM_INT); $query->bindValue(4, ($page - 1) * $limit, PDO::PARAM_INT); $query->execute();
+        $files = $query->fetchAll(); foreach ($files as &$file) $file['metadata'] = $file['metadata'] === null ? null : json_decode($file['metadata'], true); unset($file);
+        Runtime::respond(200, ['files' => $files, 'page' => $page, 'limit' => $limit, 'total' => $total]);
+    }
+    if ($method === 'POST' && $path === '/vault-audit/runs') {
+        $body = Runtime::jsonBody(); $vaultId = is_string($body['vaultId'] ?? null) ? trim($body['vaultId']) : '';
+        Runtime::requireVault($db, $principal, $vaultId);
+        $pageCount = $body['pageCount'] ?? 0; $findingCount = $body['findingCount'] ?? 0;
+        if (!is_int($pageCount) || $pageCount < 0 || $pageCount > 100000 || !is_int($findingCount) || $findingCount < 0 || $findingCount > 10000000) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Invalid audit counts.']);
+        $summary = $body['summary'] ?? null; if ($summary !== null && (!is_array($summary) || strlen(json_encode($summary)) > 100000)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Invalid audit summary.']);
+        $id = Runtime::uuid(); $db->prepare('INSERT INTO vault_audit_runs (id, organization_id, vault_id, requested_by, page_count, finding_count, summary) VALUES (?, ?, ?, ?, ?, ?, ?)')->execute([$id, $principal['organizationId'], $vaultId, $principal['userId'], $pageCount, $findingCount, $summary === null ? null : json_encode($summary, JSON_THROW_ON_ERROR)]);
+        Runtime::respond(201, ['id' => $id]);
+    }
+    if ($method === 'POST' && $path === '/vault-audit/repair') {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $body = Runtime::jsonBody(); $vaultId = is_string($body['vaultId'] ?? null) ? trim($body['vaultId']) : '';
+        Runtime::requireVault($db, $principal, $vaultId); $updates = $body['updates'] ?? [];
+        if (!is_array($updates) || count($updates) > 500) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A bounded update list is required.']);
+        $updated = 0; $query = $db->prepare('SELECT id FROM files WHERE id = ? AND organization_id = ? AND vault_id = ? AND deleted_at IS NULL');
+        foreach ($updates as $update) {
+            if (!is_array($update) || !is_string($update['fileId'] ?? null)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Invalid audit update.']);
+            $query->execute([$update['fileId'], $principal['organizationId'], $vaultId]); if (!$query->fetchColumn()) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Audit file not found.']);
+            $sets = []; $values = [];
+            if (array_key_exists('currentRevision', $update)) { if (!is_int($update['currentRevision']) || $update['currentRevision'] < 0) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Invalid revision.']); $sets[] = 'current_revision = ?'; $values[] = $update['currentRevision']; }
+            if (array_key_exists('contentHash', $update)) { if ($update['contentHash'] !== null && (!is_string($update['contentHash']) || !preg_match('/^[a-f0-9]{64}$/i', $update['contentHash']))) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Invalid content hash.']); $sets[] = 'content_hash = ?'; $values[] = $update['contentHash']; }
+            if (array_key_exists('metadata', $update)) { if (!is_array($update['metadata']) || strlen(json_encode($update['metadata'], JSON_THROW_ON_ERROR)) > 200000) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Invalid metadata.']); $db->prepare('INSERT INTO vault_audit_file_metadata (file_id, organization_id, vault_id, metadata) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE metadata = VALUES(metadata), updated_at = UTC_TIMESTAMP(3)')->execute([$update['fileId'], $principal['organizationId'], $vaultId, json_encode($update['metadata'], JSON_THROW_ON_ERROR)]); $updated++; }
+            if ($sets) { $values[] = $update['fileId']; $values[] = $principal['organizationId']; $values[] = $vaultId; $db->prepare('UPDATE files SET '.implode(', ', $sets).' WHERE id = ? AND organization_id = ? AND vault_id = ?')->execute($values); $updated++; }
+        }
+        Runtime::emitEvent($db, $principal['organizationId'], 'vault.audit_repaired', $vaultId, ['updated' => $updated, 'updatedBy' => $principal['userId']]);
+        Runtime::respond(200, ['updated' => $updated]);
+    }
     if ($method === 'GET' && $path === '/registration-requests') {
         if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
         $query = $db->prepare("SELECT id, email, display_name AS displayName, status, created_at AS createdAt FROM registration_requests WHERE organization_id = ? AND status = 'pending' ORDER BY created_at");
