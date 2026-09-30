@@ -87,6 +87,7 @@ async function waitForHealth() {
     try {
       const health = await request('/health')
       if (health.ok === true && health.supabase === false && health.apiVersion === 2) {
+        assert.ok(health.capabilities.includes('backup'))
         // A fresh/legacy deployment has no identity until the desktop installer
         // publishes one; clients must classify this as unknown, never current.
         assert.equal(health.bundleDigest, null)

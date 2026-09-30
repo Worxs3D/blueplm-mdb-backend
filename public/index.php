@@ -263,6 +263,7 @@ try {
         'runtime' => 'php',
         'supabase' => false,
         'apiVersion' => BLUEPLM_API_VERSION,
+        'capabilities' => ['backup'],
         'bundleVersion' => $manifest['version'] ?? null,
         'bundleReleaseVersion' => $manifest['releaseVersion'] ?? null,
         'bundleDigest' => $manifest['digest'] ?? null,
