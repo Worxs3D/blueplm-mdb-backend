@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { createHmac } from 'node:crypto'
+import { createHmac, generateKeyPairSync, sign } from 'node:crypto'
 import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -73,6 +73,12 @@ async function requestStatus(path, init = {}, token) {
   const response = await fetch(`${server}${path}`, { ...init, headers })
   const body = response.status === 204 ? undefined : await response.json()
   return { status: response.status, body }
+}
+
+function backupAssertion(fields, privateKey) {
+  return sign(null, Buffer.from(['blueplm-backup-v1', fields.method, fields.endpoint,
+    fields.organizationId, fields.userId, fields.machineId, fields.keyVersion,
+    fields.challengeId, fields.nonce].join('|')), privateKey).toString('base64url')
 }
 
 async function waitForHealth() {
@@ -481,16 +487,55 @@ assert.equal((await requestStatus('/backup/config', {
 }, token)).status, 400)
 await request('/backup/designate', {
   method: 'POST',
-  body: JSON.stringify({ machineId: 'integration-machine', machineName: 'Integration Host', platform: 'linux', userEmail: 'owner@example.test' }),
+  body: JSON.stringify({ machineId: 'integration-machine', machineName: 'Integration Host', platform: 'linux', publicKey: generateKeyPairSync('ed25519').publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('base64url') }),
 }, token)
 assert.equal((await request('/backup/config', {}, token)).config.designated_machine_id, 'integration-machine')
-const runtimeBackupConfig = await request('/backup/runtime-config?machineId=integration-machine', {}, token)
+// Every device-side action, including request, redeems a fresh assertion bound
+// to its exact POST route. Keep the private test key off the API payload.
+const backupKey = generateKeyPairSync('ed25519')
+await request('/backup/designate', {
+  method: 'POST',
+  body: JSON.stringify({ machineId: 'integration-machine', machineName: 'Integration Host', platform: 'linux', publicKey: backupKey.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('base64url') }),
+}, token)
+const backupPrincipal = (await request('/auth/me', {}, token)).user
+async function signedBackupAction(endpoint, action = endpoint, method = endpoint === 'runtime-config' ? 'GET' : 'POST') {
+  const challenge = await request('/backup/device/challenge', { method: 'POST', body: JSON.stringify({ deviceId: 'integration-machine', endpoint }) }, token)
+  const signature = backupAssertion({ method, endpoint: action, organizationId: backupPrincipal.organizationId, userId: backupPrincipal.userId, machineId: 'integration-machine', keyVersion: challenge.keyVersion, challengeId: challenge.challengeId, nonce: challenge.nonce }, backupKey.privateKey)
+  const headers = { 'X-BluePLM-Device-Challenge': challenge.challengeId, 'X-BluePLM-Device-Signature': signature }
+  const path = endpoint === 'runtime-config' ? '/backup/runtime-config?machineId=integration-machine' : `/backup/${endpoint}`
+  return { challenge, headers, path }
+}
+const runtimeAssertion = await signedBackupAction('runtime-config')
+const runtimeBackupConfig = await request(runtimeAssertion.path, { headers: runtimeAssertion.headers }, token)
 assert.equal(runtimeBackupConfig.config.secret_key_encrypted, 'cipher-secret')
 assert.equal((await requestStatus('/backup/runtime-config?machineId=integration-machine', {}, updatedMemberLogin.token)).status, 403)
 assert.equal((await requestStatus('/backup/runtime-config?machineId=wrong-machine', {}, token)).status, 403)
-assert.equal((await request('/backup/heartbeat', { method: 'POST', body: JSON.stringify({ machineId: 'integration-machine' }) }, token)).active, true)
+for (const endpoint of ['heartbeat', 'request', 'start', 'complete']) {
+  assert.equal((await requestStatus(`/backup/${endpoint}`, { method: 'POST', body: JSON.stringify({ machineId: 'integration-machine' }) }, token)).status, 403)
+  const assertion = await signedBackupAction(endpoint)
+  const result = await request(assertion.path, { method: 'POST', headers: assertion.headers, body: JSON.stringify({ machineId: 'integration-machine' }) }, token)
+  assert.ok(result.active === true || result.success === true)
+}
+// A captured assertion is single-use and cannot be retargeted to another
+// method/action, even when account and device ID are unchanged.
+const replay = await signedBackupAction('heartbeat')
+assert.equal((await request(replay.path, { method: 'POST', headers: replay.headers, body: JSON.stringify({ machineId: 'integration-machine' }) }, token)).active, true)
+assert.equal((await requestStatus(replay.path, { method: 'POST', headers: replay.headers, body: JSON.stringify({ machineId: 'integration-machine' }) }, token)).status, 403)
+const tampered = await signedBackupAction('heartbeat', 'start')
+assert.equal((await requestStatus(tampered.path, { method: 'POST', headers: tampered.headers, body: JSON.stringify({ machineId: 'integration-machine' }) }, token)).status, 403)
+const wrongKey = generateKeyPairSync('ed25519')
+const wrongKeyChallenge = await request('/backup/device/challenge', { method: 'POST', body: JSON.stringify({ deviceId: 'integration-machine', endpoint: 'heartbeat' }) }, token)
+const wrongKeyHeaders = {
+  'X-BluePLM-Device-Challenge': wrongKeyChallenge.challengeId,
+  'X-BluePLM-Device-Signature': backupAssertion({ method: 'POST', endpoint: 'heartbeat', organizationId: backupPrincipal.organizationId, userId: backupPrincipal.userId, machineId: 'integration-machine', keyVersion: wrongKeyChallenge.keyVersion, challengeId: wrongKeyChallenge.challengeId, nonce: wrongKeyChallenge.nonce }, wrongKey.privateKey),
+}
+assert.equal((await requestStatus('/backup/heartbeat', { method: 'POST', headers: wrongKeyHeaders, body: JSON.stringify({ machineId: 'integration-machine' }) }, token)).status, 403)
+const expired = await signedBackupAction('complete')
+execFileSync('docker', ['compose', '-f', 'docker-compose.test.yml', 'exec', '-T', 'mariadb', 'mariadb', '-ublueplm', '-pblueplm-test-password', 'blueplm', '-e', `UPDATE backup_device_challenges SET expires_at = DATE_SUB(UTC_TIMESTAMP(3), INTERVAL 1 SECOND) WHERE id = '${expired.challenge.challengeId}'`], { cwd: process.cwd(), stdio: 'pipe' })
+assert.equal((await requestStatus(expired.path, { method: 'POST', headers: expired.headers, body: JSON.stringify({ machineId: 'integration-machine' }) }, token)).status, 403)
 assert.equal((await requestStatus('/backup/designate', { method: 'DELETE' }, updatedMemberLogin.token)).status, 403)
-assert.equal((await request('/backup/request', { method: 'POST', body: JSON.stringify({ userEmail: 'spoof@example.test' }) }, token)).success, true)
+const finalRequest = await signedBackupAction('request')
+assert.equal((await request(finalRequest.path, { method: 'POST', headers: finalRequest.headers, body: JSON.stringify({ machineId: 'integration-machine' }) }, token)).success, true)
 const backupRow = execFileSync('docker', [
   'compose', '-f', 'docker-compose.test.yml', 'exec', '-T', 'mariadb',
   'mariadb', '-ublueplm', '-pblueplm-test-password', 'blueplm', '-N', '-B', '-e',
