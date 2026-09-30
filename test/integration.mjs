@@ -510,7 +510,7 @@ const runtimeBackupConfig = await request(runtimeAssertion.path, { headers: runt
 assert.equal(runtimeBackupConfig.config.secret_key_encrypted, 'cipher-secret')
 assert.equal((await requestStatus('/backup/runtime-config?machineId=integration-machine', {}, updatedMemberLogin.token)).status, 403)
 assert.equal((await requestStatus('/backup/runtime-config?machineId=wrong-machine', {}, token)).status, 403)
-for (const endpoint of ['heartbeat', 'request', 'start', 'complete']) {
+for (const endpoint of ['heartbeat', 'start', 'complete']) {
   assert.equal((await requestStatus(`/backup/${endpoint}`, { method: 'POST', body: JSON.stringify({ machineId: 'integration-machine' }) }, token)).status, 403)
   const assertion = await signedBackupAction(endpoint)
   const result = await request(assertion.path, { method: 'POST', headers: assertion.headers, body: JSON.stringify({ machineId: 'integration-machine' }) }, token)
@@ -534,14 +534,15 @@ const expired = await signedBackupAction('complete')
 execFileSync('docker', ['compose', '-f', 'docker-compose.test.yml', 'exec', '-T', 'mariadb', 'mariadb', '-ublueplm', '-pblueplm-test-password', 'blueplm', '-e', `UPDATE backup_device_challenges SET expires_at = DATE_SUB(UTC_TIMESTAMP(3), INTERVAL 1 SECOND) WHERE id = '${expired.challenge.challengeId}'`], { cwd: process.cwd(), stdio: 'pipe' })
 assert.equal((await requestStatus(expired.path, { method: 'POST', headers: expired.headers, body: JSON.stringify({ machineId: 'integration-machine' }) }, token)).status, 403)
 assert.equal((await requestStatus('/backup/designate', { method: 'DELETE' }, updatedMemberLogin.token)).status, 403)
-const finalRequest = await signedBackupAction('request')
-assert.equal((await request(finalRequest.path, { method: 'POST', headers: finalRequest.headers, body: JSON.stringify({ machineId: 'integration-machine' }) }, token)).success, true)
+// Requests are authenticated user actions. A client-supplied identity or device
+// must be ignored; the server records only the bearer principal in this org.
+assert.equal((await request('/backup/request', { method: 'POST', body: JSON.stringify({ userEmail: 'spoofed@example.test', machineId: 'other-machine' }) }, token)).success, true)
 const backupRow = execFileSync('docker', [
   'compose', '-f', 'docker-compose.test.yml', 'exec', '-T', 'mariadb',
   'mariadb', '-ublueplm', '-pblueplm-test-password', 'blueplm', '-N', '-B', '-e',
   "SELECT backup_requested_by, secret_key_encrypted FROM backup_config LIMIT 1",
 ], { cwd: process.cwd(), encoding: 'utf8' }).trim().split('\t')
-assert.equal(backupRow[0], 'owner@example.test')
+assert.equal(backupRow[0], backupPrincipal.userId)
 assert.notEqual(backupRow[1], 'cipher-secret')
 assert.equal((await requestStatus('/backup/device/challenge', {
   method: 'POST', body: JSON.stringify({ deviceId: 'integration-machine', endpoint: 'heartbeat' }),

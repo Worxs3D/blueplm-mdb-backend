@@ -36,6 +36,7 @@ final class Migrator
                 $db->exec($sql);
                 if ($migration === '015_eco_metadata.sql') self::ensureEcoMetadataConstraints($db);
                 if ($migration === '024_file_part_numbers.sql') self::ensureFilePartNumberConstraint($db);
+                if ($migration === '032_backup_machine_proof.sql') self::ensureBackupMachineProofColumn($db);
             } catch (\Throwable $error) {
                 // The route may safely identify the migration to a holder of
                 // the bootstrap secret, while the underlying database error
@@ -71,6 +72,20 @@ final class Migrator
         $query->execute(['files', 'uq_files_org_part_number']);
         if (!$query->fetchColumn()) {
             $db->exec('ALTER TABLE files ADD UNIQUE KEY uq_files_org_part_number (organization_id, part_number)');
+        }
+    }
+
+    /** MariaDB versions supported by the product do not all support ADD COLUMN
+     * IF NOT EXISTS. The migration ledger makes this metadata check idempotent. */
+    private static function ensureBackupMachineProofColumn(PDO $db): void
+    {
+        $query = $db->prepare(
+            'SELECT 1 FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?'
+        );
+        $query->execute(['backup_config', 'designated_machine_proof_hash']);
+        if (!$query->fetchColumn()) {
+            $db->exec('ALTER TABLE backup_config ADD COLUMN designated_machine_proof_hash CHAR(64) NULL AFTER designated_machine_last_seen');
         }
     }
 

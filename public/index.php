@@ -629,7 +629,17 @@ try {
         Runtime::respond(200, ['success' => true]);
         } catch (\Throwable $error) { if ($db->inTransaction()) $db->rollBack(); throw $error; }
     }
-    if ($method === 'POST' && in_array($path, ['/backup/request', '/backup/start', '/backup/complete', '/backup/heartbeat'], true)) {
+    if ($method === 'POST' && $path === '/backup/request') {
+        // A backup request is a tenant-scoped user action, not evidence that a
+        // machine currently possesses the designated device key. Do not accept
+        // requester identity from the client body; the bearer principal is the
+        // sole attribution source.
+        $update = $db->prepare('UPDATE backup_config SET backup_requested_at = UTC_TIMESTAMP(3), backup_requested_by = ?, updated_at = UTC_TIMESTAMP(3) WHERE organization_id = ?');
+        $update->execute([$principal['userId'], $principal['organizationId']]);
+        if ($update->rowCount() === 0) Runtime::respond(409, ['error' => 'NOT_CONFIGURED', 'message' => 'No backup configuration is configured.']);
+        Runtime::respond(200, ['success' => true]);
+    }
+    if ($method === 'POST' && in_array($path, ['/backup/start', '/backup/complete', '/backup/heartbeat'], true)) {
         $body = Runtime::jsonBody();
         $machineId = is_string($body['machineId'] ?? null) ? trim($body['machineId']) : '';
         $action = substr($path, strlen('/backup/'));
@@ -638,14 +648,6 @@ try {
             $update = $db->prepare('UPDATE backup_config SET designated_machine_last_seen = UTC_TIMESTAMP(3), updated_at = UTC_TIMESTAMP(3) WHERE organization_id = ? AND designated_machine_id = ?');
             $update->execute([$principal['organizationId'], $machineId]);
             Runtime::respond(200, ['active' => $update->rowCount() > 0]);
-        }
-        if ($path === '/backup/request') {
-            $userEmail = strtolower((string)$principal['email']);
-            if (!filter_var($userEmail, FILTER_VALIDATE_EMAIL) || strlen($userEmail) > 320) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid requester email is required.']);
-            $update = $db->prepare('UPDATE backup_config SET backup_requested_at = UTC_TIMESTAMP(3), backup_requested_by = ?, updated_at = UTC_TIMESTAMP(3) WHERE organization_id = ? AND designated_machine_id = ?');
-            $update->execute([$userEmail, $principal['organizationId'], $machineId]);
-            if ($update->rowCount() === 0) Runtime::respond(409, ['error' => 'NOT_CONFIGURED', 'message' => 'No designated backup machine is configured.']);
-            Runtime::respond(200, ['success' => true]);
         }
         if ($path === '/backup/start') {
             $update = $db->prepare('UPDATE backup_config SET backup_running_since = UTC_TIMESTAMP(3), backup_requested_at = NULL, backup_requested_by = NULL WHERE organization_id = ? AND designated_machine_id = ?');
