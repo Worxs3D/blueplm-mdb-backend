@@ -1018,7 +1018,7 @@ try {
              LEFT JOIN team_members tm ON tm.team_id = t.id
              LEFT JOIN team_vault_access tva ON tva.team_id = t.id
              WHERE t.organization_id = ?
-             GROUP BY t.id, t.name, t.color, t.icon, t.created_at
+             GROUP BY t.id, t.name, t.color, t.icon, t.created_at, t.module_defaults
              ORDER BY t.name'
         );
         $query->execute([$principal['organizationId']]);

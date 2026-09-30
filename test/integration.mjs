@@ -431,6 +431,16 @@ const savedTeamDefaults = await request(`/teams/${createdTeam.id}/module-default
   body: JSON.stringify({ defaults: teamDefaults }),
 }, token)
 assert.equal(savedTeamDefaults.success, true)
+execFileSync('docker', [
+  'compose', '-f', 'docker-compose.test.yml', 'exec', '-T', 'mariadb',
+  'mariadb', '-uroot', '-proot-test-password', '-e',
+  "SET GLOBAL sql_mode = CONCAT(@@GLOBAL.sql_mode, ',ONLY_FULL_GROUP_BY')",
+], { cwd: process.cwd(), stdio: 'pipe' })
+const teamsWithDefaults = await request('/teams', {}, token)
+assert.deepEqual(
+  teamsWithDefaults.teams.find((team) => team.id === createdTeam.id)?.module_defaults,
+  teamDefaults,
+)
 assert.deepEqual((await request(`/teams/${createdTeam.id}/module-defaults`, {}, token)).defaults, teamDefaults)
 assert.equal((await requestStatus(`/teams/${createdTeam.id}/module-defaults`, {
   method: 'PUT', body: JSON.stringify({ defaults: teamDefaults }),
