@@ -7,7 +7,10 @@ services:
       MARIADB_PASSWORD: blueplm-test-password
       MARIADB_ROOT_PASSWORD: root-test-password
     healthcheck:
-      test: ["CMD", "mariadb-admin", "ping", "-h", "localhost", "-uroot", "-proot-test-password"]
+      # The entrypoint's temporary Unix-socket server accepts localhost before
+      # it creates the application account, then shuts down.  Probe TCP so
+      # depends_on releases the API only after the final server is listening.
+      test: ["CMD", "mariadb-admin", "ping", "--protocol=tcp", "-h", "127.0.0.1", "-uroot", "-proot-test-password"]
       interval: 2s
       timeout: 5s
       retries: 30
