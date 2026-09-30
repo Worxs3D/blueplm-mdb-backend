@@ -499,10 +499,14 @@ try {
         if (!$fileRow) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'File not found.']);
         Runtime::requireVault($db, $principal, $fileRow['vault_id']);
 
+        $workflowRoleIds = $db->prepare('SELECT uwr.workflow_role_id FROM user_workflow_roles uwr JOIN workflow_roles wr ON wr.id = uwr.workflow_role_id AND wr.org_id = uwr.org_id AND wr.is_active = TRUE WHERE uwr.user_id = ? AND uwr.org_id = ?');
+        $workflowRoleIds->execute([$principal['userId'], $principal['organizationId']]);
+        $ownedRoles = array_map('strval', array_column($workflowRoleIds->fetchAll(), 'workflow_role_id'));
         $query = $db->prepare(
-            'SELECT t.id, t.workflow_id, t.from_state_id, t.to_state_id, t.name, t.description,
+            'SELECT t.id AS transition_id, t.workflow_id, t.from_state_id, t.to_state_id, t.name AS transition_name, t.description,
                     t.allowed_workflow_roles, t.auto_conditions, s.name AS to_state_name,
-                    s.label AS to_state_label
+                    COALESCE(s.label, s.name) AS to_state_label, s.color AS to_state_color,
+                    (SELECT COUNT(*) FROM workflow_gates g WHERE g.transition_id = t.id AND g.is_blocking = TRUE) AS gate_count
              FROM file_workflow_assignments a
              JOIN workflow_transitions t ON t.workflow_id = a.workflow_id AND t.from_state_id = a.current_state_id
              JOIN workflow_states s ON s.id = t.to_state_id
@@ -513,15 +517,18 @@ try {
         $transitions = [];
         foreach ($query->fetchAll() as $transition) {
             $allowedRoles = json_decode((string)($transition['allowed_workflow_roles'] ?? 'null'), true);
-            if (is_array($allowedRoles) && $allowedRoles !== []) {
-                $workflowRoleIds = $db->prepare('SELECT workflow_role_id FROM user_workflow_roles WHERE user_id = ? AND org_id = ?');
-                $workflowRoleIds->execute([$principal['userId'], $principal['organizationId']]);
-                $ownedRoles = array_column($workflowRoleIds->fetchAll(), 'workflow_role_id');
-                if (array_intersect($ownedRoles, array_map('strval', $allowedRoles)) === []) continue;
-            }
-            $transition['allowed_workflow_roles'] = is_array($allowedRoles) ? $allowedRoles : null;
-            $transition['auto_conditions'] = json_decode((string)($transition['auto_conditions'] ?? 'null'), true);
-            $transitions[] = $transition;
+            $canTransition = !is_array($allowedRoles) || $allowedRoles === []
+                || array_intersect($ownedRoles, array_map('strval', $allowedRoles)) !== [];
+            if (!$canTransition) continue;
+            $transitions[] = [
+                'transition_id' => $transition['transition_id'],
+                'transition_name' => $transition['transition_name'],
+                'to_state_id' => $transition['to_state_id'],
+                'to_state_name' => $transition['to_state_name'],
+                'to_state_color' => $transition['to_state_color'],
+                'has_gates' => (int)$transition['gate_count'] > 0,
+                'user_can_transition' => true,
+            ];
         }
         Runtime::respond(200, ['transitions' => $transitions]);
     }
@@ -543,15 +550,56 @@ try {
             if (!$assignmentRow) { $db->rollBack(); Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'File workflow assignment not found.']); }
             Runtime::requireVault($db, $principal, $assignmentRow['vault_id']);
             $transition = $db->prepare(
-                'SELECT id, workflow_id, from_state_id, to_state_id, name
-                 FROM workflow_transitions
-                 WHERE id = ? AND workflow_id = ? AND from_state_id = ?'
+                'SELECT t.id, t.workflow_id, t.from_state_id, t.to_state_id, t.name,
+                        t.allowed_workflow_roles, t.auto_conditions,
+                        s.name AS to_state_name, s.triggers_review, s.auto_increment_revision,
+                        (SELECT COUNT(*) FROM workflow_gates g WHERE g.transition_id = t.id AND g.is_blocking = TRUE) AS gate_count
+                 FROM workflow_transitions t
+                 JOIN workflow_states s ON s.id = t.to_state_id
+                 WHERE t.id = ? AND t.workflow_id = ? AND t.from_state_id = ?'
             );
             $transition->execute([$matches[2], $assignmentRow['workflow_id'], $assignmentRow['current_state_id']]);
             $transitionRow = $transition->fetch();
             if (!$transitionRow) { $db->rollBack(); Runtime::respond(409, ['error' => 'TRANSITION_UNAVAILABLE', 'message' => 'The workflow transition is no longer available.']); }
+            $allowedRoles = json_decode((string)($transitionRow['allowed_workflow_roles'] ?? 'null'), true);
+            if (is_array($allowedRoles) && $allowedRoles !== []) {
+                $roles = $db->prepare('SELECT uwr.workflow_role_id FROM user_workflow_roles uwr JOIN workflow_roles wr ON wr.id = uwr.workflow_role_id AND wr.org_id = uwr.org_id AND wr.is_active = TRUE WHERE uwr.user_id = ? AND uwr.org_id = ?');
+                $roles->execute([$principal['userId'], $principal['organizationId']]);
+                $ownedRoles = array_map('strval', array_column($roles->fetchAll(), 'workflow_role_id'));
+                if (array_intersect($ownedRoles, array_map('strval', $allowedRoles)) === []) {
+                    $db->rollBack();
+                    Runtime::respond(403, ['error' => 'WORKFLOW_ROLE_REQUIRED', 'message' => 'A workflow role is required for this transition.']);
+                }
+            }
+            $gate = $db->prepare('SELECT id FROM workflow_gates WHERE transition_id = ? AND is_blocking = TRUE ORDER BY sort_order, id');
+            $gate->execute([$transitionRow['id']]);
+            $gates = $gate->fetchAll();
+            if ($gates || (bool)$transitionRow['triggers_review']) {
+                foreach ($gates as $gateRow) {
+                    $db->prepare('INSERT INTO pending_reviews (id, organization_id, file_id, transition_id, gate_id, requested_by, status) VALUES (?, ?, ?, ?, ?, ?, \'pending\') ON DUPLICATE KEY UPDATE requested_by = VALUES(requested_by), status = \'pending\', requested_at = UTC_TIMESTAMP(3)')
+                        ->execute([Runtime::uuid(), $principal['organizationId'], $matches[1], $transitionRow['id'], $gateRow['id'], $principal['userId']]);
+                }
+                Runtime::emitEvent($db, $principal['organizationId'], 'file.workflow_review_requested', $matches[1], [
+                    'fileId' => $matches[1], 'transitionId' => $transitionRow['id'], 'userId' => $principal['userId'],
+                ]);
+                $db->commit();
+                Runtime::respond(200, ['result' => [
+                    'success' => true, 'requires_review' => true, 'new_state_id' => null,
+                    'new_state_name' => null, 'new_revision' => null, 'error_code' => null, 'error_message' => null,
+                ]]);
+            }
+            $revision = $db->prepare('SELECT current_revision FROM files WHERE id = ? AND organization_id = ? FOR UPDATE');
+            $revision->execute([$matches[1], $principal['organizationId']]);
+            $revisionBefore = (int)$revision->fetchColumn();
+            $revisionAfter = $revisionBefore;
+            if ((bool)$transitionRow['auto_increment_revision']) {
+                $revisionAfter++;
+                $db->prepare('UPDATE files SET current_revision = ? WHERE id = ? AND organization_id = ?')->execute([$revisionAfter, $matches[1], $principal['organizationId']]);
+            }
             $db->prepare('UPDATE file_workflow_assignments SET current_state_id = ?, assigned_by = ?, assigned_at = UTC_TIMESTAMP(3) WHERE file_id = ?')
                 ->execute([$transitionRow['to_state_id'], $principal['userId'], $matches[1]]);
+            $db->prepare('INSERT INTO workflow_history (id, organization_id, file_id, workflow_id, transition_id, from_state_id, to_state_id, performed_by, comment, revision_before, revision_after) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+                ->execute([Runtime::uuid(), $principal['organizationId'], $matches[1], $transitionRow['workflow_id'], $transitionRow['id'], $assignmentRow['current_state_id'], $transitionRow['to_state_id'], $principal['userId'], $comment, $revisionBefore, $revisionAfter]);
             Runtime::emitEvent($db, $principal['organizationId'], 'file.workflow_transition_executed', $matches[1], [
                 'fileId' => $matches[1], 'transitionId' => $matches[2], 'comment' => $comment,
                 'userId' => $principal['userId'],
@@ -563,7 +611,7 @@ try {
             Runtime::respond(200, ['result' => [
                 'success' => true, 'requires_review' => false,
                 'new_state_id' => $transitionRow['to_state_id'], 'new_state_name' => $stateName,
-                'new_revision' => null, 'error_code' => null, 'error_message' => null,
+                'new_revision' => $revisionAfter === $revisionBefore ? null : (string)$revisionAfter, 'error_code' => null, 'error_message' => null,
             ]]);
         } catch (Throwable $error) {
             if ($db->inTransaction()) $db->rollBack();
