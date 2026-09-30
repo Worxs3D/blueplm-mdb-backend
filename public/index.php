@@ -723,6 +723,11 @@ try {
             // as its own still-pending direct review.
             if ($isDirectReview) { $direct = $db->prepare("SELECT id FROM pending_reviews WHERE file_id = ? AND transition_id = ? AND gate_id IS NULL AND status = 'pending' AND id <> ? FOR UPDATE"); $direct->execute([$review['file_id'], $review['transition_id'], $review['id']]); if ($direct->fetch()) $complete = false; }
             if (!$complete) { $db->commit(); Runtime::respond(200, ['result' => ['success' => true, 'requires_review' => true, 'new_state_id' => null, 'new_state_name' => null, 'new_revision' => null, 'error_code' => null, 'error_message' => null]]); }
+            // Reaching a gate's quorum completes the transition.  No sibling
+            // review may remain actionable after that state change: otherwise
+            // a stale pending assignment is exposed until somebody clicks it.
+            $db->prepare("UPDATE pending_reviews SET status = 'cancelled' WHERE file_id = ? AND transition_id = ? AND status = 'pending'")
+                ->execute([$review['file_id'], $review['transition_id']]);
             $revision = $db->prepare('SELECT current_revision FROM files WHERE id = ? AND organization_id = ? FOR UPDATE'); $revision->execute([$review['file_id'], $principal['organizationId']]); $before = (int)$revision->fetchColumn(); $after = $before + ((bool)$review['auto_increment_revision'] ? 1 : 0);
             if ($after !== $before) $db->prepare('UPDATE files SET current_revision = ? WHERE id = ? AND organization_id = ?')->execute([$after, $review['file_id'], $principal['organizationId']]);
             $db->prepare('UPDATE file_workflow_assignments SET current_state_id = ?, assigned_by = ?, assigned_at = UTC_TIMESTAMP(3) WHERE file_id = ? AND current_state_id = ?')->execute([$review['to_state_id'], $principal['userId'], $review['file_id'], $review['from_state_id']]);
