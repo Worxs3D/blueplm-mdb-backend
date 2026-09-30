@@ -422,6 +422,21 @@ const createdTeam = await request(
   token,
 )
 assert.equal(createdTeam.name, 'Integration Team')
+const teamDefaults = { enabled_modules: { explorer: true }, module_order: ['explorer'] }
+const savedTeamDefaults = await request(`/teams/${createdTeam.id}/module-defaults`, {
+  method: 'PUT',
+  body: JSON.stringify({ defaults: teamDefaults }),
+}, token)
+assert.equal(savedTeamDefaults.success, true)
+assert.deepEqual((await request(`/teams/${createdTeam.id}/module-defaults`, {}, token)).defaults, teamDefaults)
+assert.equal((await requestStatus(`/teams/${createdTeam.id}/module-defaults`, {
+  method: 'PUT', body: JSON.stringify({ defaults: teamDefaults }),
+}, updatedMemberLogin.token)).status, 403)
+assert.equal((await requestStatus(`/teams/${createdTeam.id}/module-defaults`, {
+  method: 'DELETE',
+}, updatedMemberLogin.token)).status, 403)
+await request(`/teams/${createdTeam.id}/module-defaults`, { method: 'DELETE' }, token)
+assert.equal((await request(`/teams/${createdTeam.id}/module-defaults`, {}, token)).defaults, null)
 const teams = await request('/teams', {}, token)
 assert.ok(teams.teams.some((team) => team.id === createdTeam.id && team.memberCount === 0))
 const updatedTeam = await request(

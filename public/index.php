@@ -1011,7 +1011,7 @@ try {
     // Supabase fallback when MariaDB is selected.
     if ($method === 'GET' && $path === '/teams') {
         $query = $db->prepare(
-            'SELECT t.id, t.name, t.color, t.icon, t.created_at AS createdAt,
+            'SELECT t.id, t.name, t.color, t.icon, t.created_at AS createdAt, t.module_defaults,
                     COUNT(DISTINCT tm.user_id) AS memberCount,
                     COUNT(DISTINCT tva.vault_id) AS vaultCount
              FROM teams t
@@ -1023,9 +1023,31 @@ try {
         );
         $query->execute([$principal['organizationId']]);
         $teams = $query->fetchAll();
-        foreach ($teams as &$team) { $team['memberCount'] = (int)$team['memberCount']; $team['vaultCount'] = (int)$team['vaultCount']; }
+        foreach ($teams as &$team) { $team['memberCount'] = (int)$team['memberCount']; $team['vaultCount'] = (int)$team['vaultCount']; $team['module_defaults'] = $team['module_defaults'] === null ? null : json_decode($team['module_defaults'], true); }
         unset($team);
         Runtime::respond(200, ['teams' => $teams]);
+    }
+    if ($method === 'GET' && preg_match('#^/teams/([0-9a-f-]{36})/module-defaults$#i', $path, $matches)) {
+        $team = $db->prepare('SELECT module_defaults FROM teams WHERE id = ? AND organization_id = ?');
+        $team->execute([$matches[1], $principal['organizationId']]); $row = $team->fetch();
+        if (!$row) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Team not found.']);
+        Runtime::respond(200, ['defaults' => $row['module_defaults'] === null ? null : json_decode($row['module_defaults'], true)]);
+    }
+    if ($method === 'PUT' && preg_match('#^/teams/([0-9a-f-]{36})/module-defaults$#i', $path, $matches)) {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $body = Runtime::jsonBody(); $defaults = $body['defaults'] ?? null;
+        if (!is_array($defaults) || strlen(json_encode($defaults, JSON_THROW_ON_ERROR)) > 500000) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid module defaults object is required.']);
+        $team = $db->prepare('SELECT id FROM teams WHERE id = ? AND organization_id = ?'); $team->execute([$matches[1], $principal['organizationId']]); if (!$team->fetch()) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Team not found.']);
+        $db->prepare('UPDATE teams SET module_defaults = ?, module_defaults_forced_at = NULL WHERE id = ? AND organization_id = ?')->execute([json_encode($defaults, JSON_THROW_ON_ERROR), $matches[1], $principal['organizationId']]);
+        Runtime::emitEvent($db, $principal['organizationId'], 'team.module_defaults_updated', $matches[1], ['teamId' => $matches[1], 'updatedBy' => $principal['userId']]);
+        Runtime::respond(200, ['success' => true]);
+    }
+    if ($method === 'DELETE' && preg_match('#^/teams/([0-9a-f-]{36})/module-defaults$#i', $path, $matches)) {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $query = $db->prepare('UPDATE teams SET module_defaults = NULL, module_defaults_forced_at = NULL WHERE id = ? AND organization_id = ?'); $query->execute([$matches[1], $principal['organizationId']]);
+        if ($query->rowCount() === 0) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Team not found.']);
+        Runtime::emitEvent($db, $principal['organizationId'], 'team.module_defaults_cleared', $matches[1], ['teamId' => $matches[1], 'clearedBy' => $principal['userId']]);
+        Runtime::respond(200, ['success' => true]);
     }
     if ($method === 'POST' && $path === '/teams') {
         if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
@@ -1159,7 +1181,7 @@ try {
         $query = $db->prepare('SELECT s.user_id, u.email, u.display_name AS full_name, NULL AS avatar_url, NULL AS custom_avatar_url, m.role, COALESCE(s.machine_name, s.machine_id) AS machine_name, s.platform, s.last_seen FROM device_sessions s JOIN users u ON u.id = s.user_id JOIN organization_memberships m ON m.user_id = s.user_id AND m.organization_id = s.organization_id WHERE s.organization_id = ? AND s.is_active = TRUE AND s.last_seen >= DATE_SUB(UTC_TIMESTAMP(3), INTERVAL 5 MINUTE) ORDER BY s.last_seen DESC'); $query->execute([$principal['organizationId']]); Runtime::respond(200, ['users' => $query->fetchAll()]);
     }
     if ($method === 'GET' && $path === '/organizations/current') {
-        $query = $db->prepare('SELECT o.id, o.name, o.slug, o.created_at AS createdAt, s.default_new_user_team_id AS defaultNewUserTeamId, s.document_manager_license_key AS documentManagerLicenseKey FROM organizations o LEFT JOIN organization_settings s ON s.organization_id = o.id WHERE o.id = ?');
+        $query = $db->prepare('SELECT o.id, o.name, o.slug, o.created_at AS createdAt, s.default_new_user_team_id AS defaultNewUserTeamId, s.document_manager_license_key AS documentManagerLicenseKey, s.module_defaults_forced_at AS module_defaults_forced_at FROM organizations o LEFT JOIN organization_settings s ON s.organization_id = o.id WHERE o.id = ?');
         $query->execute([$principal['organizationId']]); $organization = $query->fetch();
         if (!$organization) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Organization not found.']);
         Runtime::respond(200, ['organization' => $organization]);
