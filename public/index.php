@@ -486,6 +486,90 @@ try {
             || str_starts_with($path, '/account/totp');
         if (!$personalWrite) Runtime::respond(403, ['error' => 'READ_ONLY_ROLE', 'message' => 'Viewer and guest accounts are read-only.']);
     }
+
+    // Workflow runtime endpoints are deliberately scoped through the file's
+    // organization and vault before any transition row is exposed.  The
+    // editor uses the collection endpoint to populate its action menu; the
+    // execute endpoint is kept adjacent so a missing second route cannot turn
+    // a successful lookup into a 404 on the next click.
+    if ($method === 'GET' && preg_match('#^/files/([0-9a-f-]{36})/available-transitions$#i', $path, $matches)) {
+        $file = $db->prepare('SELECT id, vault_id FROM files WHERE id = ? AND organization_id = ? AND deleted_at IS NULL');
+        $file->execute([$matches[1], $principal['organizationId']]);
+        $fileRow = $file->fetch();
+        if (!$fileRow) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'File not found.']);
+        Runtime::requireVault($db, $principal, $fileRow['vault_id']);
+
+        $query = $db->prepare(
+            'SELECT t.id, t.workflow_id, t.from_state_id, t.to_state_id, t.name, t.description,
+                    t.allowed_workflow_roles, t.auto_conditions, s.name AS to_state_name,
+                    s.label AS to_state_label
+             FROM file_workflow_assignments a
+             JOIN workflow_transitions t ON t.workflow_id = a.workflow_id AND t.from_state_id = a.current_state_id
+             JOIN workflow_states s ON s.id = t.to_state_id
+             WHERE a.file_id = ? AND a.workflow_id = t.workflow_id
+             ORDER BY t.name, t.id'
+        );
+        $query->execute([$fileRow['id']]);
+        $transitions = [];
+        foreach ($query->fetchAll() as $transition) {
+            $allowedRoles = json_decode((string)($transition['allowed_workflow_roles'] ?? 'null'), true);
+            if (is_array($allowedRoles) && $allowedRoles !== []) {
+                $workflowRoleIds = $db->prepare('SELECT workflow_role_id FROM user_workflow_roles WHERE user_id = ? AND org_id = ?');
+                $workflowRoleIds->execute([$principal['userId'], $principal['organizationId']]);
+                $ownedRoles = array_column($workflowRoleIds->fetchAll(), 'workflow_role_id');
+                if (array_intersect($ownedRoles, array_map('strval', $allowedRoles)) === []) continue;
+            }
+            $transition['allowed_workflow_roles'] = is_array($allowedRoles) ? $allowedRoles : null;
+            $transition['auto_conditions'] = json_decode((string)($transition['auto_conditions'] ?? 'null'), true);
+            $transitions[] = $transition;
+        }
+        Runtime::respond(200, ['transitions' => $transitions]);
+    }
+
+    if ($method === 'POST' && preg_match('#^/files/([0-9a-f-]{36})/workflow-transitions/([0-9a-f-]{36})/execute$#i', $path, $matches)) {
+        $body = Runtime::jsonBody();
+        $comment = is_string($body['comment'] ?? null) ? trim($body['comment']) : null;
+        if ($comment !== null && strlen($comment) > 20000) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'comment is too long.']);
+        $db->beginTransaction();
+        try {
+            $assignment = $db->prepare(
+                'SELECT a.workflow_id, a.current_state_id, f.vault_id
+                 FROM file_workflow_assignments a
+                 JOIN files f ON f.id = a.file_id AND f.organization_id = ? AND f.deleted_at IS NULL
+                 WHERE a.file_id = ? FOR UPDATE'
+            );
+            $assignment->execute([$principal['organizationId'], $matches[1]]);
+            $assignmentRow = $assignment->fetch();
+            if (!$assignmentRow) { $db->rollBack(); Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'File workflow assignment not found.']); }
+            Runtime::requireVault($db, $principal, $assignmentRow['vault_id']);
+            $transition = $db->prepare(
+                'SELECT id, workflow_id, from_state_id, to_state_id, name
+                 FROM workflow_transitions
+                 WHERE id = ? AND workflow_id = ? AND from_state_id = ?'
+            );
+            $transition->execute([$matches[2], $assignmentRow['workflow_id'], $assignmentRow['current_state_id']]);
+            $transitionRow = $transition->fetch();
+            if (!$transitionRow) { $db->rollBack(); Runtime::respond(409, ['error' => 'TRANSITION_UNAVAILABLE', 'message' => 'The workflow transition is no longer available.']); }
+            $db->prepare('UPDATE file_workflow_assignments SET current_state_id = ?, assigned_by = ?, assigned_at = UTC_TIMESTAMP(3) WHERE file_id = ?')
+                ->execute([$transitionRow['to_state_id'], $principal['userId'], $matches[1]]);
+            Runtime::emitEvent($db, $principal['organizationId'], 'file.workflow_transition_executed', $matches[1], [
+                'fileId' => $matches[1], 'transitionId' => $matches[2], 'comment' => $comment,
+                'userId' => $principal['userId'],
+            ]);
+            $db->commit();
+            $state = $db->prepare('SELECT name FROM workflow_states WHERE id = ?');
+            $state->execute([$transitionRow['to_state_id']]);
+            $stateName = $state->fetchColumn();
+            Runtime::respond(200, ['result' => [
+                'success' => true, 'requires_review' => false,
+                'new_state_id' => $transitionRow['to_state_id'], 'new_state_name' => $stateName,
+                'new_revision' => null, 'error_code' => null, 'error_message' => null,
+            ]]);
+        } catch (Throwable $error) {
+            if ($db->inTransaction()) $db->rollBack();
+            throw $error;
+        }
+    }
     if ($method === 'GET' && $path === '/account/totp') {
         $query = $db->prepare('SELECT enabled_at AS enabledAt FROM admin_totp_credentials WHERE user_id = ?');
         $query->execute([$principal['userId']]);

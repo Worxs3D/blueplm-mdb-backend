@@ -742,6 +742,35 @@ assert.deepEqual(
   [{ partNumber: 'PN-00042', filePath: 'drawing.txt' }],
 )
 assert.equal((await request(`/vaults/${vault.id}/files`, {}, token)).files[0].partNumber, 'PN-00042')
+
+// Workflow runtime is a two-step client contract: the available-transition
+// lookup and the action it enables must both be tenant/vault scoped. Seed a
+// minimal assignment through the test database so this exercises the real
+// authenticated PHP routes rather than only checking route source text.
+const workflowId = randomUUID()
+const fromStateId = randomUUID()
+const toStateId = randomUUID()
+const transitionId = randomUUID()
+const workflowPrincipal = await request('/auth/me', {}, token)
+const workflowSql = [
+  `INSERT INTO workflow_templates (id, organization_id, name, created_by) VALUES ('${workflowId}', '${workflowPrincipal.user.organizationId}', 'Integration Workflow', '${workflowPrincipal.user.userId}')`,
+  `INSERT INTO workflow_states (id, workflow_id, name, label) VALUES ('${fromStateId}', '${workflowId}', 'Draft', 'Draft'), ('${toStateId}', '${workflowId}', 'Released', 'Released')`,
+  `INSERT INTO workflow_transitions (id, workflow_id, from_state_id, to_state_id, name, waypoints) VALUES ('${transitionId}', '${workflowId}', '${fromStateId}', '${toStateId}', 'Release', '[]')`,
+  `INSERT INTO file_workflow_assignments (id, file_id, workflow_id, current_state_id, assigned_by) VALUES ('${randomUUID()}', '${imported.id}', '${workflowId}', '${fromStateId}', '${workflowPrincipal.user.userId}')`,
+].join('; ')
+execFileSync('docker', [
+  'compose', '-f', 'docker-compose.test.yml', 'exec', '-T', 'mariadb',
+  'mariadb', '-ublueplm', '-pblueplm-test-password', 'blueplm', '-e', workflowSql,
+], { cwd: process.cwd(), stdio: 'pipe' })
+const availableTransitions = await request(`/files/${imported.id}/available-transitions`, {}, token)
+assert.equal(availableTransitions.transitions.length, 1)
+assert.equal(availableTransitions.transitions[0].id, transitionId)
+const transitionResult = await request(`/files/${imported.id}/workflow-transitions/${transitionId}/execute`, {
+  method: 'POST',
+  body: JSON.stringify({ comment: 'integration transition' }),
+}, token)
+assert.equal(transitionResult.result.success, true)
+assert.equal(transitionResult.result.new_state_id, toStateId)
 const legacyFile = await request(
   '/files/import',
   {
