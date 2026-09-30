@@ -83,6 +83,20 @@ final class Runtime
         return hash('sha256', $secret . ':' . $token);
     }
 
+    /** Decode unpadded base64url without accepting alternate encodings. */
+    public static function base64UrlDecode(string $value): string
+    {
+        if ($value === '' || !preg_match('/^[A-Za-z0-9_-]+$/', $value)) throw new \InvalidArgumentException('Invalid base64url value.');
+        $decoded = base64_decode(strtr($value, '-_', '+/') . str_repeat('=', (4 - strlen($value) % 4) % 4), true);
+        if ($decoded === false) throw new \InvalidArgumentException('Invalid base64url value.');
+        return $decoded;
+    }
+
+    public static function base64UrlEncode(string $value): string
+    {
+        return rtrim(strtr(base64_encode($value), '+/', '-_'), '=');
+    }
+
     /** @param array<string, mixed> $payload */
     public static function emitEvent(PDO $db, string $organizationId, string $type, string $aggregateId, array $payload): void
     {
@@ -191,7 +205,7 @@ final class Runtime
         $allowed = array_filter(array_map('trim', explode(',', $env['BLUEPLM_CORS_ORIGINS'] ?? '')));
         if ($origin !== '' && in_array($origin, $allowed, true)) header("Access-Control-Allow-Origin: {$origin}");
         header('Vary: Origin');
-        header('Access-Control-Allow-Headers: Authorization, Content-Type');
+        header('Access-Control-Allow-Headers: Authorization, Content-Type, X-BluePLM-Device-Challenge, X-BluePLM-Device-Signature');
         header('Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS');
     }
 
