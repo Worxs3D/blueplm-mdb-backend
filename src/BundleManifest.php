@@ -8,7 +8,7 @@ final class BundleManifest
 {
     public const FILE_NAME = 'bundle-manifest.json';
 
-    /** @return array{version:int,digest:string,fileCount:int}|null */
+    /** @return array{version:int,releaseVersion:string,digest:string,fileCount:int}|null */
     public static function read(string $root): ?array
     {
         $path = rtrim($root, '/\\') . '/' . self::FILE_NAME;
@@ -16,6 +16,8 @@ final class BundleManifest
         $decoded = json_decode((string)file_get_contents($path), true);
         if (!is_array($decoded)
             || ($decoded['version'] ?? null) !== 1
+            || !is_string($decoded['releaseVersion'] ?? null)
+            || !preg_match('/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/', $decoded['releaseVersion'])
             || !is_string($decoded['digest'] ?? null)
             || !preg_match('/^[a-f0-9]{64}$/', $decoded['digest'])
             || !is_int($decoded['fileCount'] ?? null)
@@ -24,6 +26,7 @@ final class BundleManifest
         }
         return [
             'version' => 1,
+            'releaseVersion' => $decoded['releaseVersion'],
             'digest' => $decoded['digest'],
             'fileCount' => $decoded['fileCount'],
         ];

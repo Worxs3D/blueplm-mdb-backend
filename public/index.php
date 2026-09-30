@@ -264,6 +264,7 @@ try {
         'supabase' => false,
         'apiVersion' => BLUEPLM_API_VERSION,
         'bundleVersion' => $manifest['version'] ?? null,
+        'bundleReleaseVersion' => $manifest['releaseVersion'] ?? null,
         'bundleDigest' => $manifest['digest'] ?? null,
         'bundleFileCount' => $manifest['fileCount'] ?? null,
     ]);

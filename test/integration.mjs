@@ -85,6 +85,7 @@ async function waitForHealth() {
         // publishes one; clients must classify this as unknown, never current.
         assert.equal(health.bundleDigest, null)
         assert.equal(health.bundleVersion, null)
+        assert.equal(health.bundleReleaseVersion, null)
         const databaseProbe = await fetch(`${server}/installer/database-status`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
