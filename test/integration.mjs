@@ -125,6 +125,11 @@ const installed = await request('/installer/commit', {
 })
 assert.equal(typeof installed.token, 'string')
 assert.equal(installed.bootstrapped, true)
+const rejectedMaintenance = await requestStatus('/admin/migrate', {
+  method: 'POST',
+  body: JSON.stringify({ maintenanceToken: 'wrong-maintenance-token' }),
+})
+assert.equal(rejectedMaintenance.status, 403)
 const login = await request('/auth/login', {
   method: 'POST',
   body: JSON.stringify({ email: 'owner@example.test', password }),
