@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS backup_config (
   designated_machine_id VARCHAR(255) NULL, designated_machine_name VARCHAR(255) NULL,
   designated_machine_platform VARCHAR(128) NULL, designated_machine_user_email VARCHAR(320) NULL,
   designated_machine_last_seen DATETIME(3) NULL, backup_requested_at DATETIME(3) NULL,
+  designated_machine_proof_hash CHAR(64) NULL,
   backup_requested_by VARCHAR(320) NULL, backup_running_since DATETIME(3) NULL,
   created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),

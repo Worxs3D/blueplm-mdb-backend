@@ -449,14 +449,17 @@ try {
     if ($method === 'GET' && $path === '/backup/runtime-config') {
         $machineId = is_string($_GET['machineId'] ?? null) ? trim($_GET['machineId']) : '';
         if ($machineId === '' || strlen($machineId) > 255) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid machine ID is required.']);
-        $query = $db->prepare('SELECT * FROM backup_config WHERE organization_id = ? AND designated_machine_id = ? AND LOWER(designated_machine_user_email) = LOWER(?)');
-        $query->execute([$principal['organizationId'], $machineId, $principal['email']]);
+        $proof = is_string($_SERVER['HTTP_X_BLUEPLM_MACHINE_PROOF'] ?? null) ? trim($_SERVER['HTTP_X_BLUEPLM_MACHINE_PROOF']) : '';
+        if ($proof === '' || strlen($proof) > 512) Runtime::respond(403, ['error' => 'BACKUP_MACHINE_NOT_AUTHORIZED', 'message' => 'A valid machine proof is required.']);
+        $query = $db->prepare('SELECT * FROM backup_config WHERE organization_id = ? AND designated_machine_id = ? AND designated_machine_proof_hash = ?');
+        $query->execute([$principal['organizationId'], $machineId, hash('sha256', $proof)]);
         $row = $query->fetch();
         if (!$row) Runtime::respond(403, ['error' => 'BACKUP_MACHINE_NOT_AUTHORIZED', 'message' => 'The authenticated account is not the designated backup machine.']);
         foreach (['access_key_encrypted', 'secret_key_encrypted', 'restic_password_encrypted'] as $secretField) {
             $row[$secretField] = $row[$secretField] === null ? null : Runtime::decryptSecret($row[$secretField], $env);
         }
         $row['id'] = $row['organization_id']; $row['org_id'] = $row['organization_id']; $row['schedule_enabled'] = (bool)$row['schedule_enabled'];
+        header('Cache-Control: no-store');
         Runtime::respond(200, ['config' => $row]);
     }
     if ($path === '/backup/config' && in_array($method, ['GET', 'PUT'], true)) {
@@ -531,13 +534,13 @@ try {
     if ($path === '/backup/designate' && in_array($method, ['POST', 'DELETE'], true)) {
         if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
         if ($method === 'DELETE') {
-            $db->prepare('UPDATE backup_config SET designated_machine_id = NULL, designated_machine_name = NULL, designated_machine_platform = NULL, designated_machine_user_email = NULL, designated_machine_last_seen = NULL, updated_at = UTC_TIMESTAMP(3) WHERE organization_id = ?')->execute([$principal['organizationId']]);
+            $db->prepare('UPDATE backup_config SET designated_machine_id = NULL, designated_machine_name = NULL, designated_machine_platform = NULL, designated_machine_user_email = NULL, designated_machine_proof_hash = NULL, designated_machine_last_seen = NULL, updated_at = UTC_TIMESTAMP(3) WHERE organization_id = ?')->execute([$principal['organizationId']]);
             Runtime::respond(200, ['success' => true]);
         }
         $body = Runtime::jsonBody();
-        foreach (['machineId', 'machineName', 'platform', 'userEmail'] as $key) if (!is_string($body[$key] ?? null) || trim($body[$key]) === '' || strlen($body[$key]) > 320) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Valid machine details are required.']);
+        foreach (['machineId', 'machineName', 'platform', 'userEmail', 'machineProof'] as $key) if (!is_string($body[$key] ?? null) || trim($body[$key]) === '' || strlen($body[$key]) > 512) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Valid machine details are required.']);
         $db->prepare('INSERT INTO backup_config (organization_id) VALUES (?) ON DUPLICATE KEY UPDATE organization_id=organization_id')->execute([$principal['organizationId']]);
-        $db->prepare('UPDATE backup_config SET designated_machine_id = ?, designated_machine_name = ?, designated_machine_platform = ?, designated_machine_user_email = ?, designated_machine_last_seen = UTC_TIMESTAMP(3), updated_at = UTC_TIMESTAMP(3) WHERE organization_id = ?')->execute([trim($body['machineId']), trim($body['machineName']), trim($body['platform']), strtolower(trim($body['userEmail'])), $principal['organizationId']]);
+        $db->prepare('UPDATE backup_config SET designated_machine_id = ?, designated_machine_name = ?, designated_machine_platform = ?, designated_machine_user_email = ?, designated_machine_proof_hash = ?, designated_machine_last_seen = UTC_TIMESTAMP(3), updated_at = UTC_TIMESTAMP(3) WHERE organization_id = ?')->execute([trim($body['machineId']), trim($body['machineName']), trim($body['platform']), strtolower(trim($body['userEmail'])), hash('sha256', trim($body['machineProof'])), $principal['organizationId']]);
         Runtime::respond(200, ['success' => true]);
     }
     if ($method === 'POST' && in_array($path, ['/backup/request', '/backup/start', '/backup/complete', '/backup/heartbeat'], true)) {
