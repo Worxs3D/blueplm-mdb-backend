@@ -17,6 +17,40 @@ use BluePlm\Totp;
 
 const BLUEPLM_API_VERSION = 2;
 
+function supplierText(array $body, string $key, int $max, bool $required = false): ?string
+{
+    if (!array_key_exists($key, $body) || $body[$key] === null) {
+        if ($required) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => "$key is required."]);
+        return null;
+    }
+    if (!is_string($body[$key])) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => "$key must be a string."]);
+    $value = trim($body[$key]);
+    if ($required && $value === '') Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => "$key is required."]);
+    if (strlen($value) > $max) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => "$key is too long."]);
+    return $value === '' ? null : $value;
+}
+
+function supplierBoolean(array $body, string $key, bool $default): bool
+{
+    if (!array_key_exists($key, $body)) return $default;
+    if (!is_bool($body[$key])) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => "$key must be a boolean."]);
+    return $body[$key];
+}
+
+function supplierEmail(array $body, string $key): ?string
+{
+    $value = supplierText($body, $key, 320);
+    if ($value !== null && filter_var($value, FILTER_VALIDATE_EMAIL) === false) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => "$key must be a valid email."]);
+    return $value;
+}
+
+function supplierUrl(array $body, string $key): ?string
+{
+    $value = supplierText($body, $key, 2048);
+    if ($value !== null && filter_var($value, FILTER_VALIDATE_URL) === false) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => "$key must be a valid URL."]);
+    return $value;
+}
+
 /** @return array<string, mixed> */
 function decodeOrganizationSetting(mixed $value): array
 {
@@ -1684,7 +1718,57 @@ try {
         $id = Runtime::uuid(); $db->prepare('INSERT INTO vaults (id, organization_id, name, network_root) VALUES (?, ?, ?, ?)')->execute([$id, $principal['organizationId'], $name, $networkRoot]); Runtime::respond(201, ['id' => $id, 'name' => $name, 'networkRoot' => $networkRoot, 'storageProvider' => 'network', 'createdAt' => gmdate('c')]);
     }
     if ($method === 'GET' && $path === '/suppliers') {
-        $query = $db->prepare('SELECT id, name, code, contact_email, contact_phone, website, city, state, country, is_active, is_approved, erp_id, erp_synced_at, created_at FROM suppliers WHERE organization_id = ? ORDER BY is_active DESC, name'); $query->execute([$principal['organizationId']]); $rows = $query->fetchAll(); foreach ($rows as &$row) { $row['is_active'] = (bool)$row['is_active']; $row['is_approved'] = (bool)$row['is_approved']; } unset($row); Runtime::respond(200, ['suppliers' => $rows]);
+        $query = $db->prepare('SELECT id, name, code, contact_email, contact_phone, website, city, state, country, is_active, is_approved, erp_id, erp_synced_at, created_at FROM suppliers WHERE organization_id = ? AND is_active = TRUE ORDER BY name');
+        $query->execute([$principal['organizationId']]); $rows = $query->fetchAll();
+        foreach ($rows as &$row) { $row['is_active'] = (bool)$row['is_active']; $row['is_approved'] = (bool)$row['is_approved']; } unset($row);
+        Runtime::respond(200, ['suppliers' => $rows]);
+    }
+    if ($method === 'POST' && $path === '/suppliers') {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $body = Runtime::jsonBody();
+        $name = supplierText($body, 'name', 255, true);
+        $code = supplierText($body, 'code', 128);
+        $contactEmail = supplierEmail($body, 'contactEmail');
+        $contactPhone = supplierText($body, 'contactPhone', 128);
+        $website = supplierUrl($body, 'website');
+        $city = supplierText($body, 'city', 128); $state = supplierText($body, 'state', 128); $country = supplierText($body, 'country', 128);
+        $erpId = supplierText($body, 'erpId', 255);
+        $id = Runtime::uuid();
+        try {
+            $db->prepare('INSERT INTO suppliers (id, organization_id, name, code, contact_email, contact_phone, website, city, state, country, is_active, is_approved, erp_id, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')->execute([
+                $id, $principal['organizationId'], $name, $code, $contactEmail, $contactPhone, $website, $city, $state, $country,
+                supplierBoolean($body, 'isActive', true) ? 1 : 0, supplierBoolean($body, 'isApproved', false) ? 1 : 0, $erpId,
+                $principal['userId'],
+            ]);
+        } catch (PDOException $error) {
+            if ($error->getCode() === '23000') Runtime::respond(409, ['error' => 'ALREADY_EXISTS', 'message' => 'Supplier code already exists in this organization.']);
+            throw $error;
+        }
+        $query = $db->prepare('SELECT id, name, code, contact_email, contact_phone, website, city, state, country, is_active, is_approved, erp_id, erp_synced_at, created_at FROM suppliers WHERE id = ? AND organization_id = ?'); $query->execute([$id, $principal['organizationId']]); $row = $query->fetch(); $row['is_active'] = (bool)$row['is_active']; $row['is_approved'] = (bool)$row['is_approved']; Runtime::respond(201, ['supplier' => $row]);
+    }
+    if ($method === 'PATCH' && preg_match('#^/suppliers/([0-9a-f-]{36})$#i', $path, $matches)) {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $body = Runtime::jsonBody();
+        $sets = []; $values = [];
+        $textFields = ['name' => ['name', 255, true], 'code' => ['code', 128, false], 'contactPhone' => ['contact_phone', 128, false], 'city' => ['city', 128, false], 'state' => ['state', 128, false], 'country' => ['country', 128, false], 'erpId' => ['erp_id', 255, false]];
+        foreach ($textFields as $input => [$column, $max, $required]) if (array_key_exists($input, $body)) { $sets[] = "$column = ?"; $values[] = supplierText($body, $input, $max, $required); }
+        if (array_key_exists('contactEmail', $body)) { $sets[] = 'contact_email = ?'; $values[] = supplierEmail($body, 'contactEmail'); }
+        if (array_key_exists('website', $body)) { $sets[] = 'website = ?'; $values[] = supplierUrl($body, 'website'); }
+        foreach (['isActive' => 'is_active', 'isApproved' => 'is_approved'] as $input => $column) if (array_key_exists($input, $body)) { $sets[] = "$column = ?"; $values[] = supplierBoolean($body, $input, false) ? 1 : 0; }
+        if (!$sets) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'At least one supplier field is required.']);
+        $exists = $db->prepare('SELECT 1 FROM suppliers WHERE id = ? AND organization_id = ?'); $exists->execute([$matches[1], $principal['organizationId']]);
+        if (!$exists->fetchColumn()) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Supplier not found.']);
+        $values[] = $matches[1]; $values[] = $principal['organizationId'];
+        try { $db->prepare('UPDATE suppliers SET ' . implode(', ', $sets) . ' WHERE id = ? AND organization_id = ?')->execute($values); } catch (PDOException $error) { if ($error->getCode() === '23000') Runtime::respond(409, ['error' => 'ALREADY_EXISTS', 'message' => 'Supplier code already exists in this organization.']); throw $error; }
+        $query = $db->prepare('SELECT id, name, code, contact_email, contact_phone, website, city, state, country, is_active, is_approved, erp_id, erp_synced_at, created_at FROM suppliers WHERE id = ? AND organization_id = ?'); $query->execute([$matches[1], $principal['organizationId']]); $row = $query->fetch(); $row['is_active'] = (bool)$row['is_active']; $row['is_approved'] = (bool)$row['is_approved']; Runtime::respond(200, ['supplier' => $row]);
+    }
+    if ($method === 'DELETE' && preg_match('#^/suppliers/([0-9a-f-]{36})$#i', $path, $matches)) {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        // Deactivate instead of deleting: part_suppliers keeps its historical
+        // assignment and the foreign-key relationship remains intact.
+        $query = $db->prepare('UPDATE suppliers SET is_active = FALSE WHERE id = ? AND organization_id = ?'); $query->execute([$matches[1], $principal['organizationId']]);
+        if ($query->rowCount() === 0) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Supplier not found.']);
+        Runtime::respond(204);
     }
     if ($method === 'GET' && preg_match('#^/files/([0-9a-f-]{36})/suppliers$#i', $path, $matches)) {
         $file = $db->prepare('SELECT vault_id FROM files WHERE id = ? AND organization_id = ? AND deleted_at IS NULL'); $file->execute([$matches[1], $principal['organizationId']]); $fileRow = $file->fetch(); if (!$fileRow) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'File not found.']); Runtime::requireVault($db, $principal, $fileRow['vault_id']);
