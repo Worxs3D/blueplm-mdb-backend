@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { createHmac, generateKeyPairSync, sign } from 'node:crypto'
+import { createHmac, generateKeyPairSync, randomUUID, sign } from 'node:crypto'
 import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -545,6 +545,21 @@ const backupRow = execFileSync('docker', [
 ], { cwd: process.cwd(), encoding: 'utf8' }).trim().split('\t')
 assert.equal(backupRow[0], backupPrincipal.userId)
 assert.notEqual(backupRow[1], 'cipher-secret')
+const foreignOrgId = randomUUID()
+const foreignPassword = 'Foreign backup password 123!'
+const foreignUser = await request('/users', {
+  method: 'POST',
+  body: JSON.stringify({ email: 'foreign-backup-owner@example.test', displayName: 'Foreign Backup Owner', password: foreignPassword, role: 'admin' }),
+}, token)
+const foreignSql = `INSERT INTO organizations (id, name, slug) VALUES ('${foreignOrgId}', 'Foreign Backup Org', 'foreign-backup-org'); DELETE FROM organization_memberships WHERE user_id = '${foreignUser.id}'; INSERT INTO organization_memberships (organization_id, user_id, role) VALUES ('${foreignOrgId}', '${foreignUser.id}', 'admin');`
+execFileSync('docker', [
+  'compose', '-f', 'docker-compose.test.yml', 'exec', '-T', 'mariadb',
+  'mariadb', '-ublueplm', '-pblueplm-test-password', 'blueplm', '-e', foreignSql,
+], { cwd: process.cwd(), stdio: 'pipe' })
+const foreignLogin = await request('/auth/login', {
+  method: 'POST',
+  body: JSON.stringify({ email: 'foreign-backup-owner@example.test', password: foreignPassword }),
+})
 assert.equal((await requestStatus('/backup/device/challenge', {
   method: 'POST', body: JSON.stringify({ deviceId: 'integration-machine', endpoint: 'heartbeat' }),
 }, foreignLogin.token)).status, 403)
