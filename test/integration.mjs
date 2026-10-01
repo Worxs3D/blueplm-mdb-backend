@@ -312,6 +312,80 @@ const updatedMemberLogin = await request('/auth/login', {
 })
 assert.equal(typeof updatedMemberLogin.token, 'string')
 
+// Sidebar module defaults are an MDB organization contract.  The owner can
+// persist and read them, while a regular member cannot mutate the org record.
+const moduleDefaults = {
+  enabled_modules: { explorer: true, history: false },
+  enabled_groups: {},
+  module_order: ['explorer', 'history'],
+  dividers: [],
+  module_parents: {},
+  module_icon_colors: {},
+  custom_groups: [],
+}
+await request('/organizations/current/settings/modules', {
+  method: 'PUT',
+  body: JSON.stringify({ value: moduleDefaults }),
+}, token)
+const storedModuleDefaults = await request('/organizations/current/settings/modules', {}, token)
+assert.equal(storedModuleDefaults.value.enabled_modules.history, false)
+assert.equal((await requestStatus('/organizations/current/settings/modules', {
+  method: 'PUT',
+  body: JSON.stringify({ value: moduleDefaults }),
+}, updatedMemberLogin.token)).status, 403)
+// Supplier CRUD is tenant-scoped and role-gated. The list endpoint exposes
+// active records only; deactivation keeps historical part assignments intact.
+const supplier = await request('/suppliers', {
+  method: 'POST',
+  body: JSON.stringify({ name: 'Integration Supplier', code: 'INT-SUP-1', contactEmail: 'supplier@example.test', website: 'https://supplier.example.test', isActive: true, isApproved: false }),
+}, token)
+assert.equal(supplier.supplier.code, 'INT-SUP-1')
+assert.equal(supplier.supplier.is_active, true)
+assert.equal((await request('/suppliers', {}, token)).suppliers.some((entry) => entry.id === supplier.supplier.id), true)
+const updatedSupplier = await request(`/suppliers/${supplier.supplier.id}`, {
+  method: 'PATCH',
+  body: JSON.stringify({ city: 'Berlin', isApproved: true }),
+}, token)
+assert.equal(updatedSupplier.supplier.city, 'Berlin')
+assert.equal(updatedSupplier.supplier.is_approved, true)
+assert.equal((await requestStatus('/suppliers', { method: 'POST', body: JSON.stringify({ name: 'Denied Supplier' }) }, updatedMemberLogin.token)).status, 403)
+assert.equal((await requestStatus(`/suppliers/${supplier.supplier.id}`, { method: 'PATCH', body: JSON.stringify({ name: 'Denied Update' }) }, updatedMemberLogin.token)).status, 403)
+assert.equal((await requestStatus(`/suppliers/${supplier.supplier.id}`, { method: 'DELETE' }, updatedMemberLogin.token)).status, 403)
+assert.equal((await requestStatus(`/suppliers/${supplier.supplier.id}`, { method: 'PATCH', body: JSON.stringify({ isApproved: 'false' }) }, token)).status, 400)
+assert.equal((await requestStatus('/suppliers', { method: 'POST', body: JSON.stringify({ name: 'Duplicate Supplier', code: 'INT-SUP-1' }) }, token)).status, 409)
+assert.equal((await requestStatus(`/suppliers/00000000-0000-0000-0000-000000000000`, {}, token)).status, 404)
+await request(`/suppliers/${supplier.supplier.id}`, { method: 'DELETE' }, token)
+assert.equal((await request('/suppliers', {}, token)).suppliers.some((entry) => entry.id === supplier.supplier.id), false)
+
+// Seed a second organization through the test database fixture and obtain a
+// real admin session. This proves supplier reads and mutations remain tenant
+// isolated rather than merely returning 404 for an arbitrary UUID.
+const foreignOrgId = randomUUID()
+const foreignPassword = 'Foreign supplier password 123!'
+const foreignUser = await request('/users', {
+  method: 'POST',
+  body: JSON.stringify({ email: 'foreign-owner@example.test', displayName: 'Foreign Owner', password: foreignPassword, role: 'admin' }),
+}, token)
+const foreignSql = `INSERT INTO organizations (id, name, slug) VALUES ('${foreignOrgId}', 'Foreign Org', 'foreign-org'); DELETE FROM organization_memberships WHERE user_id = '${foreignUser.id}'; INSERT INTO organization_memberships (organization_id, user_id, role) VALUES ('${foreignOrgId}', '${foreignUser.id}', 'admin');`
+execFileSync('docker', [
+  'compose', '-f', 'docker-compose.test.yml', 'exec', '-T', 'mariadb',
+  'mariadb', '-ublueplm', '-pblueplm-test-password', 'blueplm', '-e', foreignSql,
+], { cwd: process.cwd(), stdio: 'pipe' })
+const foreignLogin = await request('/auth/login', {
+  method: 'POST',
+  body: JSON.stringify({ email: 'foreign-owner@example.test', password: foreignPassword }),
+})
+const foreignSupplier = await request('/suppliers', {
+  method: 'POST',
+  body: JSON.stringify({ name: 'Foreign Supplier', code: 'FOREIGN-1', isActive: true }),
+}, foreignLogin.token)
+assert.equal(foreignSupplier.supplier.name, 'Foreign Supplier')
+assert.equal((await request('/suppliers', {}, token)).suppliers.some((entry) => entry.id === foreignSupplier.supplier.id), false)
+assert.equal((await requestStatus(`/suppliers/${foreignSupplier.supplier.id}`, { method: 'PATCH', body: JSON.stringify({ name: 'Cross Org Update' }) }, token)).status, 404)
+assert.equal((await requestStatus(`/suppliers/${foreignSupplier.supplier.id}`, { method: 'DELETE' }, token)).status, 404)
+const foreignAfterIsolationCheck = await request('/suppliers', {}, foreignLogin.token)
+assert.equal(foreignAfterIsolationCheck.suppliers.some((entry) => entry.id === foreignSupplier.supplier.id && entry.name === 'Foreign Supplier'), true)
+
 // Workflow roles are separate organization data. Account roles must not create
 // or imply workflow-role assignments, and only organization administrators may
 // edit the role catalog or assignments.
@@ -365,6 +439,34 @@ const createdTeam = await request(
   token,
 )
 assert.equal(createdTeam.name, 'Integration Team')
+const teamDefaults = { enabled_modules: { explorer: true }, module_order: ['explorer'] }
+assert.equal((await requestStatus(`/teams/${createdTeam.id}/module-defaults`, {
+  method: 'PUT', body: JSON.stringify({ defaults: 'invalid' }),
+}, token)).status, 400)
+const savedTeamDefaults = await request(`/teams/${createdTeam.id}/module-defaults`, {
+  method: 'PUT',
+  body: JSON.stringify({ defaults: teamDefaults }),
+}, token)
+assert.equal(savedTeamDefaults.success, true)
+execFileSync('docker', [
+  'compose', '-f', 'docker-compose.test.yml', 'exec', '-T', 'mariadb',
+  'mariadb', '-uroot', '-proot-test-password', '-e',
+  "SET GLOBAL sql_mode = CONCAT(@@GLOBAL.sql_mode, ',ONLY_FULL_GROUP_BY')",
+], { cwd: process.cwd(), stdio: 'pipe' })
+const teamsWithDefaults = await request('/teams', {}, token)
+assert.deepEqual(
+  teamsWithDefaults.teams.find((team) => team.id === createdTeam.id)?.module_defaults,
+  teamDefaults,
+)
+assert.deepEqual((await request(`/teams/${createdTeam.id}/module-defaults`, {}, token)).defaults, teamDefaults)
+assert.equal((await requestStatus(`/teams/${createdTeam.id}/module-defaults`, {
+  method: 'PUT', body: JSON.stringify({ defaults: teamDefaults }),
+}, updatedMemberLogin.token)).status, 403)
+assert.equal((await requestStatus(`/teams/${createdTeam.id}/module-defaults`, {
+  method: 'DELETE',
+}, updatedMemberLogin.token)).status, 403)
+await request(`/teams/${createdTeam.id}/module-defaults`, { method: 'DELETE' }, token)
+assert.equal((await request(`/teams/${createdTeam.id}/module-defaults`, {}, token)).defaults, null)
 const teams = await request('/teams', {}, token)
 assert.ok(teams.teams.some((team) => team.id === createdTeam.id && team.memberCount === 0))
 const updatedTeam = await request(
@@ -545,24 +647,24 @@ const backupRow = execFileSync('docker', [
 ], { cwd: process.cwd(), encoding: 'utf8' }).trim().split('\t')
 assert.equal(backupRow[0], backupPrincipal.userId)
 assert.notEqual(backupRow[1], 'cipher-secret')
-const foreignOrgId = randomUUID()
-const foreignPassword = 'Foreign backup password 123!'
-const foreignUser = await request('/users', {
+const foreignBackupOrgId = randomUUID()
+const foreignBackupPassword = 'Foreign backup password 123!'
+const foreignBackupUser = await request('/users', {
   method: 'POST',
-  body: JSON.stringify({ email: 'foreign-backup-owner@example.test', displayName: 'Foreign Backup Owner', password: foreignPassword, role: 'admin' }),
+  body: JSON.stringify({ email: 'foreign-backup-owner@example.test', displayName: 'Foreign Backup Owner', password: foreignBackupPassword, role: 'admin' }),
 }, token)
-const foreignSql = `INSERT INTO organizations (id, name, slug) VALUES ('${foreignOrgId}', 'Foreign Backup Org', 'foreign-backup-org'); DELETE FROM organization_memberships WHERE user_id = '${foreignUser.id}'; INSERT INTO organization_memberships (organization_id, user_id, role) VALUES ('${foreignOrgId}', '${foreignUser.id}', 'admin');`
+const foreignBackupSql = `INSERT INTO organizations (id, name, slug) VALUES ('${foreignBackupOrgId}', 'Foreign Backup Org', 'foreign-backup-org'); DELETE FROM organization_memberships WHERE user_id = '${foreignBackupUser.id}'; INSERT INTO organization_memberships (organization_id, user_id, role) VALUES ('${foreignBackupOrgId}', '${foreignBackupUser.id}', 'admin');`
 execFileSync('docker', [
   'compose', '-f', 'docker-compose.test.yml', 'exec', '-T', 'mariadb',
-  'mariadb', '-ublueplm', '-pblueplm-test-password', 'blueplm', '-e', foreignSql,
+  'mariadb', '-ublueplm', '-pblueplm-test-password', 'blueplm', '-e', foreignBackupSql,
 ], { cwd: process.cwd(), stdio: 'pipe' })
-const foreignLogin = await request('/auth/login', {
+const foreignBackupLogin = await request('/auth/login', {
   method: 'POST',
-  body: JSON.stringify({ email: 'foreign-backup-owner@example.test', password: foreignPassword }),
+  body: JSON.stringify({ email: 'foreign-backup-owner@example.test', password: foreignBackupPassword }),
 })
 assert.equal((await requestStatus('/backup/device/challenge', {
   method: 'POST', body: JSON.stringify({ deviceId: 'integration-machine', endpoint: 'heartbeat' }),
-}, foreignLogin.token)).status, 403)
+}, foreignBackupLogin.token)).status, 403)
 const preRotation = await signedBackupAction('complete')
 const rotatedKey = generateKeyPairSync('ed25519')
 await request('/backup/designate', {
@@ -895,6 +997,74 @@ assert.deepEqual(
   [{ partNumber: 'PN-00042', filePath: 'drawing.txt' }],
 )
 assert.equal((await request(`/vaults/${vault.id}/files`, {}, token)).files[0].partNumber, 'PN-00042')
+
+// Workflow runtime is a two-step client contract: the available-transition
+// lookup and the action it enables must both be tenant/vault scoped. Seed a
+// minimal assignment through the test database so this exercises the real
+// authenticated PHP routes rather than only checking route source text.
+const workflowId = randomUUID()
+const fromStateId = randomUUID()
+const toStateId = randomUUID()
+const transitionId = randomUUID()
+const workflowPrincipal = await request('/auth/me', {}, token)
+const workflowSql = [
+  `INSERT INTO workflow_templates (id, organization_id, name, created_by) VALUES ('${workflowId}', '${workflowPrincipal.user.organizationId}', 'Integration Workflow', '${workflowPrincipal.user.userId}')`,
+  `INSERT INTO workflow_states (id, workflow_id, name, label) VALUES ('${fromStateId}', '${workflowId}', 'Draft', 'Draft'), ('${toStateId}', '${workflowId}', 'Released', 'Released')`,
+  `INSERT INTO workflow_transitions (id, workflow_id, from_state_id, to_state_id, name, waypoints) VALUES ('${transitionId}', '${workflowId}', '${fromStateId}', '${toStateId}', 'Release', '[]')`,
+  `INSERT INTO file_workflow_assignments (id, file_id, workflow_id, current_state_id, assigned_by) VALUES ('${randomUUID()}', '${imported.id}', '${workflowId}', '${fromStateId}', '${workflowPrincipal.user.userId}')`,
+].join('; ')
+execFileSync('docker', [
+  'compose', '-f', 'docker-compose.test.yml', 'exec', '-T', 'mariadb',
+  'mariadb', '-ublueplm', '-pblueplm-test-password', 'blueplm', '-e', workflowSql,
+], { cwd: process.cwd(), stdio: 'pipe' })
+const availableTransitions = await request(`/files/${imported.id}/available-transitions`, {}, token)
+assert.equal(availableTransitions.transitions.length, 1)
+assert.deepEqual(Object.keys(availableTransitions.transitions[0]).sort(), [
+  'has_gates', 'to_state_color', 'to_state_id', 'to_state_name', 'transition_id',
+  'transition_name', 'user_can_transition',
+].sort())
+assert.equal(availableTransitions.transitions[0].transition_id, transitionId)
+assert.equal(availableTransitions.transitions[0].user_can_transition, true)
+const transitionResult = await request(`/files/${imported.id}/workflow-transitions/${transitionId}/execute`, {
+  method: 'POST',
+  body: JSON.stringify({ comment: 'integration transition' }),
+}, token)
+assert.equal(transitionResult.result.success, true)
+assert.equal(transitionResult.result.new_state_id, toStateId)
+const staleTransition = await fetch(`${server}/files/${imported.id}/workflow-transitions/${transitionId}/execute`, {
+  method: 'POST',
+  headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+  body: JSON.stringify({}),
+})
+assert.equal(staleTransition.status, 409)
+
+const restrictedStateId = randomUUID()
+const restrictedTransitionId = randomUUID()
+const memberTargetStateId = randomUUID()
+const memberTransitionId = randomUUID()
+const restrictedRoleId = randomUUID()
+const restrictedSql = [
+  `INSERT INTO workflow_states (id, workflow_id, name, label) VALUES ('${restrictedStateId}', '${workflowId}', 'Restricted', 'Restricted'), ('${memberTargetStateId}', '${workflowId}', 'Member target', 'Member target')`,
+  `INSERT INTO workflow_roles (id, org_id, name) VALUES ('${restrictedRoleId}', '${workflowPrincipal.user.organizationId}', 'Release approver')`,
+  `INSERT INTO workflow_transitions (id, workflow_id, from_state_id, to_state_id, name, allowed_workflow_roles, waypoints) VALUES ('${restrictedTransitionId}', '${workflowId}', '${toStateId}', '${restrictedStateId}', 'Restricted release', '["${restrictedRoleId}"]', '[]')`,
+  `INSERT INTO workflow_transitions (id, workflow_id, from_state_id, to_state_id, name, allowed_workflow_roles, waypoints) VALUES ('${memberTransitionId}', '${workflowId}', '${restrictedStateId}', '${memberTargetStateId}', 'Member restricted release', '["${restrictedRoleId}"]', '[]')`,
+].join('; ')
+execFileSync('docker', [
+  'compose', '-f', 'docker-compose.test.yml', 'exec', '-T', 'mariadb',
+  'mariadb', '-ublueplm', '-pblueplm-test-password', 'blueplm', '-e', restrictedSql,
+], { cwd: process.cwd(), stdio: 'pipe' })
+const restrictedExecution = await fetch(`${server}/files/${imported.id}/workflow-transitions/${restrictedTransitionId}/execute`, {
+  method: 'POST',
+  headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+  body: JSON.stringify({}),
+})
+assert.equal(restrictedExecution.status, 200)
+const memberRestrictedExecution = await fetch(`${server}/files/${imported.id}/workflow-transitions/${memberTransitionId}/execute`, {
+  method: 'POST',
+  headers: { Authorization: `Bearer ${updatedMemberLogin.token}`, 'Content-Type': 'application/json' },
+  body: JSON.stringify({}),
+})
+assert.equal(memberRestrictedExecution.status, 403)
 const legacyFile = await request(
   '/files/import',
   {

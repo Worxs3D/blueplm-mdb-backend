@@ -22,8 +22,19 @@ before changing it:
 - **Empty database:** BluePLM offers a new installation.
 - **Versioned BluePLM database:** BluePLM asks whether to migrate it in place or
   erase it and reinstall. Migration preserves existing records.
-- **Legacy BluePLM schema or foreign tables:** automatic migration is blocked.
-  Only an explicitly confirmed erase-and-reinstall operation is available.
+- **Recognized legacy BluePLM schema:** BluePLM can adopt the database by
+  creating the migration ledger and applying the known migrations that are not
+  recorded there. Adoption-aware migrations inspect existing schema objects
+  before adding missing ones; for example, the module-default migration accepts
+  both complete and partial sets of its team and organization columns without
+  replacing existing values.
+- **Foreign or unrecognized schema:** automatic migration remains blocked. An
+  explicitly confirmed erase-and-reinstall operation or manual remediation is
+  required.
+
+Legacy adoption applies only to schema shapes supported by the bundled BluePLM
+migrations. It is not a general repair mechanism and does not guarantee that an
+arbitrarily modified or unrelated database can be migrated safely.
 
 Erasing requires the exact confirmation `DELETE ALL DATABASE DATA`. The server
 checks the database state again immediately before committing, so a stale UI
@@ -70,6 +81,7 @@ network vault operations, and the removal of browser setup/admin pages.
 docker compose -f docker-compose.test.yml up --build -d
 node test/integration.mjs
 docker compose -f docker-compose.test.yml exec -T api php test/database-lifecycle.php
+docker compose -f docker-compose.test.yml exec -T api php test/module-defaults-migration.php
 docker compose -f docker-compose.test.yml down -v
 ```
 
