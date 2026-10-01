@@ -7,6 +7,7 @@ require dirname(__DIR__) . '/src/FileReferences.php';
 require dirname(__DIR__) . '/src/Totp.php';
 require dirname(__DIR__) . '/src/Installation.php';
 require dirname(__DIR__) . '/src/DatabaseLifecycle.php';
+require dirname(__DIR__) . '/src/BundleManifest.php';
 
 use BluePlm\Migrator;
 use BluePlm\FileReferences;
@@ -14,6 +15,7 @@ use BluePlm\Installation;
 use BluePlm\Runtime;
 use BluePlm\DatabaseLifecycle;
 use BluePlm\Totp;
+use BluePlm\BundleManifest;
 
 const BLUEPLM_API_VERSION = 2;
 
@@ -281,16 +283,24 @@ if (in_array($path, ['/installer/database-status', '/installer/commit'], true)) 
     }
 }
 
-$env = Runtime::env($root . '/.env');
+$environmentRoot = is_string($_SERVER['BLUEPLM_LIVE_ROOT'] ?? null)
+    ? rtrim($_SERVER['BLUEPLM_LIVE_ROOT'], '/\\')
+    : $root;
+$env = Runtime::env($environmentRoot . '/.env');
 Runtime::sendCors($env);
 if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'OPTIONS') Runtime::respond(204);
 
 try {
+    $manifest = BundleManifest::read($root);
     if ($path === '/health') Runtime::respond(200, [
         'ok' => true,
         'runtime' => 'php',
         'supabase' => false,
         'apiVersion' => BLUEPLM_API_VERSION,
+        'bundleVersion' => $manifest['version'] ?? null,
+        'bundleReleaseVersion' => $manifest['releaseVersion'] ?? null,
+        'bundleDigest' => $manifest['digest'] ?? null,
+        'bundleFileCount' => $manifest['fileCount'] ?? null,
     ]);
     $db = Runtime::database($env);
 

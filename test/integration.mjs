@@ -81,6 +81,11 @@ async function waitForHealth() {
     try {
       const health = await request('/health')
       if (health.ok === true && health.supabase === false && health.apiVersion === 2) {
+        // A fresh/legacy deployment has no identity until the desktop installer
+        // publishes one; clients must classify this as unknown, never current.
+        assert.equal(health.bundleDigest, null)
+        assert.equal(health.bundleVersion, null)
+        assert.equal(health.bundleReleaseVersion, null)
         const databaseProbe = await fetch(`${server}/installer/database-status`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -121,6 +126,11 @@ const installed = await request('/installer/commit', {
 })
 assert.equal(typeof installed.token, 'string')
 assert.equal(installed.bootstrapped, true)
+const rejectedMaintenance = await requestStatus('/admin/migrate', {
+  method: 'POST',
+  body: JSON.stringify({ maintenanceToken: 'wrong-maintenance-token' }),
+})
+assert.equal(rejectedMaintenance.status, 403)
 const login = await request('/auth/login', {
   method: 'POST',
   body: JSON.stringify({ email: 'owner@example.test', password }),
