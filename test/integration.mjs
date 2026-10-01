@@ -854,6 +854,74 @@ assert.deepEqual(
   [{ partNumber: 'PN-00042', filePath: 'drawing.txt' }],
 )
 assert.equal((await request(`/vaults/${vault.id}/files`, {}, token)).files[0].partNumber, 'PN-00042')
+
+// Workflow runtime is a two-step client contract: the available-transition
+// lookup and the action it enables must both be tenant/vault scoped. Seed a
+// minimal assignment through the test database so this exercises the real
+// authenticated PHP routes rather than only checking route source text.
+const workflowId = randomUUID()
+const fromStateId = randomUUID()
+const toStateId = randomUUID()
+const transitionId = randomUUID()
+const workflowPrincipal = await request('/auth/me', {}, token)
+const workflowSql = [
+  `INSERT INTO workflow_templates (id, organization_id, name, created_by) VALUES ('${workflowId}', '${workflowPrincipal.user.organizationId}', 'Integration Workflow', '${workflowPrincipal.user.userId}')`,
+  `INSERT INTO workflow_states (id, workflow_id, name, label) VALUES ('${fromStateId}', '${workflowId}', 'Draft', 'Draft'), ('${toStateId}', '${workflowId}', 'Released', 'Released')`,
+  `INSERT INTO workflow_transitions (id, workflow_id, from_state_id, to_state_id, name, waypoints) VALUES ('${transitionId}', '${workflowId}', '${fromStateId}', '${toStateId}', 'Release', '[]')`,
+  `INSERT INTO file_workflow_assignments (id, file_id, workflow_id, current_state_id, assigned_by) VALUES ('${randomUUID()}', '${imported.id}', '${workflowId}', '${fromStateId}', '${workflowPrincipal.user.userId}')`,
+].join('; ')
+execFileSync('docker', [
+  'compose', '-f', 'docker-compose.test.yml', 'exec', '-T', 'mariadb',
+  'mariadb', '-ublueplm', '-pblueplm-test-password', 'blueplm', '-e', workflowSql,
+], { cwd: process.cwd(), stdio: 'pipe' })
+const availableTransitions = await request(`/files/${imported.id}/available-transitions`, {}, token)
+assert.equal(availableTransitions.transitions.length, 1)
+assert.deepEqual(Object.keys(availableTransitions.transitions[0]).sort(), [
+  'has_gates', 'to_state_color', 'to_state_id', 'to_state_name', 'transition_id',
+  'transition_name', 'user_can_transition',
+].sort())
+assert.equal(availableTransitions.transitions[0].transition_id, transitionId)
+assert.equal(availableTransitions.transitions[0].user_can_transition, true)
+const transitionResult = await request(`/files/${imported.id}/workflow-transitions/${transitionId}/execute`, {
+  method: 'POST',
+  body: JSON.stringify({ comment: 'integration transition' }),
+}, token)
+assert.equal(transitionResult.result.success, true)
+assert.equal(transitionResult.result.new_state_id, toStateId)
+const staleTransition = await fetch(`${server}/files/${imported.id}/workflow-transitions/${transitionId}/execute`, {
+  method: 'POST',
+  headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+  body: JSON.stringify({}),
+})
+assert.equal(staleTransition.status, 409)
+
+const restrictedStateId = randomUUID()
+const restrictedTransitionId = randomUUID()
+const memberTargetStateId = randomUUID()
+const memberTransitionId = randomUUID()
+const restrictedRoleId = randomUUID()
+const restrictedSql = [
+  `INSERT INTO workflow_states (id, workflow_id, name, label) VALUES ('${restrictedStateId}', '${workflowId}', 'Restricted', 'Restricted'), ('${memberTargetStateId}', '${workflowId}', 'Member target', 'Member target')`,
+  `INSERT INTO workflow_roles (id, org_id, name) VALUES ('${restrictedRoleId}', '${workflowPrincipal.user.organizationId}', 'Release approver')`,
+  `INSERT INTO workflow_transitions (id, workflow_id, from_state_id, to_state_id, name, allowed_workflow_roles, waypoints) VALUES ('${restrictedTransitionId}', '${workflowId}', '${toStateId}', '${restrictedStateId}', 'Restricted release', '["${restrictedRoleId}"]', '[]')`,
+  `INSERT INTO workflow_transitions (id, workflow_id, from_state_id, to_state_id, name, allowed_workflow_roles, waypoints) VALUES ('${memberTransitionId}', '${workflowId}', '${restrictedStateId}', '${memberTargetStateId}', 'Member restricted release', '["${restrictedRoleId}"]', '[]')`,
+].join('; ')
+execFileSync('docker', [
+  'compose', '-f', 'docker-compose.test.yml', 'exec', '-T', 'mariadb',
+  'mariadb', '-ublueplm', '-pblueplm-test-password', 'blueplm', '-e', restrictedSql,
+], { cwd: process.cwd(), stdio: 'pipe' })
+const restrictedExecution = await fetch(`${server}/files/${imported.id}/workflow-transitions/${restrictedTransitionId}/execute`, {
+  method: 'POST',
+  headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+  body: JSON.stringify({}),
+})
+assert.equal(restrictedExecution.status, 200)
+const memberRestrictedExecution = await fetch(`${server}/files/${imported.id}/workflow-transitions/${memberTransitionId}/execute`, {
+  method: 'POST',
+  headers: { Authorization: `Bearer ${updatedMemberLogin.token}`, 'Content-Type': 'application/json' },
+  body: JSON.stringify({}),
+})
+assert.equal(memberRestrictedExecution.status, 403)
 const legacyFile = await request(
   '/files/import',
   {

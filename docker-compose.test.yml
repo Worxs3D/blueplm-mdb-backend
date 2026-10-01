@@ -7,7 +7,10 @@ services:
       MARIADB_PASSWORD: blueplm-test-password
       MARIADB_ROOT_PASSWORD: root-test-password
     healthcheck:
-      test: ["CMD", "mariadb-admin", "ping", "-h", "localhost", "-uroot", "-proot-test-password"]
+      # The entrypoint's temporary Unix-socket server accepts localhost before
+      # it creates the application account, then shuts down.  Probe TCP so
+      # depends_on releases the API only after the final server is listening.
+      test: ["CMD", "mariadb-admin", "ping", "--protocol=tcp", "-h", "127.0.0.1", "-uroot", "-proot-test-password"]
       interval: 2s
       timeout: 5s
       retries: 30
@@ -28,7 +31,7 @@ services:
       BLUEPLM_INSTALLATION_TOKEN: integration-installation-token-must-be-at-least-32-chars
       BLUEPLM_CORS_ORIGINS: null,file://,http://localhost:5173
     ports:
-      - "18080:80"
+      - "${BLUEPLM_PHP_TEST_PORT:-18080}:80"
     depends_on:
       mariadb:
         condition: service_healthy
