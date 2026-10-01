@@ -7,6 +7,7 @@ require dirname(__DIR__) . '/src/FileReferences.php';
 require dirname(__DIR__) . '/src/Totp.php';
 require dirname(__DIR__) . '/src/Installation.php';
 require dirname(__DIR__) . '/src/DatabaseLifecycle.php';
+require dirname(__DIR__) . '/src/BundleManifest.php';
 
 use BluePlm\Migrator;
 use BluePlm\FileReferences;
@@ -14,6 +15,7 @@ use BluePlm\Installation;
 use BluePlm\Runtime;
 use BluePlm\DatabaseLifecycle;
 use BluePlm\Totp;
+use BluePlm\BundleManifest;
 
 const BLUEPLM_API_VERSION = 2;
 
@@ -61,6 +63,40 @@ function createWorkflowReviews(PDO $db, array $principal, string $fileId, string
         if ($reviewers === []) $reviewers = [$principal['userId']];
         foreach ($reviewers as $reviewerId) $insert->execute([Runtime::uuid(), $principal['organizationId'], $fileId, $transitionId, $gateId, $principal['userId'], $reviewerId, $fileId, $transitionId, $gateId, $reviewerId]);
     }
+}
+
+function supplierText(array $body, string $key, int $max, bool $required = false): ?string
+{
+    if (!array_key_exists($key, $body) || $body[$key] === null) {
+        if ($required) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => "$key is required."]);
+        return null;
+    }
+    if (!is_string($body[$key])) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => "$key must be a string."]);
+    $value = trim($body[$key]);
+    if ($required && $value === '') Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => "$key is required."]);
+    if (strlen($value) > $max) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => "$key is too long."]);
+    return $value === '' ? null : $value;
+}
+
+function supplierBoolean(array $body, string $key, bool $default): bool
+{
+    if (!array_key_exists($key, $body)) return $default;
+    if (!is_bool($body[$key])) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => "$key must be a boolean."]);
+    return $body[$key];
+}
+
+function supplierEmail(array $body, string $key): ?string
+{
+    $value = supplierText($body, $key, 320);
+    if ($value !== null && filter_var($value, FILTER_VALIDATE_EMAIL) === false) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => "$key must be a valid email."]);
+    return $value;
+}
+
+function supplierUrl(array $body, string $key): ?string
+{
+    $value = supplierText($body, $key, 2048);
+    if ($value !== null && filter_var($value, FILTER_VALIDATE_URL) === false) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => "$key must be a valid URL."]);
+    return $value;
 }
 
 /** @return array<string, mixed> */
@@ -293,16 +329,24 @@ if (in_array($path, ['/installer/database-status', '/installer/commit'], true)) 
     }
 }
 
-$env = Runtime::env($root . '/.env');
+$environmentRoot = is_string($_SERVER['BLUEPLM_LIVE_ROOT'] ?? null)
+    ? rtrim($_SERVER['BLUEPLM_LIVE_ROOT'], '/\\')
+    : $root;
+$env = Runtime::env($environmentRoot . '/.env');
 Runtime::sendCors($env);
 if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'OPTIONS') Runtime::respond(204);
 
 try {
+    $manifest = BundleManifest::read($root);
     if ($path === '/health') Runtime::respond(200, [
         'ok' => true,
         'runtime' => 'php',
         'supabase' => false,
         'apiVersion' => BLUEPLM_API_VERSION,
+        'bundleVersion' => $manifest['version'] ?? null,
+        'bundleReleaseVersion' => $manifest['releaseVersion'] ?? null,
+        'bundleDigest' => $manifest['digest'] ?? null,
+        'bundleFileCount' => $manifest['fileCount'] ?? null,
     ]);
     $db = Runtime::database($env);
 
@@ -1261,21 +1305,46 @@ try {
     // Supabase fallback when MariaDB is selected.
     if ($method === 'GET' && $path === '/teams') {
         $query = $db->prepare(
-            'SELECT t.id, t.name, t.color, t.icon, t.created_at AS createdAt,
+            'SELECT t.id, t.name, t.color, t.icon, t.created_at AS createdAt, t.module_defaults,
                     COUNT(DISTINCT tm.user_id) AS memberCount,
                     COUNT(DISTINCT tva.vault_id) AS vaultCount
              FROM teams t
              LEFT JOIN team_members tm ON tm.team_id = t.id
              LEFT JOIN team_vault_access tva ON tva.team_id = t.id
              WHERE t.organization_id = ?
-             GROUP BY t.id, t.name, t.color, t.icon, t.created_at
+             GROUP BY t.id, t.name, t.color, t.icon, t.created_at, t.module_defaults
              ORDER BY t.name'
         );
         $query->execute([$principal['organizationId']]);
         $teams = $query->fetchAll();
-        foreach ($teams as &$team) { $team['memberCount'] = (int)$team['memberCount']; $team['vaultCount'] = (int)$team['vaultCount']; }
+        foreach ($teams as &$team) { $team['memberCount'] = (int)$team['memberCount']; $team['vaultCount'] = (int)$team['vaultCount']; $team['module_defaults'] = $team['module_defaults'] === null ? null : json_decode($team['module_defaults'], true); }
         unset($team);
         Runtime::respond(200, ['teams' => $teams]);
+    }
+    if ($method === 'GET' && preg_match('#^/teams/([0-9a-f-]{36})/module-defaults$#i', $path, $matches)) {
+        $team = $db->prepare('SELECT module_defaults FROM teams WHERE id = ? AND organization_id = ?');
+        $team->execute([$matches[1], $principal['organizationId']]); $row = $team->fetch();
+        if (!$row) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Team not found.']);
+        Runtime::respond(200, ['defaults' => $row['module_defaults'] === null ? null : json_decode($row['module_defaults'], true)]);
+    }
+    if ($method === 'PUT' && preg_match('#^/teams/([0-9a-f-]{36})/module-defaults$#i', $path, $matches)) {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $body = Runtime::jsonBody(); $defaults = $body['defaults'] ?? null;
+        if (!is_array($defaults)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid module defaults object is required.']);
+        try { $encodedDefaults = json_encode($defaults, JSON_THROW_ON_ERROR); }
+        catch (JsonException $error) { Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid module defaults object is required.']); }
+        if (strlen($encodedDefaults) > 500000) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid module defaults object is required.']);
+        $team = $db->prepare('SELECT id FROM teams WHERE id = ? AND organization_id = ?'); $team->execute([$matches[1], $principal['organizationId']]); if (!$team->fetch()) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Team not found.']);
+        $db->prepare('UPDATE teams SET module_defaults = ?, module_defaults_forced_at = NULL WHERE id = ? AND organization_id = ?')->execute([$encodedDefaults, $matches[1], $principal['organizationId']]);
+        Runtime::emitEvent($db, $principal['organizationId'], 'team.module_defaults_updated', $matches[1], ['teamId' => $matches[1], 'updatedBy' => $principal['userId']]);
+        Runtime::respond(200, ['success' => true]);
+    }
+    if ($method === 'DELETE' && preg_match('#^/teams/([0-9a-f-]{36})/module-defaults$#i', $path, $matches)) {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $query = $db->prepare('UPDATE teams SET module_defaults = NULL, module_defaults_forced_at = NULL WHERE id = ? AND organization_id = ?'); $query->execute([$matches[1], $principal['organizationId']]);
+        if ($query->rowCount() === 0) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Team not found.']);
+        Runtime::emitEvent($db, $principal['organizationId'], 'team.module_defaults_cleared', $matches[1], ['teamId' => $matches[1], 'clearedBy' => $principal['userId']]);
+        Runtime::respond(200, ['success' => true]);
     }
     if ($method === 'POST' && $path === '/teams') {
         if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
@@ -1409,7 +1478,7 @@ try {
         $query = $db->prepare('SELECT s.user_id, u.email, u.display_name AS full_name, NULL AS avatar_url, NULL AS custom_avatar_url, m.role, COALESCE(s.machine_name, s.machine_id) AS machine_name, s.platform, s.last_seen FROM device_sessions s JOIN users u ON u.id = s.user_id JOIN organization_memberships m ON m.user_id = s.user_id AND m.organization_id = s.organization_id WHERE s.organization_id = ? AND s.is_active = TRUE AND s.last_seen >= DATE_SUB(UTC_TIMESTAMP(3), INTERVAL 5 MINUTE) ORDER BY s.last_seen DESC'); $query->execute([$principal['organizationId']]); Runtime::respond(200, ['users' => $query->fetchAll()]);
     }
     if ($method === 'GET' && $path === '/organizations/current') {
-        $query = $db->prepare('SELECT o.id, o.name, o.slug, o.created_at AS createdAt, s.default_new_user_team_id AS defaultNewUserTeamId, s.document_manager_license_key AS documentManagerLicenseKey FROM organizations o LEFT JOIN organization_settings s ON s.organization_id = o.id WHERE o.id = ?');
+        $query = $db->prepare('SELECT o.id, o.name, o.slug, o.created_at AS createdAt, s.default_new_user_team_id AS defaultNewUserTeamId, s.document_manager_license_key AS documentManagerLicenseKey, s.module_defaults_forced_at AS module_defaults_forced_at FROM organizations o LEFT JOIN organization_settings s ON s.organization_id = o.id WHERE o.id = ?');
         $query->execute([$principal['organizationId']]); $organization = $query->fetch();
         if (!$organization) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Organization not found.']);
         Runtime::respond(200, ['organization' => $organization]);
@@ -1431,35 +1500,40 @@ try {
         Runtime::emitEvent($db, $principal['organizationId'], 'organization.default_team_updated', $principal['organizationId'], ['defaultNewUserTeamId' => $teamId, 'updatedBy' => $principal['userId']]);
         Runtime::respond(200, ['defaultNewUserTeamId' => $teamId]);
     }
-    if ($method === 'GET' && preg_match('#^/organizations/current/settings/(serialization|export|rfq|auth-providers)$#', $path, $matches)) {
+    if ($method === 'GET' && preg_match('#^/organizations/current/settings/(serialization|export|rfq|auth-providers|modules)$#', $path, $matches)) {
         $columns = [
             'serialization' => 'serialization_settings',
             'export' => 'export_settings',
             'rfq' => 'rfq_settings',
             'auth-providers' => 'auth_provider_settings',
+            'modules' => 'module_defaults',
         ];
         $section = $matches[1];
         $column = $columns[$section];
-        $query = $db->prepare("SELECT {$column}, serialization_counter FROM organization_settings WHERE organization_id = ?");
+        $query = $db->prepare("SELECT {$column}, serialization_counter, module_defaults_forced_at FROM organization_settings WHERE organization_id = ?");
         $query->execute([$principal['organizationId']]);
         $row = $query->fetch() ?: [];
         $value = decodeOrganizationSetting($row[$column] ?? null);
         if ($section === 'serialization') $value['current_counter'] = (int)($row['serialization_counter'] ?? 0);
+        if ($section === 'modules') $value['_forcedAt'] = $row['module_defaults_forced_at'] ?? null;
         Runtime::respond(200, ['value' => $value]);
     }
-    if ($method === 'PUT' && preg_match('#^/organizations/current/settings/(serialization|export|rfq|auth-providers)$#', $path, $matches)) {
+    if ($method === 'PUT' && preg_match('#^/organizations/current/settings/(serialization|export|rfq|auth-providers|modules)$#', $path, $matches)) {
         if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
         $columns = [
             'serialization' => 'serialization_settings',
             'export' => 'export_settings',
             'rfq' => 'rfq_settings',
             'auth-providers' => 'auth_provider_settings',
+            'modules' => 'module_defaults',
         ];
         $section = $matches[1];
         $column = $columns[$section];
         $body = Runtime::jsonBody();
         $value = $body['value'] ?? null;
         if (!is_array($value)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'value must be a JSON object.']);
+        $force = ($body['force'] ?? false) === true;
+        if ($section === 'modules' && array_key_exists('_forcedAt', $value)) unset($value['_forcedAt']);
         $counter = null;
         if ($section === 'serialization') {
             if (array_key_exists('current_counter', $value)) {
@@ -1478,8 +1552,13 @@ try {
             $db->prepare("INSERT INTO organization_settings (organization_id, {$column}, serialization_counter) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE {$column} = VALUES({$column}), serialization_counter = VALUES(serialization_counter)")
                 ->execute([$principal['organizationId'], $encoded, $counter]);
         } else {
-            $db->prepare("INSERT INTO organization_settings (organization_id, {$column}) VALUES (?, ?) ON DUPLICATE KEY UPDATE {$column} = VALUES({$column})")
-                ->execute([$principal['organizationId'], $encoded]);
+            if ($section === 'modules' && $force) {
+                $db->prepare("INSERT INTO organization_settings (organization_id, {$column}, module_defaults_forced_at) VALUES (?, ?, UTC_TIMESTAMP(3)) ON DUPLICATE KEY UPDATE {$column} = VALUES({$column}), module_defaults_forced_at = UTC_TIMESTAMP(3)")
+                    ->execute([$principal['organizationId'], $encoded]);
+            } else {
+                $db->prepare("INSERT INTO organization_settings (organization_id, {$column}) VALUES (?, ?) ON DUPLICATE KEY UPDATE {$column} = VALUES({$column})")
+                    ->execute([$principal['organizationId'], $encoded]);
+            }
         }
         if ($section === 'serialization') {
             $query = $db->prepare('SELECT serialization_counter FROM organization_settings WHERE organization_id = ?');
@@ -1899,7 +1978,57 @@ try {
         $id = Runtime::uuid(); $db->prepare('INSERT INTO vaults (id, organization_id, name, network_root) VALUES (?, ?, ?, ?)')->execute([$id, $principal['organizationId'], $name, $networkRoot]); Runtime::respond(201, ['id' => $id, 'name' => $name, 'networkRoot' => $networkRoot, 'storageProvider' => 'network', 'createdAt' => gmdate('c')]);
     }
     if ($method === 'GET' && $path === '/suppliers') {
-        $query = $db->prepare('SELECT id, name, code, contact_email, contact_phone, website, city, state, country, is_active, is_approved, erp_id, erp_synced_at, created_at FROM suppliers WHERE organization_id = ? ORDER BY is_active DESC, name'); $query->execute([$principal['organizationId']]); $rows = $query->fetchAll(); foreach ($rows as &$row) { $row['is_active'] = (bool)$row['is_active']; $row['is_approved'] = (bool)$row['is_approved']; } unset($row); Runtime::respond(200, ['suppliers' => $rows]);
+        $query = $db->prepare('SELECT id, name, code, contact_email, contact_phone, website, city, state, country, is_active, is_approved, erp_id, erp_synced_at, created_at FROM suppliers WHERE organization_id = ? AND is_active = TRUE ORDER BY name');
+        $query->execute([$principal['organizationId']]); $rows = $query->fetchAll();
+        foreach ($rows as &$row) { $row['is_active'] = (bool)$row['is_active']; $row['is_approved'] = (bool)$row['is_approved']; } unset($row);
+        Runtime::respond(200, ['suppliers' => $rows]);
+    }
+    if ($method === 'POST' && $path === '/suppliers') {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $body = Runtime::jsonBody();
+        $name = supplierText($body, 'name', 255, true);
+        $code = supplierText($body, 'code', 128);
+        $contactEmail = supplierEmail($body, 'contactEmail');
+        $contactPhone = supplierText($body, 'contactPhone', 128);
+        $website = supplierUrl($body, 'website');
+        $city = supplierText($body, 'city', 128); $state = supplierText($body, 'state', 128); $country = supplierText($body, 'country', 128);
+        $erpId = supplierText($body, 'erpId', 255);
+        $id = Runtime::uuid();
+        try {
+            $db->prepare('INSERT INTO suppliers (id, organization_id, name, code, contact_email, contact_phone, website, city, state, country, is_active, is_approved, erp_id, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')->execute([
+                $id, $principal['organizationId'], $name, $code, $contactEmail, $contactPhone, $website, $city, $state, $country,
+                supplierBoolean($body, 'isActive', true) ? 1 : 0, supplierBoolean($body, 'isApproved', false) ? 1 : 0, $erpId,
+                $principal['userId'],
+            ]);
+        } catch (PDOException $error) {
+            if ($error->getCode() === '23000') Runtime::respond(409, ['error' => 'ALREADY_EXISTS', 'message' => 'Supplier code already exists in this organization.']);
+            throw $error;
+        }
+        $query = $db->prepare('SELECT id, name, code, contact_email, contact_phone, website, city, state, country, is_active, is_approved, erp_id, erp_synced_at, created_at FROM suppliers WHERE id = ? AND organization_id = ?'); $query->execute([$id, $principal['organizationId']]); $row = $query->fetch(); $row['is_active'] = (bool)$row['is_active']; $row['is_approved'] = (bool)$row['is_approved']; Runtime::respond(201, ['supplier' => $row]);
+    }
+    if ($method === 'PATCH' && preg_match('#^/suppliers/([0-9a-f-]{36})$#i', $path, $matches)) {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $body = Runtime::jsonBody();
+        $sets = []; $values = [];
+        $textFields = ['name' => ['name', 255, true], 'code' => ['code', 128, false], 'contactPhone' => ['contact_phone', 128, false], 'city' => ['city', 128, false], 'state' => ['state', 128, false], 'country' => ['country', 128, false], 'erpId' => ['erp_id', 255, false]];
+        foreach ($textFields as $input => [$column, $max, $required]) if (array_key_exists($input, $body)) { $sets[] = "$column = ?"; $values[] = supplierText($body, $input, $max, $required); }
+        if (array_key_exists('contactEmail', $body)) { $sets[] = 'contact_email = ?'; $values[] = supplierEmail($body, 'contactEmail'); }
+        if (array_key_exists('website', $body)) { $sets[] = 'website = ?'; $values[] = supplierUrl($body, 'website'); }
+        foreach (['isActive' => 'is_active', 'isApproved' => 'is_approved'] as $input => $column) if (array_key_exists($input, $body)) { $sets[] = "$column = ?"; $values[] = supplierBoolean($body, $input, false) ? 1 : 0; }
+        if (!$sets) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'At least one supplier field is required.']);
+        $exists = $db->prepare('SELECT 1 FROM suppliers WHERE id = ? AND organization_id = ?'); $exists->execute([$matches[1], $principal['organizationId']]);
+        if (!$exists->fetchColumn()) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Supplier not found.']);
+        $values[] = $matches[1]; $values[] = $principal['organizationId'];
+        try { $db->prepare('UPDATE suppliers SET ' . implode(', ', $sets) . ' WHERE id = ? AND organization_id = ?')->execute($values); } catch (PDOException $error) { if ($error->getCode() === '23000') Runtime::respond(409, ['error' => 'ALREADY_EXISTS', 'message' => 'Supplier code already exists in this organization.']); throw $error; }
+        $query = $db->prepare('SELECT id, name, code, contact_email, contact_phone, website, city, state, country, is_active, is_approved, erp_id, erp_synced_at, created_at FROM suppliers WHERE id = ? AND organization_id = ?'); $query->execute([$matches[1], $principal['organizationId']]); $row = $query->fetch(); $row['is_active'] = (bool)$row['is_active']; $row['is_approved'] = (bool)$row['is_approved']; Runtime::respond(200, ['supplier' => $row]);
+    }
+    if ($method === 'DELETE' && preg_match('#^/suppliers/([0-9a-f-]{36})$#i', $path, $matches)) {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        // Deactivate instead of deleting: part_suppliers keeps its historical
+        // assignment and the foreign-key relationship remains intact.
+        $query = $db->prepare('UPDATE suppliers SET is_active = FALSE WHERE id = ? AND organization_id = ?'); $query->execute([$matches[1], $principal['organizationId']]);
+        if ($query->rowCount() === 0) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Supplier not found.']);
+        Runtime::respond(204);
     }
     if ($method === 'GET' && preg_match('#^/files/([0-9a-f-]{36})/suppliers$#i', $path, $matches)) {
         $file = $db->prepare('SELECT vault_id FROM files WHERE id = ? AND organization_id = ? AND deleted_at IS NULL'); $file->execute([$matches[1], $principal['organizationId']]); $fileRow = $file->fetch(); if (!$fileRow) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'File not found.']); Runtime::requireVault($db, $principal, $fileRow['vault_id']);

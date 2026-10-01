@@ -81,6 +81,11 @@ async function waitForHealth() {
     try {
       const health = await request('/health')
       if (health.ok === true && health.supabase === false && health.apiVersion === 2) {
+        // A fresh/legacy deployment has no identity until the desktop installer
+        // publishes one; clients must classify this as unknown, never current.
+        assert.equal(health.bundleDigest, null)
+        assert.equal(health.bundleVersion, null)
+        assert.equal(health.bundleReleaseVersion, null)
         const databaseProbe = await fetch(`${server}/installer/database-status`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -121,6 +126,11 @@ const installed = await request('/installer/commit', {
 })
 assert.equal(typeof installed.token, 'string')
 assert.equal(installed.bootstrapped, true)
+const rejectedMaintenance = await requestStatus('/admin/migrate', {
+  method: 'POST',
+  body: JSON.stringify({ maintenanceToken: 'wrong-maintenance-token' }),
+})
+assert.equal(rejectedMaintenance.status, 403)
 const login = await request('/auth/login', {
   method: 'POST',
   body: JSON.stringify({ email: 'owner@example.test', password }),
@@ -295,6 +305,80 @@ const updatedMemberLogin = await request('/auth/login', {
 })
 assert.equal(typeof updatedMemberLogin.token, 'string')
 
+// Sidebar module defaults are an MDB organization contract.  The owner can
+// persist and read them, while a regular member cannot mutate the org record.
+const moduleDefaults = {
+  enabled_modules: { explorer: true, history: false },
+  enabled_groups: {},
+  module_order: ['explorer', 'history'],
+  dividers: [],
+  module_parents: {},
+  module_icon_colors: {},
+  custom_groups: [],
+}
+await request('/organizations/current/settings/modules', {
+  method: 'PUT',
+  body: JSON.stringify({ value: moduleDefaults }),
+}, token)
+const storedModuleDefaults = await request('/organizations/current/settings/modules', {}, token)
+assert.equal(storedModuleDefaults.value.enabled_modules.history, false)
+assert.equal((await requestStatus('/organizations/current/settings/modules', {
+  method: 'PUT',
+  body: JSON.stringify({ value: moduleDefaults }),
+}, updatedMemberLogin.token)).status, 403)
+// Supplier CRUD is tenant-scoped and role-gated. The list endpoint exposes
+// active records only; deactivation keeps historical part assignments intact.
+const supplier = await request('/suppliers', {
+  method: 'POST',
+  body: JSON.stringify({ name: 'Integration Supplier', code: 'INT-SUP-1', contactEmail: 'supplier@example.test', website: 'https://supplier.example.test', isActive: true, isApproved: false }),
+}, token)
+assert.equal(supplier.supplier.code, 'INT-SUP-1')
+assert.equal(supplier.supplier.is_active, true)
+assert.equal((await request('/suppliers', {}, token)).suppliers.some((entry) => entry.id === supplier.supplier.id), true)
+const updatedSupplier = await request(`/suppliers/${supplier.supplier.id}`, {
+  method: 'PATCH',
+  body: JSON.stringify({ city: 'Berlin', isApproved: true }),
+}, token)
+assert.equal(updatedSupplier.supplier.city, 'Berlin')
+assert.equal(updatedSupplier.supplier.is_approved, true)
+assert.equal((await requestStatus('/suppliers', { method: 'POST', body: JSON.stringify({ name: 'Denied Supplier' }) }, updatedMemberLogin.token)).status, 403)
+assert.equal((await requestStatus(`/suppliers/${supplier.supplier.id}`, { method: 'PATCH', body: JSON.stringify({ name: 'Denied Update' }) }, updatedMemberLogin.token)).status, 403)
+assert.equal((await requestStatus(`/suppliers/${supplier.supplier.id}`, { method: 'DELETE' }, updatedMemberLogin.token)).status, 403)
+assert.equal((await requestStatus(`/suppliers/${supplier.supplier.id}`, { method: 'PATCH', body: JSON.stringify({ isApproved: 'false' }) }, token)).status, 400)
+assert.equal((await requestStatus('/suppliers', { method: 'POST', body: JSON.stringify({ name: 'Duplicate Supplier', code: 'INT-SUP-1' }) }, token)).status, 409)
+assert.equal((await requestStatus(`/suppliers/00000000-0000-0000-0000-000000000000`, {}, token)).status, 404)
+await request(`/suppliers/${supplier.supplier.id}`, { method: 'DELETE' }, token)
+assert.equal((await request('/suppliers', {}, token)).suppliers.some((entry) => entry.id === supplier.supplier.id), false)
+
+// Seed a second organization through the test database fixture and obtain a
+// real admin session. This proves supplier reads and mutations remain tenant
+// isolated rather than merely returning 404 for an arbitrary UUID.
+const foreignOrgId = randomUUID()
+const foreignPassword = 'Foreign supplier password 123!'
+const foreignUser = await request('/users', {
+  method: 'POST',
+  body: JSON.stringify({ email: 'foreign-owner@example.test', displayName: 'Foreign Owner', password: foreignPassword, role: 'admin' }),
+}, token)
+const foreignSql = `INSERT INTO organizations (id, name, slug) VALUES ('${foreignOrgId}', 'Foreign Org', 'foreign-org'); DELETE FROM organization_memberships WHERE user_id = '${foreignUser.id}'; INSERT INTO organization_memberships (organization_id, user_id, role) VALUES ('${foreignOrgId}', '${foreignUser.id}', 'admin');`
+execFileSync('docker', [
+  'compose', '-f', 'docker-compose.test.yml', 'exec', '-T', 'mariadb',
+  'mariadb', '-ublueplm', '-pblueplm-test-password', 'blueplm', '-e', foreignSql,
+], { cwd: process.cwd(), stdio: 'pipe' })
+const foreignLogin = await request('/auth/login', {
+  method: 'POST',
+  body: JSON.stringify({ email: 'foreign-owner@example.test', password: foreignPassword }),
+})
+const foreignSupplier = await request('/suppliers', {
+  method: 'POST',
+  body: JSON.stringify({ name: 'Foreign Supplier', code: 'FOREIGN-1', isActive: true }),
+}, foreignLogin.token)
+assert.equal(foreignSupplier.supplier.name, 'Foreign Supplier')
+assert.equal((await request('/suppliers', {}, token)).suppliers.some((entry) => entry.id === foreignSupplier.supplier.id), false)
+assert.equal((await requestStatus(`/suppliers/${foreignSupplier.supplier.id}`, { method: 'PATCH', body: JSON.stringify({ name: 'Cross Org Update' }) }, token)).status, 404)
+assert.equal((await requestStatus(`/suppliers/${foreignSupplier.supplier.id}`, { method: 'DELETE' }, token)).status, 404)
+const foreignAfterIsolationCheck = await request('/suppliers', {}, foreignLogin.token)
+assert.equal(foreignAfterIsolationCheck.suppliers.some((entry) => entry.id === foreignSupplier.supplier.id && entry.name === 'Foreign Supplier'), true)
+
 // Workflow roles are separate organization data. Account roles must not create
 // or imply workflow-role assignments, and only organization administrators may
 // edit the role catalog or assignments.
@@ -348,6 +432,34 @@ const createdTeam = await request(
   token,
 )
 assert.equal(createdTeam.name, 'Integration Team')
+const teamDefaults = { enabled_modules: { explorer: true }, module_order: ['explorer'] }
+assert.equal((await requestStatus(`/teams/${createdTeam.id}/module-defaults`, {
+  method: 'PUT', body: JSON.stringify({ defaults: 'invalid' }),
+}, token)).status, 400)
+const savedTeamDefaults = await request(`/teams/${createdTeam.id}/module-defaults`, {
+  method: 'PUT',
+  body: JSON.stringify({ defaults: teamDefaults }),
+}, token)
+assert.equal(savedTeamDefaults.success, true)
+execFileSync('docker', [
+  'compose', '-f', 'docker-compose.test.yml', 'exec', '-T', 'mariadb',
+  'mariadb', '-uroot', '-proot-test-password', '-e',
+  "SET GLOBAL sql_mode = CONCAT(@@GLOBAL.sql_mode, ',ONLY_FULL_GROUP_BY')",
+], { cwd: process.cwd(), stdio: 'pipe' })
+const teamsWithDefaults = await request('/teams', {}, token)
+assert.deepEqual(
+  teamsWithDefaults.teams.find((team) => team.id === createdTeam.id)?.module_defaults,
+  teamDefaults,
+)
+assert.deepEqual((await request(`/teams/${createdTeam.id}/module-defaults`, {}, token)).defaults, teamDefaults)
+assert.equal((await requestStatus(`/teams/${createdTeam.id}/module-defaults`, {
+  method: 'PUT', body: JSON.stringify({ defaults: teamDefaults }),
+}, updatedMemberLogin.token)).status, 403)
+assert.equal((await requestStatus(`/teams/${createdTeam.id}/module-defaults`, {
+  method: 'DELETE',
+}, updatedMemberLogin.token)).status, 403)
+await request(`/teams/${createdTeam.id}/module-defaults`, { method: 'DELETE' }, token)
+assert.equal((await request(`/teams/${createdTeam.id}/module-defaults`, {}, token)).defaults, null)
 const teams = await request('/teams', {}, token)
 assert.ok(teams.teams.some((team) => team.id === createdTeam.id && team.memberCount === 0))
 const updatedTeam = await request(

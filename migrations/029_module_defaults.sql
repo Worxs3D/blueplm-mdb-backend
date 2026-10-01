@@ -1,0 +1,3 @@
+-- Applied by Migrator::ensureModuleDefaultsColumns(). It inspects each column
+-- before issuing an ALTER so ledger reconstruction can safely adopt complete
+-- and partial legacy schemas across supported MariaDB versions.

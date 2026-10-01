@@ -33,7 +33,11 @@ final class Migrator
             $sql = file_get_contents($file);
             if ($sql === false) throw new RuntimeException("Cannot read {$file}.");
             try {
-                $db->exec($sql);
+                if ($migration === '029_module_defaults.sql') {
+                    self::ensureModuleDefaultsColumns($db);
+                } else {
+                    $db->exec($sql);
+                }
                 if ($migration === '015_eco_metadata.sql') self::ensureEcoMetadataConstraints($db);
                 if ($migration === '024_file_part_numbers.sql') self::ensureFilePartNumberConstraint($db);
             } catch (\Throwable $error) {
@@ -71,6 +75,26 @@ final class Migrator
         $query->execute(['files', 'uq_files_org_part_number']);
         if (!$query->fetchColumn()) {
             $db->exec('ALTER TABLE files ADD UNIQUE KEY uq_files_org_part_number (organization_id, part_number)');
+        }
+    }
+
+    private static function ensureModuleDefaultsColumns(PDO $db): void
+    {
+        $columns = [
+            ['teams', 'module_defaults', 'JSON NULL'],
+            ['teams', 'module_defaults_forced_at', 'DATETIME(3) NULL'],
+            ['organization_settings', 'module_defaults', 'JSON NULL'],
+            ['organization_settings', 'module_defaults_forced_at', 'DATETIME(3) NULL'],
+        ];
+        $query = $db->prepare(
+            'SELECT 1 FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?'
+        );
+        foreach ($columns as [$table, $column, $definition]) {
+            $query->execute([$table, $column]);
+            if (!$query->fetchColumn()) {
+                $db->exec("ALTER TABLE `{$table}` ADD COLUMN `{$column}` {$definition}");
+            }
         }
     }
 
