@@ -25,6 +25,33 @@ function decodeOrganizationSetting(mixed $value): array
     return is_array($decoded) ? $decoded : [];
 }
 
+/** @return array<string, mixed> */
+function authProviderSettings(PDO $db, string $organizationId): array
+{
+    $query = $db->prepare('SELECT auth_provider_settings FROM organization_settings WHERE organization_id = ?');
+    $query->execute([$organizationId]);
+    $settings = decodeOrganizationSetting($query->fetchColumn());
+    return [
+        'selfRegistration' => ($settings['selfRegistration'] ?? false) === true,
+        'users' => is_array($settings['users'] ?? null) ? $settings['users'] : [],
+        'suppliers' => is_array($settings['suppliers'] ?? null) ? $settings['suppliers'] : [],
+    ];
+}
+
+/** @return array{id:string,name:string,slug:string}|null */
+function registrationOrganization(PDO $db, mixed $slug = null): ?array
+{
+    if (is_string($slug) && trim($slug) !== '') {
+        $query = $db->prepare('SELECT id, name, slug FROM organizations WHERE slug = ? LIMIT 1');
+        $query->execute([strtolower(trim($slug))]);
+    } else {
+        $query = $db->query('SELECT id, name, slug FROM organizations ORDER BY created_at LIMIT 1');
+    }
+    if (!$query) return null;
+    $organization = $query->fetch();
+    return is_array($organization) ? $organization : null;
+}
+
 /** @param array<string, mixed> $settings */
 function formatOrganizationSerial(array $settings, int $counter): string
 {
@@ -54,6 +81,31 @@ function nextOrganizationSerialCounter(array $settings, int $current): int
         }
     } while ($moved);
     return $candidate;
+}
+
+/**
+ * Keep the first MDB organization usable without coupling workflow roles to
+ * account roles. These are ordinary editable records; no user assignment is
+ * created here. The labels are organization data, not translated UI copy.
+ */
+function ensureWorkflowRoleDefaults(PDO $db, string $organizationId, string $createdBy): void
+{
+    $existing = $db->prepare('SELECT 1 FROM workflow_roles WHERE org_id = ? LIMIT 1');
+    $existing->execute([$organizationId]);
+    if ($existing->fetchColumn()) return;
+
+    $defaults = [
+        ['Administrators', '#DC2626', 'shield', 0],
+        ['Engineers', '#2563EB', 'wrench', 1],
+        ['Viewers', '#64748B', 'eye', 2],
+    ];
+    $insert = $db->prepare(
+        'INSERT IGNORE INTO workflow_roles (id, org_id, name, color, icon, sort_order, created_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?)'
+    );
+    foreach ($defaults as [$name, $color, $icon, $sortOrder]) {
+        $insert->execute([Runtime::uuid(), $organizationId, $name, $color, $icon, $sortOrder, $createdBy]);
+    }
 }
 
 /** @return array<int, array{id:string,width:int,visible:bool}> */
@@ -265,6 +317,91 @@ try {
         }
         Runtime::respond(200, ['token' => Runtime::issueSession($db, $env, $user['id'], $user['organization_id']), 'expiresAt' => gmdate('c', time() + 7 * 86400)]);
     }
+    if ($method === 'GET' && $path === '/auth/registration') {
+        $organization = registrationOrganization($db, $_GET['organizationSlug'] ?? null);
+        if (!$organization) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'No organization is configured.']);
+        $settings = authProviderSettings($db, $organization['id']);
+        Runtime::respond(200, [
+            'enabled' => $settings['selfRegistration'] === true,
+            'organizationId' => $organization['id'],
+            'organizationName' => $organization['name'],
+        ]);
+    }
+    if ($method === 'POST' && $path === '/auth/register') {
+        $body = Runtime::jsonBody();
+        $organization = registrationOrganization($db, $body['organizationSlug'] ?? null);
+        if (!$organization) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'No organization is configured.']);
+        if (authProviderSettings($db, $organization['id'])['selfRegistration'] !== true) {
+            Runtime::respond(403, ['error' => 'REGISTRATION_DISABLED', 'message' => 'Self-registration is disabled for this organization.']);
+        }
+        $email = is_string($body['email'] ?? null) ? strtolower(trim($body['email'])) : '';
+        $displayName = is_string($body['displayName'] ?? null) ? trim($body['displayName']) : '';
+        $password = is_string($body['password'] ?? null) ? $body['password'] : '';
+        if (!filter_var($email, FILTER_VALIDATE_EMAIL) || strlen($email) > 320 || $displayName === '' || strlen($displayName) > 200 || strlen($password) < 12) {
+            Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid email, display name, and password of at least 12 characters are required.']);
+        }
+        $existingUser = $db->prepare('SELECT 1 FROM users WHERE email = ? LIMIT 1');
+        $existingUser->execute([$email]);
+        if ($existingUser->fetchColumn()) Runtime::respond(409, ['error' => 'ALREADY_EXISTS', 'message' => 'An account with this email already exists.']);
+        $pending = $db->prepare("SELECT 1 FROM registration_requests WHERE organization_id = ? AND email = ? AND status = 'pending' LIMIT 1");
+        $pending->execute([$organization['id'], $email]);
+        if ($pending->fetchColumn()) Runtime::respond(409, ['error' => 'ALREADY_PENDING', 'message' => 'A registration request for this email is already pending.']);
+        $requestId = Runtime::uuid();
+        $db->prepare('INSERT INTO registration_requests (id, organization_id, email, display_name, password_hash) VALUES (?, ?, ?, ?, ?)')
+            ->execute([$requestId, $organization['id'], $email, $displayName, Runtime::passwordHash($password)]);
+        Runtime::respond(202, ['status' => 'pending', 'requestId' => $requestId]);
+    }
+    if ($method === 'POST' && $path === '/auth/recovery-register') {
+        $body = Runtime::jsonBody();
+        $organization = registrationOrganization($db, $body['organizationSlug'] ?? null);
+        if (!$organization) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'No organization is configured.']);
+        $code = is_string($body['recoveryCode'] ?? null) ? strtoupper(trim($body['recoveryCode'])) : '';
+        $email = is_string($body['email'] ?? null) ? strtolower(trim($body['email'])) : '';
+        $displayName = is_string($body['displayName'] ?? null) ? trim($body['displayName']) : '';
+        $password = is_string($body['password'] ?? null) ? $body['password'] : '';
+        if (!preg_match('/^[A-Z2-9]{4}(?:-[A-Z2-9]{4}){3}$/', $code)
+            || !filter_var($email, FILTER_VALIDATE_EMAIL) || strlen($email) > 320
+            || $displayName === '' || strlen($displayName) > 200 || strlen($password) < 12) {
+            Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid recovery code, email, display name, and password of at least 12 characters are required.']);
+        }
+        $existingUser = $db->prepare('SELECT 1 FROM users WHERE email = ? LIMIT 1');
+        $existingUser->execute([$email]);
+        if ($existingUser->fetchColumn()) Runtime::respond(409, ['error' => 'ALREADY_EXISTS', 'message' => 'An account with this email already exists.']);
+
+        $db->beginTransaction();
+        try {
+            $recovery = $db->prepare('SELECT id FROM admin_recovery_codes WHERE organization_id = ? AND code_hash = ? AND is_used = FALSE AND is_revoked = FALSE AND expires_at > UTC_TIMESTAMP(3) FOR UPDATE');
+            $recovery->execute([$organization['id'], hash('sha256', str_replace('-', '', $code))]);
+            $record = $recovery->fetch();
+            if (!$record) {
+                $db->rollBack();
+                Runtime::respond(401, ['error' => 'RECOVERY_CODE_INVALID', 'message' => 'The recovery code is invalid, expired, used, or revoked.']);
+            }
+            $userId = Runtime::uuid();
+            $db->prepare('INSERT INTO users (id, email, display_name, password_hash) VALUES (?, ?, ?, ?)')
+                ->execute([$userId, $email, $displayName, Runtime::passwordHash($password)]);
+            $db->prepare("INSERT INTO organization_memberships (organization_id, user_id, role) VALUES (?, ?, 'admin')")
+                ->execute([$organization['id'], $userId]);
+            $used = $db->prepare('UPDATE admin_recovery_codes SET is_used = TRUE, used_by = ?, used_at = UTC_TIMESTAMP(3) WHERE id = ? AND is_used = FALSE');
+            $used->execute([$userId, $record['id']]);
+            if ($used->rowCount() === 0) throw new \RuntimeException('Recovery code was already used.');
+            $token = Runtime::issueSession($db, $env, $userId, $organization['id']);
+            Runtime::emitEvent($db, $organization['id'], 'registration.recovery_approved', $userId, ['userId' => $userId, 'recoveryCodeId' => $record['id'], 'role' => 'admin']);
+            $db->commit();
+        } catch (PDOException $error) {
+            if ($db->inTransaction()) $db->rollBack();
+            if ($error->getCode() === '23000') Runtime::respond(409, ['error' => 'ALREADY_EXISTS', 'message' => 'An account with this email already exists.']);
+            throw $error;
+        } catch (Throwable $error) {
+            if ($db->inTransaction()) $db->rollBack();
+            throw $error;
+        }
+        Runtime::respond(201, [
+            'token' => $token,
+            'expiresAt' => gmdate('c', time() + 7 * 86400),
+            'user' => ['id' => $userId, 'email' => $email, 'displayName' => $displayName, 'role' => 'admin'],
+        ]);
+    }
     if ($method === 'POST' && $path === '/auth/totp/verify') {
         $body = Runtime::jsonBody();
         $challengeToken = is_string($body['challengeToken'] ?? null) ? $body['challengeToken'] : '';
@@ -296,6 +433,51 @@ try {
         Runtime::respond(200, ['user' => Runtime::principal($db, $env)]);
     }
     $principal = Runtime::principal($db, $env);
+    if ($method === 'GET' && $path === '/registration-requests') {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $query = $db->prepare("SELECT id, email, display_name AS displayName, status, created_at AS createdAt FROM registration_requests WHERE organization_id = ? AND status = 'pending' ORDER BY created_at");
+        $query->execute([$principal['organizationId']]);
+        Runtime::respond(200, ['requests' => $query->fetchAll()]);
+    }
+    if ($method === 'POST' && preg_match('#^/registration-requests/([0-9a-f-]{36})/(approve|reject)$#i', $path, $matches)) {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $requestId = $matches[1];
+        $action = $matches[2];
+        $query = $db->prepare("SELECT id, organization_id, email, display_name, password_hash FROM registration_requests WHERE id = ? AND organization_id = ? AND status = 'pending'");
+        $query->execute([$requestId, $principal['organizationId']]);
+        $request = $query->fetch();
+        if (!$request) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Registration request not found.']);
+        if ($action === 'reject') {
+            $db->prepare("UPDATE registration_requests SET status = 'rejected', reviewed_by = ?, reviewed_at = UTC_TIMESTAMP(3) WHERE id = ? AND status = 'pending'")
+                ->execute([$principal['userId'], $requestId]);
+            Runtime::emitEvent($db, $principal['organizationId'], 'registration.rejected', $requestId, ['requestId' => $requestId, 'rejectedBy' => $principal['userId']]);
+            Runtime::respond(200, ['status' => 'rejected']);
+        }
+        $body = Runtime::jsonBody();
+        $role = is_string($body['role'] ?? null) ? $body['role'] : '';
+        if (!in_array($role, ['admin', 'member', 'viewer', 'guest'], true)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'An explicit non-owner role is required for approval.']);
+        $userId = Runtime::uuid();
+        $db->beginTransaction();
+        try {
+            $db->prepare('INSERT INTO users (id, email, display_name, password_hash) VALUES (?, ?, ?, ?)')
+                ->execute([$userId, $request['email'], $request['display_name'], $request['password_hash']]);
+            $db->prepare('INSERT INTO organization_memberships (organization_id, user_id, role) VALUES (?, ?, ?)')
+                ->execute([$principal['organizationId'], $userId, $role]);
+            $update = $db->prepare("UPDATE registration_requests SET status = 'approved', reviewed_by = ?, reviewed_at = UTC_TIMESTAMP(3) WHERE id = ? AND status = 'pending'");
+            $update->execute([$principal['userId'], $requestId]);
+            if ($update->rowCount() === 0) throw new \RuntimeException('Registration request was already processed.');
+            $db->commit();
+        } catch (PDOException $error) {
+            if ($db->inTransaction()) $db->rollBack();
+            if ($error->getCode() === '23000') Runtime::respond(409, ['error' => 'ALREADY_EXISTS', 'message' => 'An account with this email already exists.']);
+            throw $error;
+        } catch (Throwable $error) {
+            if ($db->inTransaction()) $db->rollBack();
+            throw $error;
+        }
+        Runtime::emitEvent($db, $principal['organizationId'], 'registration.approved', $userId, ['requestId' => $requestId, 'approvedBy' => $principal['userId'], 'role' => $role]);
+        Runtime::respond(201, ['user' => ['id' => $userId, 'email' => $request['email'], 'displayName' => $request['display_name'], 'role' => $role]]);
+    }
     if (in_array($principal['role'], ['viewer', 'guest'], true) && $method !== 'GET') {
         $personalWrite = $path === '/account'
             || $path === '/recovery-codes/use'
@@ -369,6 +551,21 @@ try {
         $query = $db->prepare('SELECT u.id, u.email, u.display_name AS displayName, m.role, u.created_at AS createdAt FROM users u JOIN organization_memberships m ON m.user_id = u.id WHERE m.organization_id = ? AND u.disabled_at IS NULL ORDER BY u.display_name, u.email');
         $query->execute([$principal['organizationId']]);
         Runtime::respond(200, ['users' => $query->fetchAll()]);
+    }
+    if ($method === 'GET' && preg_match('#^/users/([0-9a-f-]{36})/profile$#i', $path, $matches)) {
+        $targetId = $matches[1];
+        if ($targetId !== $principal['userId'] && !in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $query = $db->prepare('SELECT u.id, u.email, u.display_name AS displayName, m.role, u.created_at AS createdAt FROM users u JOIN organization_memberships m ON m.user_id = u.id WHERE u.id = ? AND m.organization_id = ? AND u.disabled_at IS NULL');
+        $query->execute([$targetId, $principal['organizationId']]);
+        $profile = $query->fetch();
+        if (!$profile) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'User not found.']);
+        $teams = $db->prepare('SELECT t.id, t.name, t.color, t.icon FROM team_members tm JOIN teams t ON t.id = tm.team_id WHERE tm.user_id = ? AND t.organization_id = ? ORDER BY t.name');
+        $teams->execute([$targetId, $principal['organizationId']]);
+        $roles = $db->prepare('SELECT wr.id, wr.name, wr.color, wr.icon FROM user_workflow_roles uwr JOIN workflow_roles wr ON wr.id = uwr.workflow_role_id WHERE uwr.user_id = ? AND uwr.org_id = ? AND wr.is_active = TRUE ORDER BY wr.sort_order, wr.name');
+        $roles->execute([$targetId, $principal['organizationId']]);
+        $profile['teams'] = $teams->fetchAll();
+        $profile['workflowRoles'] = $roles->fetchAll();
+        Runtime::respond(200, ['user' => $profile]);
     }
     if ($method === 'POST' && $path === '/users') {
         if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
@@ -468,6 +665,120 @@ try {
         } catch (Throwable $error) { if ($db->inTransaction()) $db->rollBack(); throw $error; }
         Runtime::respond(204);
     }
+    if ($method === 'GET' && $path === '/workflow-roles') {
+        ensureWorkflowRoleDefaults($db, $principal['organizationId'], $principal['userId']);
+        $query = $db->prepare(
+            'SELECT id, name, color, icon, description, sort_order
+             FROM workflow_roles
+             WHERE org_id = ? AND is_active = TRUE
+             ORDER BY sort_order, name'
+        );
+        $query->execute([$principal['organizationId']]);
+        Runtime::respond(200, ['roles' => $query->fetchAll()]);
+    }
+    if ($method === 'POST' && $path === '/workflow-roles') {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $body = Runtime::jsonBody();
+        $name = is_string($body['name'] ?? null) ? trim($body['name']) : '';
+        $color = is_string($body['color'] ?? null) ? trim($body['color']) : '#6B7280';
+        $icon = is_string($body['icon'] ?? null) ? trim($body['icon']) : 'badge-check';
+        $description = is_string($body['description'] ?? null) ? trim($body['description']) : null;
+        if ($name === '' || strlen($name) > 200 || $color === '' || strlen($color) > 32 || $icon === '' || strlen($icon) > 64 || ($description !== null && strlen($description) > 2000)) {
+            Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid name, color, icon, and optional description are required.']);
+        }
+        $roleId = Runtime::uuid();
+        try {
+            $db->prepare('INSERT INTO workflow_roles (id, org_id, name, color, icon, description, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)')
+                ->execute([$roleId, $principal['organizationId'], $name, $color, $icon, $description ?: null, $principal['userId']]);
+        } catch (PDOException $error) {
+            if ($error->getCode() === '23000') Runtime::respond(409, ['error' => 'ALREADY_EXISTS', 'message' => 'A workflow role with this name already exists.']);
+            throw $error;
+        }
+        Runtime::emitEvent($db, $principal['organizationId'], 'workflow_role.created', $roleId, ['roleId' => $roleId, 'createdBy' => $principal['userId']]);
+        Runtime::respond(201, ['role' => ['id' => $roleId, 'name' => $name, 'color' => $color, 'icon' => $icon, 'description' => $description ?: null, 'sort_order' => 0]]);
+    }
+    if ($method === 'PATCH' && preg_match('#^/workflow-roles/([0-9a-f-]{36})$#i', $path, $matches)) {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $body = Runtime::jsonBody();
+        $roleId = $matches[1];
+        $current = $db->prepare('SELECT id, name, color, icon, description, sort_order FROM workflow_roles WHERE id = ? AND org_id = ? AND is_active = TRUE');
+        $current->execute([$roleId, $principal['organizationId']]);
+        $role = $current->fetch();
+        if (!$role) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Workflow role not found.']);
+        $name = array_key_exists('name', $body) && is_string($body['name']) ? trim($body['name']) : $role['name'];
+        $color = array_key_exists('color', $body) && is_string($body['color']) ? trim($body['color']) : $role['color'];
+        $icon = array_key_exists('icon', $body) && is_string($body['icon']) ? trim($body['icon']) : $role['icon'];
+        $description = array_key_exists('description', $body) ? (is_string($body['description']) ? trim($body['description']) : null) : $role['description'];
+        if ($name === '' || strlen($name) > 200 || $color === '' || strlen($color) > 32 || $icon === '' || strlen($icon) > 64 || ($description !== null && strlen($description) > 2000)) {
+            Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid name, color, icon, and optional description are required.']);
+        }
+        try {
+            $db->prepare('UPDATE workflow_roles SET name = ?, color = ?, icon = ?, description = ?, updated_by = ? WHERE id = ? AND org_id = ?')
+                ->execute([$name, $color, $icon, $description ?: null, $principal['userId'], $roleId, $principal['organizationId']]);
+        } catch (PDOException $error) {
+            if ($error->getCode() === '23000') Runtime::respond(409, ['error' => 'ALREADY_EXISTS', 'message' => 'A workflow role with this name already exists.']);
+            throw $error;
+        }
+        Runtime::emitEvent($db, $principal['organizationId'], 'workflow_role.updated', $roleId, ['roleId' => $roleId, 'updatedBy' => $principal['userId']]);
+        Runtime::respond(200, ['role' => ['id' => $roleId, 'name' => $name, 'color' => $color, 'icon' => $icon, 'description' => $description, 'sort_order' => (int)$role['sort_order']]]);
+    }
+    if ($method === 'DELETE' && preg_match('#^/workflow-roles/([0-9a-f-]{36})$#i', $path, $matches)) {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $roleId = $matches[1];
+        $query = $db->prepare('DELETE FROM workflow_roles WHERE id = ? AND org_id = ?');
+        $query->execute([$roleId, $principal['organizationId']]);
+        if ($query->rowCount() === 0) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Workflow role not found.']);
+        Runtime::emitEvent($db, $principal['organizationId'], 'workflow_role.deleted', $roleId, ['roleId' => $roleId, 'deletedBy' => $principal['userId']]);
+        Runtime::respond(204);
+    }
+    if ($method === 'GET' && $path === '/workflow-role-assignments') {
+        $query = $db->prepare(
+            'SELECT user_id, workflow_role_id
+             FROM user_workflow_roles uwr
+             JOIN workflow_roles wr ON wr.id = uwr.workflow_role_id AND wr.org_id = uwr.org_id
+             WHERE uwr.org_id = ? AND wr.is_active = TRUE
+             ORDER BY uwr.user_id, uwr.workflow_role_id'
+        );
+        $query->execute([$principal['organizationId']]);
+        $assignments = [];
+        foreach ($query->fetchAll() as $assignment) {
+            $assignments[$assignment['user_id']][] = $assignment['workflow_role_id'];
+        }
+        Runtime::respond(200, ['assignments' => (object)$assignments]);
+    }
+    if ($method === 'PUT' && preg_match('#^/users/([0-9a-f-]{36})/workflow-roles$#i', $path, $matches)) {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $targetId = $matches[1];
+        $body = Runtime::jsonBody();
+        $roleIds = $body['roleIds'] ?? null;
+        if (!is_array($roleIds) || count($roleIds) > 100 || count(array_filter($roleIds, static fn($id) => !is_string($id) || !preg_match('/^[0-9a-f-]{36}$/i', $id))) > 0) {
+            Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'roleIds must be an array of valid IDs.']);
+        }
+        $roleIds = array_values(array_unique($roleIds));
+        $member = $db->prepare('SELECT 1 FROM organization_memberships WHERE organization_id = ? AND user_id = ?');
+        $member->execute([$principal['organizationId'], $targetId]);
+        if (!$member->fetch()) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'User not found.']);
+        if ($roleIds !== []) {
+            $placeholders = implode(',', array_fill(0, count($roleIds), '?'));
+            $roles = $db->prepare("SELECT COUNT(*) FROM workflow_roles WHERE org_id = ? AND is_active = TRUE AND id IN ($placeholders)");
+            $roles->execute([$principal['organizationId'], ...$roleIds]);
+            if ((int)$roles->fetchColumn() !== count($roleIds)) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'One or more workflow roles were not found.']);
+        }
+        $db->beginTransaction();
+        try {
+            $db->prepare('DELETE FROM user_workflow_roles WHERE org_id = ? AND user_id = ?')->execute([$principal['organizationId'], $targetId]);
+            if ($roleIds !== []) {
+                $insert = $db->prepare('INSERT INTO user_workflow_roles (id, org_id, user_id, workflow_role_id, assigned_by) VALUES (?, ?, ?, ?, ?)');
+                foreach ($roleIds as $roleId) $insert->execute([Runtime::uuid(), $principal['organizationId'], $targetId, $roleId, $principal['userId']]);
+            }
+            Runtime::emitEvent($db, $principal['organizationId'], 'workflow_role.assignments_updated', $targetId, ['userId' => $targetId, 'roleIds' => $roleIds, 'updatedBy' => $principal['userId']]);
+            $db->commit();
+        } catch (Throwable $error) {
+            if ($db->inTransaction()) $db->rollBack();
+            throw $error;
+        }
+        Runtime::respond(200, ['success' => true, 'roleIds' => $roleIds]);
+    }
     if ($method === 'GET' && preg_match('#^/users/([0-9a-f-]{36})/vault-access$#i', $path, $matches)) {
         $targetId = $matches[1];
         if ($targetId !== $principal['userId'] && !in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
@@ -566,8 +877,137 @@ try {
         }
         Runtime::respond(200, ['success' => true]);
     }
-    // Team management is a first-class Community API. Keep its response names
-    // aligned with src/lib/community.ts so the desktop client never needs a
+    if ($method === 'GET' && preg_match('#^/users/([0-9a-f-]{36})/effective-permissions$#i', $path, $matches)) {
+        $targetId = $matches[1];
+        if ($targetId !== $principal['userId'] && !in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $member = $db->prepare('SELECT m.role FROM organization_memberships m JOIN users u ON u.id = m.user_id WHERE m.organization_id = ? AND m.user_id = ? AND u.disabled_at IS NULL');
+        $member->execute([$principal['organizationId'], $targetId]);
+        $memberRow = $member->fetch();
+        if (!$memberRow) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'User not found.']);
+
+        $merged = [];
+        $mergePermission = static function (array &$target, string $resource, ?string $vaultId, array $actions): void {
+            $key = $resource . "\0" . ($vaultId ?? '');
+            $target[$key] ??= ['resource' => $resource, 'vaultId' => $vaultId, 'actions' => []];
+            $target[$key]['actions'] = array_values(array_unique(array_merge($target[$key]['actions'], $actions)));
+        };
+        $direct = $db->prepare('SELECT resource, vault_id, actions FROM user_permissions WHERE organization_id = ? AND user_id = ?');
+        $direct->execute([$principal['organizationId'], $targetId]);
+        foreach ($direct->fetchAll() as $permission) {
+            $mergePermission($merged, (string)$permission['resource'], $permission['vault_id'] !== null ? (string)$permission['vault_id'] : null, json_decode($permission['actions'], true, 16, JSON_THROW_ON_ERROR));
+        }
+        $teamPermissions = $db->prepare('SELECT tp.resource, tp.vault_id, tp.actions FROM team_permissions tp JOIN team_members tm ON tm.team_id = tp.team_id AND tm.user_id = ? WHERE tp.organization_id = ?');
+        $teamPermissions->execute([$targetId, $principal['organizationId']]);
+        foreach ($teamPermissions->fetchAll() as $permission) {
+            $mergePermission($merged, (string)$permission['resource'], $permission['vault_id'] !== null ? (string)$permission['vault_id'] : null, json_decode($permission['actions'], true, 16, JSON_THROW_ON_ERROR));
+        }
+
+        $vaultQuery = $db->prepare('SELECT id FROM vaults WHERE organization_id = ? ORDER BY name');
+        $vaultQuery->execute([$principal['organizationId']]);
+        $allVaultIds = array_values(array_map(static fn(array $vault): string => (string)$vault['id'], $vaultQuery->fetchAll()));
+        $accessibleVaultIds = [];
+        if (in_array($memberRow['role'], ['owner', 'admin'], true)) {
+            $accessibleVaultIds = $allVaultIds;
+        } else {
+            $directVaults = $db->prepare('SELECT vault_id FROM vault_access WHERE user_id = ? AND vault_id IN (SELECT id FROM vaults WHERE organization_id = ?)');
+            $directVaults->execute([$targetId, $principal['organizationId']]);
+            $accessibleVaultIds = array_column($directVaults->fetchAll(), 'vault_id');
+            $teamIdsQuery = $db->prepare('SELECT team_id FROM team_members WHERE user_id = ?');
+            $teamIdsQuery->execute([$targetId]);
+            foreach ($teamIdsQuery->fetchAll() as $teamRow) {
+                $restricted = $db->prepare('SELECT vault_id FROM team_vault_access WHERE team_id = ?');
+                $restricted->execute([$teamRow['team_id']]);
+                $teamVaultIds = array_column($restricted->fetchAll(), 'vault_id');
+                $accessibleVaultIds = array_merge($accessibleVaultIds, $teamVaultIds === [] ? $allVaultIds : $teamVaultIds);
+            }
+        }
+        Runtime::respond(200, ['permissions' => array_values($merged), 'vaultIds' => array_values(array_unique($accessibleVaultIds))]);
+    }
+    if ($method === 'GET' && preg_match('#^/teams/([0-9a-f-]{36})/permissions$#i', $path, $matches)) {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $teamId = $matches[1];
+        $team = $db->prepare('SELECT id FROM teams WHERE id = ? AND organization_id = ?');
+        $team->execute([$teamId, $principal['organizationId']]);
+        if (!$team->fetch()) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Team not found.']);
+        $query = $db->prepare('SELECT resource, vault_id AS vaultId, actions FROM team_permissions WHERE team_id = ? AND organization_id = ? ORDER BY resource, vault_id');
+        $query->execute([$teamId, $principal['organizationId']]);
+        $permissions = [];
+        foreach ($query->fetchAll() as $permission) $permissions[] = ['resource' => $permission['resource'], 'vaultId' => $permission['vaultId'], 'actions' => json_decode($permission['actions'], true, 16, JSON_THROW_ON_ERROR)];
+        Runtime::respond(200, ['permissions' => $permissions]);
+    }
+    if ($method === 'PUT' && preg_match('#^/teams/([0-9a-f-]{36})/permissions$#i', $path, $matches)) {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $teamId = $matches[1];
+        $team = $db->prepare('SELECT id FROM teams WHERE id = ? AND organization_id = ?');
+        $team->execute([$teamId, $principal['organizationId']]);
+        if (!$team->fetch()) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Team not found.']);
+        $body = Runtime::jsonBody();
+        $entries = $body['permissions'] ?? null;
+        if (!is_array($entries) || count($entries) > 500) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'permissions must be an array.']);
+        $allowedActions = ['view', 'create', 'edit', 'delete', 'admin'];
+        $normalized = [];
+        foreach ($entries as $entry) {
+            if (!is_array($entry)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Each permission must be an object.']);
+            $resource = is_string($entry['resource'] ?? null) ? $entry['resource'] : '';
+            $vaultId = $entry['vaultId'] ?? null;
+            $actions = $entry['actions'] ?? null;
+            if (!preg_match('/^[A-Za-z0-9_.:-]{1,200}$/', $resource) || ($vaultId !== null && (!is_string($vaultId) || !preg_match('/^[0-9a-f-]{36}$/i', $vaultId))) || !is_array($actions) || count($actions) > count($allowedActions)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Each permission requires a valid resource, vaultId, and action array.']);
+            $actions = array_values(array_unique($actions));
+            if (count(array_filter($actions, static fn($action) => !is_string($action) || !in_array($action, $allowedActions, true))) > 0) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A permission contains an unsupported action.']);
+            if ($actions !== []) $normalized[] = [$resource, $vaultId, $actions];
+        }
+        $vaultIds = array_values(array_unique(array_filter(array_map(static fn(array $entry) => $entry[1], $normalized))));
+        if ($vaultIds !== []) {
+            $placeholders = implode(',', array_fill(0, count($vaultIds), '?'));
+            $vaults = $db->prepare("SELECT COUNT(*) FROM vaults WHERE organization_id = ? AND id IN ($placeholders)");
+            $vaults->execute([$principal['organizationId'], ...$vaultIds]);
+            if ((int)$vaults->fetchColumn() !== count($vaultIds)) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'One or more vaults were not found.']);
+        }
+        $db->beginTransaction();
+        try {
+            $db->prepare('DELETE FROM team_permissions WHERE team_id = ? AND organization_id = ?')->execute([$teamId, $principal['organizationId']]);
+            $insert = $db->prepare('INSERT INTO team_permissions (id, organization_id, team_id, resource, vault_id, actions, granted_by) VALUES (?, ?, ?, ?, ?, ?, ?)');
+            foreach ($normalized as [$resource, $vaultId, $actions]) $insert->execute([Runtime::uuid(), $principal['organizationId'], $teamId, $resource, $vaultId, json_encode($actions, JSON_THROW_ON_ERROR), $principal['userId']]);
+            Runtime::emitEvent($db, $principal['organizationId'], 'team.permissions_updated', $teamId, ['teamId' => $teamId, 'updatedBy' => $principal['userId']]);
+            $db->commit();
+        } catch (Throwable $error) { if ($db->inTransaction()) $db->rollBack(); throw $error; }
+        Runtime::respond(200, ['success' => true]);
+    }
+    if ($method === 'GET' && preg_match('#^/teams/([0-9a-f-]{36})/reviewers$#i', $path, $matches)) {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $teamId = $matches[1];
+        $team = $db->prepare('SELECT id FROM teams WHERE id = ? AND organization_id = ?'); $team->execute([$teamId, $principal['organizationId']]);
+        if (!$team->fetch()) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Team not found.']);
+        $query = $db->prepare('SELECT tr.id, tr.team_id, tr.reviewer_type, tr.user_id, tr.workflow_role_id, tr.added_at, u.email, u.display_name AS displayName FROM team_reviewers tr LEFT JOIN users u ON u.id = tr.user_id WHERE tr.team_id = ? AND tr.organization_id = ? ORDER BY tr.added_at');
+        $query->execute([$teamId, $principal['organizationId']]);
+        $reviewers = [];
+        foreach ($query->fetchAll() as $reviewer) {
+            $reviewers[] = ['id' => $reviewer['id'], 'team_id' => $reviewer['team_id'], 'reviewer_type' => $reviewer['reviewer_type'], 'user_id' => $reviewer['user_id'], 'workflow_role_id' => $reviewer['workflow_role_id'], 'added_at' => $reviewer['added_at'], 'user' => $reviewer['user_id'] ? ['id' => $reviewer['user_id'], 'email' => $reviewer['email'], 'full_name' => $reviewer['displayName'], 'avatar_url' => null] : null];
+        }
+        Runtime::respond(200, ['reviewers' => $reviewers]);
+    }
+    if ($method === 'POST' && preg_match('#^/teams/([0-9a-f-]{36})/reviewers$#i', $path, $matches)) {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $teamId = $matches[1]; $body = Runtime::jsonBody();
+        $reviewerType = is_string($body['reviewerType'] ?? null) ? $body['reviewerType'] : '';
+        $userId = is_string($body['userId'] ?? null) ? $body['userId'] : null;
+        $workflowRoleId = is_string($body['workflowRoleId'] ?? null) ? $body['workflowRoleId'] : null;
+        if (!in_array($reviewerType, ['user', 'workflow_role'], true) || ($reviewerType === 'user' && !preg_match('/^[0-9a-f-]{36}$/i', (string)$userId)) || ($reviewerType === 'workflow_role' && !preg_match('/^[0-9a-f-]{36}$/i', (string)$workflowRoleId))) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A reviewer type and matching target are required.']);
+        $team = $db->prepare('SELECT id FROM teams WHERE id = ? AND organization_id = ?'); $team->execute([$teamId, $principal['organizationId']]); if (!$team->fetch()) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Team not found.']);
+        if ($reviewerType === 'user') { $target = $db->prepare('SELECT 1 FROM organization_memberships WHERE organization_id = ? AND user_id = ?'); $target->execute([$principal['organizationId'], $userId]); if (!$target->fetch()) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'User not found.']); }
+        else { $target = $db->prepare('SELECT 1 FROM workflow_roles WHERE org_id = ? AND id = ?'); $target->execute([$principal['organizationId'], $workflowRoleId]); if (!$target->fetch()) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Workflow role not found.']); }
+        $duplicate = $db->prepare('SELECT 1 FROM team_reviewers WHERE organization_id = ? AND team_id = ? AND reviewer_type = ? AND user_id <=> ? AND workflow_role_id <=> ?'); $duplicate->execute([$principal['organizationId'], $teamId, $reviewerType, $userId, $workflowRoleId]); if ($duplicate->fetch()) Runtime::respond(409, ['error' => 'ALREADY_EXISTS', 'message' => 'Reviewer rule already exists.']);
+        $reviewerId = Runtime::uuid(); $db->prepare('INSERT INTO team_reviewers (id, organization_id, team_id, reviewer_type, user_id, workflow_role_id, added_by) VALUES (?, ?, ?, ?, ?, ?, ?)')->execute([$reviewerId, $principal['organizationId'], $teamId, $reviewerType, $userId, $workflowRoleId, $principal['userId']]);
+        Runtime::emitEvent($db, $principal['organizationId'], 'team.reviewer_added', $teamId, ['teamId' => $teamId, 'reviewerId' => $reviewerId, 'addedBy' => $principal['userId']]);
+        Runtime::respond(201, ['id' => $reviewerId]);
+    }
+    if ($method === 'DELETE' && preg_match('#^/team-reviewers/([0-9a-f-]{36})$#i', $path, $matches)) {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $query = $db->prepare('DELETE FROM team_reviewers WHERE id = ? AND organization_id = ?'); $query->execute([$matches[1], $principal['organizationId']]); if ($query->rowCount() === 0) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Reviewer rule not found.']);
+        Runtime::respond(204);
+    }
+    // Team management is a first-class MDB API. Keep its response names
+    // aligned with the MDB client contract so the desktop client never needs a
     // Supabase fallback when MariaDB is selected.
     if ($method === 'GET' && $path === '/teams') {
         $query = $db->prepare(

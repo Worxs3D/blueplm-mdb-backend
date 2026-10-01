@@ -65,6 +65,16 @@ async function request(path, init = {}, token) {
   return body
 }
 
+async function requestStatus(path, init = {}, token) {
+  const headers = new Headers(init.headers)
+  headers.set('Accept', 'application/json')
+  if (init.body) headers.set('Content-Type', 'application/json')
+  if (token) headers.set('Authorization', `Bearer ${token}`)
+  const response = await fetch(`${server}${path}`, { ...init, headers })
+  const body = response.status === 204 ? undefined : await response.json()
+  return { status: response.status, body }
+}
+
 async function waitForHealth() {
   let lastError
   for (let attempt = 0; attempt < 40; attempt += 1) {
@@ -117,6 +127,86 @@ const login = await request('/auth/login', {
 })
 const token = login.token
 
+// Self-registration is opt-in. A request is stored without a membership or
+// role and only becomes usable after an administrator explicitly approves it.
+const registrationBefore = await request('/auth/registration')
+assert.equal(registrationBefore.enabled, false)
+await request(
+  '/organizations/current/settings/auth-providers',
+  {
+    method: 'PUT',
+    body: JSON.stringify({
+      value: {
+        selfRegistration: true,
+        users: { google: false, email: true, phone: false },
+        suppliers: { google: false, email: false, phone: false },
+      },
+    }),
+  },
+  token,
+)
+const registrationAfter = await request('/auth/registration')
+assert.equal(registrationAfter.enabled, true)
+const registration = await request('/auth/register', {
+  method: 'POST',
+  body: JSON.stringify({
+    email: 'self-registered@example.test',
+    displayName: 'Pending User',
+    password: 'Self registered password 123!',
+  }),
+})
+assert.equal(registration.status, 'pending')
+const pendingLogin = await fetch(`${server}/auth/login`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ email: 'self-registered@example.test', password: 'Self registered password 123!' }),
+})
+assert.equal(pendingLogin.status, 401)
+const pendingRequests = await request('/registration-requests', {}, token)
+assert.ok(pendingRequests.requests.some((entry) => entry.email === 'self-registered@example.test'))
+const pendingRequest = pendingRequests.requests.find((entry) => entry.email === 'self-registered@example.test')
+assert.ok(pendingRequest)
+const approved = await request(`/registration-requests/${pendingRequest.id}/approve`, {
+  method: 'POST',
+  body: JSON.stringify({ role: 'viewer' }),
+}, token)
+assert.equal(approved.user.role, 'viewer')
+const approvedLogin = await request('/auth/login', {
+  method: 'POST',
+  body: JSON.stringify({ email: 'self-registered@example.test', password: 'Self registered password 123!' }),
+})
+assert.equal(typeof approvedLogin.token, 'string')
+
+// Emergency registration is a separate recovery flow. It creates an admin
+// directly, consumes the single-use code, and returns an authenticated session.
+const generatedRecoveryCode = await request('/recovery-codes', {
+  method: 'POST',
+  body: JSON.stringify({ description: 'integration emergency registration', expiresInDays: 1 }),
+}, token)
+const emergencyRegistration = await request('/auth/recovery-register', {
+  method: 'POST',
+  body: JSON.stringify({
+    recoveryCode: generatedRecoveryCode.code,
+    email: 'emergency-admin@example.test',
+    displayName: 'Emergency Admin',
+    password: 'Emergency admin password 123!',
+  }),
+})
+assert.equal(emergencyRegistration.user.role, 'admin')
+const emergencyPrincipal = await request('/auth/me', {}, emergencyRegistration.token)
+assert.equal(emergencyPrincipal.user.role, 'admin')
+const reusedRecoveryCode = await fetch(`${server}/auth/recovery-register`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    recoveryCode: generatedRecoveryCode.code,
+    email: 'second-emergency-admin@example.test',
+    displayName: 'Second Emergency Admin',
+    password: 'Emergency admin password 123!',
+  }),
+})
+assert.equal(reusedRecoveryCode.status, 401)
+
 // Authenticator enrollment and challenge verification are public client API
 // contracts. The secret is returned once during enrollment and never stored by
 // the desktop client.
@@ -157,7 +247,7 @@ await request(
   token,
 )
 
-// Community user management must remain a first-class API: no Supabase auth
+// MDB user management must remain a first-class API: no Supabase auth
 // endpoint is involved when an administrator creates or changes an account.
 const createdUser = await request(
   '/users',
@@ -205,7 +295,46 @@ const updatedMemberLogin = await request('/auth/login', {
 })
 assert.equal(typeof updatedMemberLogin.token, 'string')
 
-// Teams are used by the desktop Community backend. A missing GET /teams
+// Workflow roles are separate organization data. Account roles must not create
+// or imply workflow-role assignments, and only organization administrators may
+// edit the role catalog or assignments.
+const workflowRoles = await request('/workflow-roles', {}, token)
+assert.equal(workflowRoles.roles.length, 3)
+const initialWorkflowAssignments = await request('/workflow-role-assignments', {}, token)
+assert.deepEqual(initialWorkflowAssignments.assignments, {})
+const customWorkflowRole = await request('/workflow-roles', {
+  method: 'POST',
+  body: JSON.stringify({
+    name: 'Quality Reviewers',
+    color: '#0EA5E9',
+    icon: 'check-circle',
+    description: 'Review released quality records',
+  }),
+}, token)
+assert.equal(customWorkflowRole.role.name, 'Quality Reviewers')
+const renamedWorkflowRole = await request(`/workflow-roles/${customWorkflowRole.role.id}`, {
+  method: 'PATCH',
+  body: JSON.stringify({ name: 'Quality Approvers' }),
+}, token)
+assert.equal(renamedWorkflowRole.role.name, 'Quality Approvers')
+await request(`/users/${createdUser.id}/workflow-roles`, {
+  method: 'PUT',
+  body: JSON.stringify({ roleIds: [customWorkflowRole.role.id] }),
+}, token)
+const assignedWorkflowRoles = await request('/workflow-role-assignments', {}, token)
+assert.deepEqual(assignedWorkflowRoles.assignments[createdUser.id], [customWorkflowRole.role.id])
+const memberWorkflowRoles = await request('/workflow-roles', {}, updatedMemberLogin.token)
+assert.ok(memberWorkflowRoles.roles.some((role) => role.id === customWorkflowRole.role.id))
+const deniedWorkflowRoleCreate = await requestStatus('/workflow-roles', {
+  method: 'POST',
+  body: JSON.stringify({ name: 'Should Be Denied' }),
+}, updatedMemberLogin.token)
+assert.equal(deniedWorkflowRoleCreate.status, 403)
+await request(`/workflow-roles/${customWorkflowRole.role.id}`, { method: 'DELETE' }, token)
+const assignmentsAfterDelete = await request('/workflow-role-assignments', {}, token)
+assert.deepEqual(assignmentsAfterDelete.assignments, {})
+
+// Teams are used by the desktop MDB backend. A missing GET /teams
 // route makes the client surface "Failed to load teams" immediately after
 // successful login, so retain this as an end-to-end compatibility contract.
 const initialTeams = await request('/teams', {}, token)
@@ -246,6 +375,41 @@ const userTeams = await request(`/users/${createdUser.id}/teams`, {}, token)
 assert.ok(userTeams.teams.some((team) => team.id === createdTeam.id))
 const teamMembers = await request(`/teams/${createdTeam.id}/members`, {}, token)
 assert.ok(teamMembers.members.some((member) => member.userId === createdUser.id))
+const memberProfile = await request(`/users/${createdUser.id}/profile`, {}, token)
+assert.equal(memberProfile.user.id, createdUser.id)
+assert.ok(memberProfile.user.teams.some((team) => team.id === createdTeam.id))
+
+const reviewerWorkflowRole = await request('/workflow-roles', {
+  method: 'POST',
+  body: JSON.stringify({ name: 'Team Reviewer', color: '#16a34a', icon: 'shield-check' }),
+}, token)
+await request(`/teams/${createdTeam.id}/reviewers`, {
+  method: 'POST',
+  body: JSON.stringify({ reviewerType: 'user', userId: createdUser.id }),
+}, token)
+await request(`/teams/${createdTeam.id}/reviewers`, {
+  method: 'POST',
+  body: JSON.stringify({ reviewerType: 'workflow_role', workflowRoleId: reviewerWorkflowRole.role.id }),
+}, token)
+const teamReviewers = await request(`/teams/${createdTeam.id}/reviewers`, {}, token)
+assert.equal(teamReviewers.reviewers.length, 2)
+assert.ok(teamReviewers.reviewers.some((reviewer) => reviewer.user_id === createdUser.id))
+assert.ok(teamReviewers.reviewers.some((reviewer) => reviewer.workflow_role_id === reviewerWorkflowRole.role.id))
+await request(`/team-reviewers/${teamReviewers.reviewers[0].id}`, { method: 'DELETE' }, token)
+
+await request(`/teams/${createdTeam.id}/permissions`, {
+  method: 'PUT',
+  body: JSON.stringify({
+    permissions: [
+      { resource: 'module:explorer', vaultId: null, actions: ['view', 'edit'] },
+      { resource: 'module:history', vaultId: null, actions: ['view'] },
+    ],
+  }),
+}, token)
+const teamPermissions = await request(`/teams/${createdTeam.id}/permissions`, {}, token)
+assert.deepEqual(teamPermissions.permissions.map((permission) => permission.resource), ['module:explorer', 'module:history'])
+const effectivePermissions = await request(`/users/${createdUser.id}/effective-permissions`, {}, updatedMemberLogin.token)
+assert.ok(effectivePermissions.permissions.some((permission) => permission.resource === 'module:explorer' && permission.actions.includes('edit')))
 
 const root = await mkdtemp(join(tmpdir(), 'blueplm-php-vault-'))
 const vaultRoot = join(root, 'vault')
@@ -373,6 +537,50 @@ const guestLogin = await request('/auth/login', {
   method: 'POST',
   body: JSON.stringify({ email: 'guest@example.test', password: 'Integration guest password 123!' }),
 })
+
+// Registration moderation is admin-only. A viewer or guest may not inspect,
+// approve, or reject pending requests.
+await request(
+  '/organizations/current/settings/auth-providers',
+  {
+    method: 'PUT',
+    body: JSON.stringify({
+      value: {
+        selfRegistration: true,
+        users: { google: false, email: true, phone: false },
+        suppliers: { google: false, email: false, phone: false },
+      },
+    }),
+  },
+  token,
+)
+const restrictedRegistration = await request('/auth/register', {
+  method: 'POST',
+  body: JSON.stringify({
+    email: 'moderation-target@example.test',
+    displayName: 'Moderation Target',
+    password: 'Moderation target password 123!',
+  }),
+})
+assert.equal(restrictedRegistration.status, 'pending')
+assert.equal((await requestStatus('/registration-requests', {}, viewerLogin.token)).status, 403)
+assert.equal((await requestStatus('/registration-requests', {}, guestLogin.token)).status, 403)
+const moderationRequests = await request('/registration-requests', {}, token)
+const moderationRequest = moderationRequests.requests.find((entry) => entry.email === 'moderation-target@example.test')
+assert.ok(moderationRequest)
+assert.equal((await requestStatus(`/registration-requests/${moderationRequest.id}/approve`, {
+  method: 'POST',
+  body: JSON.stringify({ role: 'admin' }),
+}, viewerLogin.token)).status, 403)
+assert.equal((await requestStatus(`/registration-requests/${moderationRequest.id}/reject`, {
+  method: 'POST',
+}, guestLogin.token)).status, 403)
+const moderationApproval = await request(`/registration-requests/${moderationRequest.id}/approve`, {
+  method: 'POST',
+  body: JSON.stringify({ role: 'member' }),
+}, token)
+assert.equal(moderationApproval.user.role, 'member')
+
 await request(
   '/module-access/customers',
   { method: 'PUT', body: JSON.stringify({ teamIds: [], userIds: [viewer.id] }) },

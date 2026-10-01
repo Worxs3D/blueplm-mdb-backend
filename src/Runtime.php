@@ -140,7 +140,7 @@ final class Runtime
             [$key, $value] = explode('=', $line, 2);
             $key = trim($key);
             $value = trim($value, " \t\n\r\0\x0B\"");
-            // The shared project configuration predates the Community adapter
+            // The shared project configuration predates the MDB adapter
             // and keeps database values in an INI-like [Mariadb] section.
             // Map only that local section; explicit MARIADB_* variables always
             // take precedence and the unrelated FTP section remains ignored.
