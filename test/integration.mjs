@@ -295,6 +295,27 @@ const updatedMemberLogin = await request('/auth/login', {
 })
 assert.equal(typeof updatedMemberLogin.token, 'string')
 
+// Sidebar module defaults are an MDB organization contract.  The owner can
+// persist and read them, while a regular member cannot mutate the org record.
+const moduleDefaults = {
+  enabled_modules: { explorer: true, history: false },
+  enabled_groups: {},
+  module_order: ['explorer', 'history'],
+  dividers: [],
+  module_parents: {},
+  module_icon_colors: {},
+  custom_groups: [],
+}
+await request('/organizations/current/settings/modules', {
+  method: 'PUT',
+  body: JSON.stringify({ value: moduleDefaults }),
+}, token)
+const storedModuleDefaults = await request('/organizations/current/settings/modules', {}, token)
+assert.equal(storedModuleDefaults.value.enabled_modules.history, false)
+assert.equal((await requestStatus('/organizations/current/settings/modules', {
+  method: 'PUT',
+  body: JSON.stringify({ value: moduleDefaults }),
+}, updatedMemberLogin.token)).status, 403)
 // Supplier CRUD is tenant-scoped and role-gated. The list endpoint exposes
 // active records only; deactivation keeps historical part assignments intact.
 const supplier = await request('/suppliers', {
@@ -401,6 +422,34 @@ const createdTeam = await request(
   token,
 )
 assert.equal(createdTeam.name, 'Integration Team')
+const teamDefaults = { enabled_modules: { explorer: true }, module_order: ['explorer'] }
+assert.equal((await requestStatus(`/teams/${createdTeam.id}/module-defaults`, {
+  method: 'PUT', body: JSON.stringify({ defaults: 'invalid' }),
+}, token)).status, 400)
+const savedTeamDefaults = await request(`/teams/${createdTeam.id}/module-defaults`, {
+  method: 'PUT',
+  body: JSON.stringify({ defaults: teamDefaults }),
+}, token)
+assert.equal(savedTeamDefaults.success, true)
+execFileSync('docker', [
+  'compose', '-f', 'docker-compose.test.yml', 'exec', '-T', 'mariadb',
+  'mariadb', '-uroot', '-proot-test-password', '-e',
+  "SET GLOBAL sql_mode = CONCAT(@@GLOBAL.sql_mode, ',ONLY_FULL_GROUP_BY')",
+], { cwd: process.cwd(), stdio: 'pipe' })
+const teamsWithDefaults = await request('/teams', {}, token)
+assert.deepEqual(
+  teamsWithDefaults.teams.find((team) => team.id === createdTeam.id)?.module_defaults,
+  teamDefaults,
+)
+assert.deepEqual((await request(`/teams/${createdTeam.id}/module-defaults`, {}, token)).defaults, teamDefaults)
+assert.equal((await requestStatus(`/teams/${createdTeam.id}/module-defaults`, {
+  method: 'PUT', body: JSON.stringify({ defaults: teamDefaults }),
+}, updatedMemberLogin.token)).status, 403)
+assert.equal((await requestStatus(`/teams/${createdTeam.id}/module-defaults`, {
+  method: 'DELETE',
+}, updatedMemberLogin.token)).status, 403)
+await request(`/teams/${createdTeam.id}/module-defaults`, { method: 'DELETE' }, token)
+assert.equal((await request(`/teams/${createdTeam.id}/module-defaults`, {}, token)).defaults, null)
 const teams = await request('/teams', {}, token)
 assert.ok(teams.teams.some((team) => team.id === createdTeam.id && team.memberCount === 0))
 const updatedTeam = await request(
