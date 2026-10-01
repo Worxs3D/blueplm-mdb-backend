@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { createHmac, randomUUID } from 'node:crypto'
+import { createHmac, generateKeyPairSync, randomUUID, sign } from 'node:crypto'
 import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -75,12 +75,19 @@ async function requestStatus(path, init = {}, token) {
   return { status: response.status, body }
 }
 
+function backupAssertion(fields, privateKey) {
+  return sign(null, Buffer.from(['blueplm-backup-v1', fields.method, fields.endpoint,
+    fields.organizationId, fields.userId, fields.machineId, fields.keyVersion,
+    fields.challengeId, fields.nonce].join('|')), privateKey).toString('base64url')
+}
+
 async function waitForHealth() {
   let lastError
   for (let attempt = 0; attempt < 40; attempt += 1) {
     try {
       const health = await request('/health')
       if (health.ok === true && health.supabase === false && health.apiVersion === 2) {
+        assert.ok(health.capabilities.includes('backup'))
         // A fresh/legacy deployment has no identity until the desktop installer
         // publishes one; clients must classify this as unknown, never current.
         assert.equal(health.bundleDigest, null)
@@ -554,6 +561,142 @@ const defaultTeam = await request(
   token,
 )
 assert.equal(defaultTeam.defaultNewUserTeamId, createdTeam.id)
+
+// Backup and Vault Audit are native MDB contracts. Backup credentials are only
+// returned to administrators; audit reads are vault-scoped while repairs are
+// administrator-only and every route is organization-bound.
+const backupConfig = await request('/backup/config', {
+  method: 'PUT',
+  body: JSON.stringify({
+    provider: 'aws_s3', bucket: 'integration-bucket', region: 'eu-central-1',
+    endpoint: null, access_key_encrypted: 'cipher-access', secret_key_encrypted: 'cipher-secret',
+    restic_password_encrypted: 'cipher-restic', retention_daily: 7, retention_weekly: 4,
+    retention_monthly: 12, retention_yearly: 3, schedule_enabled: false,
+    schedule_hour: 0, schedule_minute: 0, schedule_timezone: 'UTC',
+  }),
+}, token)
+assert.equal(backupConfig.config.provider, 'aws_s3')
+assert.equal(Object.hasOwn(backupConfig.config, 'secret_key_encrypted'), false)
+assert.equal(backupConfig.config.has_secret_key, true)
+assert.equal((await request('/backup/config', {}, token)).config.bucket, 'integration-bucket')
+const memberBackupConfig = await request('/backup/config', {}, updatedMemberLogin.token)
+assert.equal(memberBackupConfig.config.bucket, 'integration-bucket')
+assert.equal(Object.hasOwn(memberBackupConfig.config, 'secret_key_encrypted'), false)
+assert.equal((await requestStatus('/backup/config', {
+  method: 'PUT', body: JSON.stringify({ provider: 'aws_s3', bucket: 'member-write' }),
+}, updatedMemberLogin.token)).status, 403)
+assert.equal((await requestStatus('/backup/config', {
+  method: 'PUT', body: JSON.stringify({ provider: 'aws_s3', bucket: 'bad', schedule_enabled: 'false' }),
+}, token)).status, 400)
+await request('/backup/designate', {
+  method: 'POST',
+  body: JSON.stringify({ machineId: 'integration-machine', machineName: 'Integration Host', platform: 'linux', publicKey: generateKeyPairSync('ed25519').publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('base64url') }),
+}, token)
+assert.equal((await request('/backup/config', {}, token)).config.designated_machine_id, 'integration-machine')
+// Every device-side action, including request, redeems a fresh assertion bound
+// to its exact POST route. Keep the private test key off the API payload.
+const backupKey = generateKeyPairSync('ed25519')
+await request('/backup/designate', {
+  method: 'POST',
+  body: JSON.stringify({ machineId: 'integration-machine', machineName: 'Integration Host', platform: 'linux', publicKey: backupKey.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('base64url') }),
+}, token)
+const backupPrincipal = (await request('/auth/me', {}, token)).user
+async function signedBackupAction(endpoint, action = endpoint, method = endpoint === 'runtime-config' ? 'GET' : 'POST') {
+  const challenge = await request('/backup/device/challenge', { method: 'POST', body: JSON.stringify({ deviceId: 'integration-machine', endpoint }) }, token)
+  const signature = backupAssertion({ method, endpoint: action, organizationId: backupPrincipal.organizationId, userId: backupPrincipal.userId, machineId: 'integration-machine', keyVersion: challenge.keyVersion, challengeId: challenge.challengeId, nonce: challenge.nonce }, backupKey.privateKey)
+  const headers = { 'X-BluePLM-Device-Challenge': challenge.challengeId, 'X-BluePLM-Device-Signature': signature }
+  const path = endpoint === 'runtime-config' ? '/backup/runtime-config?machineId=integration-machine' : `/backup/${endpoint}`
+  return { challenge, headers, path }
+}
+const runtimeAssertion = await signedBackupAction('runtime-config')
+const runtimeBackupConfig = await request(runtimeAssertion.path, { headers: runtimeAssertion.headers }, token)
+assert.equal(runtimeBackupConfig.config.secret_key_encrypted, 'cipher-secret')
+assert.equal((await requestStatus('/backup/runtime-config?machineId=integration-machine', {}, updatedMemberLogin.token)).status, 403)
+assert.equal((await requestStatus('/backup/runtime-config?machineId=wrong-machine', {}, token)).status, 403)
+for (const endpoint of ['heartbeat', 'start', 'complete']) {
+  assert.equal((await requestStatus(`/backup/${endpoint}`, { method: 'POST', body: JSON.stringify({ machineId: 'integration-machine' }) }, token)).status, 403)
+  const assertion = await signedBackupAction(endpoint)
+  const result = await request(assertion.path, { method: 'POST', headers: assertion.headers, body: JSON.stringify({ machineId: 'integration-machine' }) }, token)
+  assert.ok(result.active === true || result.success === true)
+}
+// A captured assertion is single-use and cannot be retargeted to another
+// method/action, even when account and device ID are unchanged.
+const replay = await signedBackupAction('heartbeat')
+assert.equal((await request(replay.path, { method: 'POST', headers: replay.headers, body: JSON.stringify({ machineId: 'integration-machine' }) }, token)).active, true)
+assert.equal((await requestStatus(replay.path, { method: 'POST', headers: replay.headers, body: JSON.stringify({ machineId: 'integration-machine' }) }, token)).status, 403)
+const tampered = await signedBackupAction('heartbeat', 'start')
+assert.equal((await requestStatus(tampered.path, { method: 'POST', headers: tampered.headers, body: JSON.stringify({ machineId: 'integration-machine' }) }, token)).status, 403)
+const wrongKey = generateKeyPairSync('ed25519')
+const wrongKeyChallenge = await request('/backup/device/challenge', { method: 'POST', body: JSON.stringify({ deviceId: 'integration-machine', endpoint: 'heartbeat' }) }, token)
+const wrongKeyHeaders = {
+  'X-BluePLM-Device-Challenge': wrongKeyChallenge.challengeId,
+  'X-BluePLM-Device-Signature': backupAssertion({ method: 'POST', endpoint: 'heartbeat', organizationId: backupPrincipal.organizationId, userId: backupPrincipal.userId, machineId: 'integration-machine', keyVersion: wrongKeyChallenge.keyVersion, challengeId: wrongKeyChallenge.challengeId, nonce: wrongKeyChallenge.nonce }, wrongKey.privateKey),
+}
+assert.equal((await requestStatus('/backup/heartbeat', { method: 'POST', headers: wrongKeyHeaders, body: JSON.stringify({ machineId: 'integration-machine' }) }, token)).status, 403)
+const expired = await signedBackupAction('complete')
+execFileSync('docker', ['compose', '-f', 'docker-compose.test.yml', 'exec', '-T', 'mariadb', 'mariadb', '-ublueplm', '-pblueplm-test-password', 'blueplm', '-e', `UPDATE backup_device_challenges SET expires_at = DATE_SUB(UTC_TIMESTAMP(3), INTERVAL 1 SECOND) WHERE id = '${expired.challenge.challengeId}'`], { cwd: process.cwd(), stdio: 'pipe' })
+assert.equal((await requestStatus(expired.path, { method: 'POST', headers: expired.headers, body: JSON.stringify({ machineId: 'integration-machine' }) }, token)).status, 403)
+assert.equal((await requestStatus('/backup/designate', { method: 'DELETE' }, updatedMemberLogin.token)).status, 403)
+// Requests are authenticated user actions. A client-supplied identity or device
+// must be ignored; the server records only the bearer principal in this org.
+assert.equal((await request('/backup/request', { method: 'POST', body: JSON.stringify({ userEmail: 'spoofed@example.test', machineId: 'other-machine' }) }, token)).success, true)
+const backupRow = execFileSync('docker', [
+  'compose', '-f', 'docker-compose.test.yml', 'exec', '-T', 'mariadb',
+  'mariadb', '-ublueplm', '-pblueplm-test-password', 'blueplm', '-N', '-B', '-e',
+  "SELECT backup_requested_by, secret_key_encrypted FROM backup_config LIMIT 1",
+], { cwd: process.cwd(), encoding: 'utf8' }).trim().split('\t')
+assert.equal(backupRow[0], backupPrincipal.userId)
+assert.notEqual(backupRow[1], 'cipher-secret')
+const foreignBackupOrgId = randomUUID()
+const foreignBackupPassword = 'Foreign backup password 123!'
+const foreignBackupUser = await request('/users', {
+  method: 'POST',
+  body: JSON.stringify({ email: 'foreign-backup-owner@example.test', displayName: 'Foreign Backup Owner', password: foreignBackupPassword, role: 'admin' }),
+}, token)
+const foreignBackupSql = `INSERT INTO organizations (id, name, slug) VALUES ('${foreignBackupOrgId}', 'Foreign Backup Org', 'foreign-backup-org'); DELETE FROM organization_memberships WHERE user_id = '${foreignBackupUser.id}'; INSERT INTO organization_memberships (organization_id, user_id, role) VALUES ('${foreignBackupOrgId}', '${foreignBackupUser.id}', 'admin');`
+execFileSync('docker', [
+  'compose', '-f', 'docker-compose.test.yml', 'exec', '-T', 'mariadb',
+  'mariadb', '-ublueplm', '-pblueplm-test-password', 'blueplm', '-e', foreignBackupSql,
+], { cwd: process.cwd(), stdio: 'pipe' })
+const foreignBackupLogin = await request('/auth/login', {
+  method: 'POST',
+  body: JSON.stringify({ email: 'foreign-backup-owner@example.test', password: foreignBackupPassword }),
+})
+assert.equal((await requestStatus('/backup/device/challenge', {
+  method: 'POST', body: JSON.stringify({ deviceId: 'integration-machine', endpoint: 'heartbeat' }),
+}, foreignBackupLogin.token)).status, 403)
+const preRotation = await signedBackupAction('complete')
+const rotatedKey = generateKeyPairSync('ed25519')
+await request('/backup/designate', {
+  method: 'POST',
+  body: JSON.stringify({ machineId: 'integration-machine', machineName: 'Integration Host', platform: 'linux', publicKey: rotatedKey.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('base64url') }),
+}, token)
+assert.equal((await requestStatus(preRotation.path, { method: 'POST', headers: preRotation.headers, body: JSON.stringify({ machineId: 'integration-machine' }) }, token)).status, 403)
+await request('/backup/designate', { method: 'DELETE' }, token)
+assert.equal((await requestStatus('/backup/device/challenge', {
+  method: 'POST', body: JSON.stringify({ deviceId: 'integration-machine', endpoint: 'heartbeat' }),
+}, token)).status, 403)
+
+const auditPage = await request(`/vault-audit/files?vaultId=${encodeURIComponent(vault.id)}&page=1&limit=25`, {}, token)
+assert.equal(auditPage.page, 1)
+assert.equal(auditPage.limit, 25)
+assert.equal(typeof auditPage.total, 'number')
+const memberAuditPage = await request(`/vault-audit/files?vaultId=${encodeURIComponent(vault.id)}&page=1&limit=25`, {}, updatedMemberLogin.token)
+assert.equal(memberAuditPage.total, auditPage.total)
+assert.equal((await request('/vault-audit/repair', {
+  method: 'POST', body: JSON.stringify({ vaultId: vault.id, updates: [] }),
+}, token)).updated, 0)
+assert.equal((await requestStatus(`/vault-audit/repair`, {
+  method: 'POST', body: JSON.stringify({ vaultId: vault.id, updates: [] }),
+}, updatedMemberLogin.token)).status, 403)
+assert.equal((await requestStatus('/vault-audit/runs', {
+  method: 'POST', body: JSON.stringify({ vaultId: vault.id, pageCount: 1, findingCount: 0 }),
+}, updatedMemberLogin.token)).status, 403)
+const auditRun = await request('/vault-audit/runs', {
+  method: 'POST', body: JSON.stringify({ vaultId: vault.id, pageCount: 1, findingCount: 0, summary: { source: 'integration' } }),
+}, token)
+assert.equal(typeof auditRun.id, 'string')
+assert.equal((await requestStatus(`/vault-audit/files?vaultId=00000000-0000-0000-0000-000000000000`, {}, token)).status, 404)
 
 const serializationSettings = {
   enabled: true,

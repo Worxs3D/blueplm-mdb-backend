@@ -343,6 +343,7 @@ try {
         'runtime' => 'php',
         'supabase' => false,
         'apiVersion' => BLUEPLM_API_VERSION,
+        'capabilities' => ['backup'],
         'bundleVersion' => $manifest['version'] ?? null,
         'bundleReleaseVersion' => $manifest['releaseVersion'] ?? null,
         'bundleDigest' => $manifest['digest'] ?? null,
@@ -523,6 +524,263 @@ try {
         Runtime::respond(200, ['user' => Runtime::principal($db, $env)]);
     }
     $principal = Runtime::principal($db, $env);
+
+    /**
+     * Redeem one device challenge for one exact backup action.  The challenge
+     * row, credential lifecycle, current designation, principal and payload
+     * are checked under a lock before consumed_at is written, making an
+     * intercepted assertion useless for a second action or route.
+     */
+    $requireBackupDeviceAssertion = static function (string $action, string $machineId) use ($db, $principal): void {
+        $challengeId = is_string($_SERVER['HTTP_X_BLUEPLM_DEVICE_CHALLENGE'] ?? null) ? trim($_SERVER['HTTP_X_BLUEPLM_DEVICE_CHALLENGE']) : '';
+        $signature = is_string($_SERVER['HTTP_X_BLUEPLM_DEVICE_SIGNATURE'] ?? null) ? trim($_SERVER['HTTP_X_BLUEPLM_DEVICE_SIGNATURE']) : '';
+        if ($machineId === '' || strlen($machineId) > 255 || !preg_match('/^[0-9a-f-]{36}$/i', $challengeId) || $signature === '') {
+            Runtime::respond(403, ['error' => 'BACKUP_DEVICE_NOT_AUTHORIZED', 'message' => 'A signed device assertion is required.']);
+        }
+        $db->beginTransaction();
+        try {
+            $query = $db->prepare("SELECT c.*, d.public_key, d.status, d.key_version AS credential_key_version
+                FROM backup_device_challenges c
+                JOIN backup_device_credentials d ON d.id = c.credential_id
+                JOIN backup_config b ON b.organization_id = c.organization_id AND b.designated_machine_id = c.device_id
+                WHERE c.id = ? AND c.organization_id = ? AND c.designated_user_id = ? AND c.device_id = ?
+                FOR UPDATE");
+            $query->execute([$challengeId, $principal['organizationId'], $principal['userId'], $machineId]);
+            $challenge = $query->fetch();
+            if (!$challenge || $challenge['status'] !== 'active' || (int)$challenge['credential_key_version'] !== (int)$challenge['key_version'] || $challenge['consumed_at'] !== null || $challenge['endpoint'] !== $action || strtotime($challenge['expires_at']) < time()) {
+                throw new \RuntimeException('DEVICE_ASSERTION_INVALID');
+            }
+            $payload = implode('|', ['blueplm-backup-v1', 'POST', $action, $principal['organizationId'], $principal['userId'], $machineId, $challenge['key_version'], $challengeId, Runtime::base64UrlEncode($challenge['nonce'])]);
+            try {
+                $valid = function_exists('sodium_crypto_sign_verify_detached')
+                    && sodium_crypto_sign_verify_detached(Runtime::base64UrlDecode($signature), $payload, $challenge['public_key']);
+            } catch (\Throwable) {
+                $valid = false;
+            }
+            if (!$valid) throw new \RuntimeException('DEVICE_ASSERTION_INVALID');
+            $used = $db->prepare('UPDATE backup_device_challenges SET consumed_at = UTC_TIMESTAMP(3) WHERE id = ? AND consumed_at IS NULL');
+            $used->execute([$challengeId]);
+            if ($used->rowCount() !== 1) throw new \RuntimeException('DEVICE_ASSERTION_INVALID');
+            $db->commit();
+        } catch (\RuntimeException $error) {
+            if ($db->inTransaction()) $db->rollBack();
+            if ($error->getMessage() === 'DEVICE_ASSERTION_INVALID') Runtime::respond(403, ['error' => 'BACKUP_DEVICE_NOT_AUTHORIZED', 'message' => 'The device assertion is invalid, expired, or already used.']);
+            throw $error;
+        } catch (\Throwable $error) {
+            if ($db->inTransaction()) $db->rollBack();
+            throw $error;
+        }
+    };
+
+    // Backup control plane. The API stores only opaque client-encrypted provider
+    // values and scopes every query to the authenticated organization.
+    // Device credentials are asymmetric: only the Electron main process owns
+    // the private key. A signed assertion always redeems a fresh, single-use
+    // challenge so neither a device id nor a captured signature is reusable.
+    if ($method === 'POST' && $path === '/backup/device/challenge') {
+        $body = Runtime::jsonBody();
+        $deviceId = is_string($body['deviceId'] ?? null) ? trim($body['deviceId']) : '';
+        $endpoint = is_string($body['endpoint'] ?? null) ? trim($body['endpoint']) : '';
+        if ($deviceId === '' || strlen($deviceId) > 255 || !in_array($endpoint, ['runtime-config', 'heartbeat', 'request', 'start', 'complete'], true)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Valid device and endpoint are required.']);
+        $credential = $db->prepare("SELECT d.* FROM backup_device_credentials d JOIN backup_config b ON b.organization_id = d.organization_id AND b.designated_machine_id = d.device_id WHERE d.organization_id = ? AND d.designated_user_id = ? AND d.device_id = ? AND d.status = 'active' ORDER BY d.key_version DESC LIMIT 1");
+        $credential->execute([$principal['organizationId'], $principal['userId'], $deviceId]);
+        $credential = $credential->fetch();
+        if (!$credential) Runtime::respond(403, ['error' => 'BACKUP_DEVICE_NOT_AUTHORIZED', 'message' => 'This device is not authorized.']);
+        $id = Runtime::uuid(); $nonce = random_bytes(32);
+        $db->prepare('INSERT INTO backup_device_challenges (id, credential_id, organization_id, designated_user_id, device_id, key_version, endpoint, nonce, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, DATE_ADD(UTC_TIMESTAMP(3), INTERVAL 60 SECOND))')->execute([$id, $credential['id'], $principal['organizationId'], $principal['userId'], $deviceId, $credential['key_version'], $endpoint, $nonce]);
+        Runtime::respond(200, ['challengeId' => $id, 'nonce' => Runtime::base64UrlEncode($nonce), 'keyVersion' => (int)$credential['key_version'], 'expiresInSeconds' => 60]);
+    }
+    if ($method === 'GET' && $path === '/backup/runtime-config') {
+        $machineId = is_string($_GET['machineId'] ?? null) ? trim($_GET['machineId']) : '';
+        $challengeId = is_string($_SERVER['HTTP_X_BLUEPLM_DEVICE_CHALLENGE'] ?? null) ? trim($_SERVER['HTTP_X_BLUEPLM_DEVICE_CHALLENGE']) : '';
+        $signature = is_string($_SERVER['HTTP_X_BLUEPLM_DEVICE_SIGNATURE'] ?? null) ? trim($_SERVER['HTTP_X_BLUEPLM_DEVICE_SIGNATURE']) : '';
+        if ($machineId === '' || strlen($machineId) > 255 || !preg_match('/^[0-9a-f-]{36}$/i', $challengeId) || $signature === '') Runtime::respond(403, ['error' => 'BACKUP_DEVICE_NOT_AUTHORIZED', 'message' => 'A signed device assertion is required.']);
+        $db->beginTransaction();
+        try {
+            $query = $db->prepare("SELECT c.*, d.public_key, d.status, d.key_version AS credential_key_version FROM backup_device_challenges c JOIN backup_device_credentials d ON d.id = c.credential_id JOIN backup_config b ON b.organization_id = c.organization_id AND b.designated_machine_id = c.device_id WHERE c.id = ? AND c.organization_id = ? AND c.designated_user_id = ? AND c.device_id = ? FOR UPDATE");
+            $query->execute([$challengeId, $principal['organizationId'], $principal['userId'], $machineId]); $challenge = $query->fetch();
+            if (!$challenge || $challenge['status'] !== 'active' || (int)$challenge['credential_key_version'] !== (int)$challenge['key_version'] || $challenge['consumed_at'] !== null || $challenge['endpoint'] !== 'runtime-config' || strtotime($challenge['expires_at']) < time()) throw new \RuntimeException('DEVICE_ASSERTION_INVALID');
+            $payload = implode('|', ['blueplm-backup-v1', 'GET', 'runtime-config', $principal['organizationId'], $principal['userId'], $machineId, $challenge['key_version'], $challengeId, Runtime::base64UrlEncode($challenge['nonce'])]);
+            try { $valid = function_exists('sodium_crypto_sign_verify_detached') && sodium_crypto_sign_verify_detached(Runtime::base64UrlDecode($signature), $payload, $challenge['public_key']); } catch (\Throwable) { $valid = false; }
+            if (!$valid) throw new \RuntimeException('DEVICE_ASSERTION_INVALID');
+            $used = $db->prepare('UPDATE backup_device_challenges SET consumed_at = UTC_TIMESTAMP(3) WHERE id = ? AND consumed_at IS NULL'); $used->execute([$challengeId]);
+            if ($used->rowCount() !== 1) throw new \RuntimeException('DEVICE_ASSERTION_INVALID');
+            $query = $db->prepare('SELECT * FROM backup_config WHERE organization_id = ? AND designated_machine_id = ?'); $query->execute([$principal['organizationId'], $machineId]); $row = $query->fetch();
+            if (!$row) throw new \RuntimeException('DEVICE_ASSERTION_INVALID');
+            foreach (['access_key_encrypted', 'secret_key_encrypted', 'restic_password_encrypted'] as $secretField) $row[$secretField] = $row[$secretField] === null ? null : Runtime::decryptSecret($row[$secretField], $env);
+            $db->commit(); $row['id'] = $row['organization_id']; $row['org_id'] = $row['organization_id']; $row['schedule_enabled'] = (bool)$row['schedule_enabled'];
+            header('Pragma: no-cache'); Runtime::respond(200, ['config' => $row]);
+        } catch (\RuntimeException $error) {
+            if ($db->inTransaction()) $db->rollBack();
+            if ($error->getMessage() === 'DEVICE_ASSERTION_INVALID') Runtime::respond(403, ['error' => 'BACKUP_DEVICE_NOT_AUTHORIZED', 'message' => 'The device assertion is invalid, expired, or already used.']);
+            throw $error;
+        } catch (\Throwable $error) { if ($db->inTransaction()) $db->rollBack(); throw $error; }
+    }
+    if ($path === '/backup/config' && in_array($method, ['GET', 'PUT'], true)) {
+        if ($method === 'PUT' && !in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        if ($method === 'GET') {
+            $query = $db->prepare('SELECT * FROM backup_config WHERE organization_id = ?');
+            $query->execute([$principal['organizationId']]);
+            $row = $query->fetch() ?: null;
+            if ($row) {
+                $row['id'] = $row['organization_id'];
+                $row['org_id'] = $row['organization_id'];
+                foreach (['schedule_enabled'] as $flag) $row[$flag] = (bool)$row[$flag];
+                foreach (['retention_daily', 'retention_weekly', 'retention_monthly', 'retention_yearly', 'schedule_hour', 'schedule_minute'] as $number) $row[$number] = (int)$row[$number];
+                foreach (['access_key_encrypted', 'secret_key_encrypted', 'restic_password_encrypted'] as $secretField) {
+                    $row['has_' . str_replace('_encrypted', '', $secretField)] = is_string($row[$secretField] ?? null) && $row[$secretField] !== '';
+                    unset($row[$secretField]);
+                }
+            }
+            Runtime::respond(200, ['config' => $row]);
+        }
+        $body = Runtime::jsonBody();
+        $provider = is_string($body['provider'] ?? null) ? $body['provider'] : 'backblaze_b2';
+        if (!in_array($provider, ['backblaze_b2', 'aws_s3', 'google_cloud'], true)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Unsupported backup provider.']);
+        $stringField = static function (array $body, string $key, int $max): ?string {
+            if (!array_key_exists($key, $body) || $body[$key] === null) return null;
+            if (!is_string($body[$key]) || strlen($body[$key]) > $max || str_contains($body[$key], "\0") || str_contains($body[$key], "\r") || str_contains($body[$key], "\n")) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Invalid backup configuration field.']);
+            return trim($body[$key]);
+        };
+        $bucket = $stringField($body, 'bucket', 512);
+        if (!$bucket) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A backup bucket is required.']);
+        $region = $stringField($body, 'region', 128);
+        $endpoint = $stringField($body, 'endpoint', 2048);
+        $existingConfig = $db->prepare('SELECT access_key_encrypted, secret_key_encrypted, restic_password_encrypted FROM backup_config WHERE organization_id = ?');
+        $existingConfig->execute([$principal['organizationId']]);
+        $existingSecrets = $existingConfig->fetch() ?: [];
+        $secretValues = [];
+        foreach (['access_key_encrypted', 'secret_key_encrypted', 'restic_password_encrypted'] as $secretField) {
+            $value = $body[$secretField] ?? null;
+            if ($value === null) {
+                $secretValues[$secretField] = $existingSecrets[$secretField] ?? null;
+                continue;
+            }
+            if (!is_string($value) || strlen($value) > 20000 || str_contains($value, "\0") || str_contains($value, "\r") || str_contains($value, "\n")) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Invalid backup secret.']);
+            $secretValues[$secretField] = $value === '' ? null : Runtime::encryptSecret($value, $env);
+        }
+        $integerField = static function (array $body, string $key, int $default, int $max): int {
+            $value = $body[$key] ?? $default;
+            if (!is_int($value) || $value < 0 || $value > $max) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Invalid backup number.']);
+            return $value;
+        };
+        $scheduleEnabled = $body['schedule_enabled'] ?? false;
+        if (!is_bool($scheduleEnabled)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'schedule_enabled must be boolean.']);
+        $scheduleTimezone = $stringField($body, 'schedule_timezone', 128) ?: 'UTC';
+        $values = [
+            $principal['organizationId'], $provider, $bucket, $region, $endpoint,
+            $secretValues['access_key_encrypted'], $secretValues['secret_key_encrypted'], $secretValues['restic_password_encrypted'],
+            $integerField($body, 'retention_daily', 7, 3650), $integerField($body, 'retention_weekly', 4, 520), $integerField($body, 'retention_monthly', 12, 120), $integerField($body, 'retention_yearly', 3, 100),
+            $scheduleEnabled ? 1 : 0, $integerField($body, 'schedule_hour', 0, 23), $integerField($body, 'schedule_minute', 0, 59), $scheduleTimezone,
+        ];
+        $db->prepare('INSERT INTO backup_config (organization_id, provider, bucket, region, endpoint, access_key_encrypted, secret_key_encrypted, restic_password_encrypted, retention_daily, retention_weekly, retention_monthly, retention_yearly, schedule_enabled, schedule_hour, schedule_minute, schedule_timezone) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE provider=VALUES(provider), bucket=VALUES(bucket), region=VALUES(region), endpoint=VALUES(endpoint), access_key_encrypted=VALUES(access_key_encrypted), secret_key_encrypted=VALUES(secret_key_encrypted), restic_password_encrypted=VALUES(restic_password_encrypted), retention_daily=VALUES(retention_daily), retention_weekly=VALUES(retention_weekly), retention_monthly=VALUES(retention_monthly), retention_yearly=VALUES(retention_yearly), schedule_enabled=VALUES(schedule_enabled), schedule_hour=VALUES(schedule_hour), schedule_minute=VALUES(schedule_minute), schedule_timezone=VALUES(schedule_timezone), updated_at=UTC_TIMESTAMP(3)')->execute($values);
+        $query = $db->prepare('SELECT * FROM backup_config WHERE organization_id = ?');
+        $query->execute([$principal['organizationId']]);
+        $row = $query->fetch();
+        $row['id'] = $row['organization_id']; $row['org_id'] = $row['organization_id']; $row['schedule_enabled'] = (bool)$row['schedule_enabled'];
+        foreach (['access_key_encrypted', 'secret_key_encrypted', 'restic_password_encrypted'] as $secretField) {
+            $row['has_' . str_replace('_encrypted', '', $secretField)] = is_string($row[$secretField] ?? null) && $row[$secretField] !== '';
+            unset($row[$secretField]);
+        }
+        Runtime::emitEvent($db, $principal['organizationId'], 'backup.config_updated', $principal['organizationId'], ['updatedBy' => $principal['userId']]);
+        Runtime::respond(200, ['config' => $row]);
+    }
+    if ($path === '/backup/designate' && in_array($method, ['POST', 'DELETE'], true)) {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $db->beginTransaction();
+        try {
+        if ($method === 'DELETE') {
+            $db->prepare("UPDATE backup_device_credentials SET status = 'revoked', revoked_at = UTC_TIMESTAMP(3) WHERE organization_id = ? AND status = 'active'")->execute([$principal['organizationId']]);
+            $db->prepare('UPDATE backup_config SET designated_machine_id = NULL, designated_machine_name = NULL, designated_machine_platform = NULL, designated_machine_user_email = NULL, designated_machine_proof_hash = NULL, designated_machine_last_seen = NULL, updated_at = UTC_TIMESTAMP(3) WHERE organization_id = ?')->execute([$principal['organizationId']]);
+            $db->commit();
+            Runtime::respond(200, ['success' => true]);
+        }
+        $body = Runtime::jsonBody();
+        foreach (['machineId', 'machineName', 'platform', 'publicKey'] as $key) if (!is_string($body[$key] ?? null) || trim($body[$key]) === '' || strlen($body[$key]) > 512) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Valid machine details are required.']);
+        $publicKey = Runtime::base64UrlDecode(trim($body['publicKey']));
+        if (strlen($publicKey) !== 32) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'An Ed25519 public key is required.']);
+        $db->prepare('INSERT INTO backup_config (organization_id) VALUES (?) ON DUPLICATE KEY UPDATE organization_id=organization_id')->execute([$principal['organizationId']]);
+        $previous = $db->prepare("SELECT id, key_version FROM backup_device_credentials WHERE organization_id = ? AND status = 'active' FOR UPDATE"); $previous->execute([$principal['organizationId']]); $previous = $previous->fetchAll();
+        $db->prepare("UPDATE backup_device_credentials SET status = 'revoked', revoked_at = UTC_TIMESTAMP(3) WHERE organization_id = ? AND status = 'active'")->execute([$principal['organizationId']]);
+        $version = 1; foreach ($previous as $record) $version = max($version, (int)$record['key_version'] + 1);
+        $credentialId = Runtime::uuid(); $rotatedFrom = $previous[0]['id'] ?? null;
+        $db->prepare('INSERT INTO backup_device_credentials (id, organization_id, designated_user_id, device_id, public_key, key_version, rotated_from_id) VALUES (?, ?, ?, ?, ?, ?, ?)')->execute([$credentialId, $principal['organizationId'], $principal['userId'], trim($body['machineId']), $publicKey, $version, $rotatedFrom]);
+        $db->prepare('UPDATE backup_config SET designated_machine_id = ?, designated_machine_name = ?, designated_machine_platform = ?, designated_machine_user_email = ?, designated_machine_proof_hash = NULL, designated_machine_last_seen = UTC_TIMESTAMP(3), updated_at = UTC_TIMESTAMP(3) WHERE organization_id = ?')->execute([trim($body['machineId']), trim($body['machineName']), trim($body['platform']), strtolower((string)$principal['email']), $principal['organizationId']]);
+        $db->commit();
+        Runtime::respond(200, ['success' => true]);
+        } catch (\Throwable $error) { if ($db->inTransaction()) $db->rollBack(); throw $error; }
+    }
+    if ($method === 'POST' && $path === '/backup/request') {
+        // A backup request is a tenant-scoped user action, not evidence that a
+        // machine currently possesses the designated device key. Do not accept
+        // requester identity from the client body; the bearer principal is the
+        // sole attribution source.
+        $update = $db->prepare('UPDATE backup_config SET backup_requested_at = UTC_TIMESTAMP(3), backup_requested_by = ?, updated_at = UTC_TIMESTAMP(3) WHERE organization_id = ?');
+        $update->execute([$principal['userId'], $principal['organizationId']]);
+        if ($update->rowCount() === 0) Runtime::respond(409, ['error' => 'NOT_CONFIGURED', 'message' => 'No backup configuration is configured.']);
+        Runtime::respond(200, ['success' => true]);
+    }
+    if ($method === 'POST' && in_array($path, ['/backup/start', '/backup/complete', '/backup/heartbeat'], true)) {
+        $body = Runtime::jsonBody();
+        $machineId = is_string($body['machineId'] ?? null) ? trim($body['machineId']) : '';
+        $action = substr($path, strlen('/backup/'));
+        $requireBackupDeviceAssertion($action, $machineId);
+        if ($path === '/backup/heartbeat') {
+            $update = $db->prepare('UPDATE backup_config SET designated_machine_last_seen = UTC_TIMESTAMP(3), updated_at = UTC_TIMESTAMP(3) WHERE organization_id = ? AND designated_machine_id = ?');
+            $update->execute([$principal['organizationId'], $machineId]);
+            Runtime::respond(200, ['active' => $update->rowCount() > 0]);
+        }
+        if ($path === '/backup/start') {
+            $update = $db->prepare('UPDATE backup_config SET backup_running_since = UTC_TIMESTAMP(3), backup_requested_at = NULL, backup_requested_by = NULL WHERE organization_id = ? AND designated_machine_id = ?');
+        } else {
+            $update = $db->prepare('UPDATE backup_config SET backup_running_since = NULL WHERE organization_id = ? AND designated_machine_id = ?');
+        }
+        $update->execute([$principal['organizationId'], $machineId]);
+        if ($update->rowCount() === 0) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'This machine is not designated for the organization.']);
+        Runtime::respond(200, ['success' => true]);
+    }
+    if ($method === 'GET' && $path === '/vault-audit/files') {
+        $vaultId = is_string($_GET['vaultId'] ?? null) ? trim($_GET['vaultId']) : '';
+        if (!preg_match('/^[0-9a-f-]{36}$/i', $vaultId)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid vault ID is required.']);
+        Runtime::requireVault($db, $principal, $vaultId);
+        $page = filter_var($_GET['page'] ?? 1, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1, 'max_range' => 100000]]) ?: 1;
+        $limit = filter_var($_GET['limit'] ?? 100, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1, 'max_range' => 500]]) ?: 100;
+        $count = $db->prepare('SELECT COUNT(*) FROM files WHERE organization_id = ? AND vault_id = ? AND deleted_at IS NULL');
+        $count->execute([$principal['organizationId'], $vaultId]);
+        $total = (int)$count->fetchColumn();
+        $query = $db->prepare('SELECT f.id, f.vault_id AS vaultId, f.canonical_path AS canonicalPath, f.file_name AS fileName, f.current_revision AS currentRevision, f.state, f.content_hash AS contentHash, f.updated_at AS updatedAt, m.metadata FROM files f LEFT JOIN vault_audit_file_metadata m ON m.file_id = f.id AND m.organization_id = f.organization_id AND m.vault_id = f.vault_id WHERE f.organization_id = ? AND f.vault_id = ? AND f.deleted_at IS NULL ORDER BY f.canonical_path LIMIT ? OFFSET ?');
+        $query->bindValue(1, $principal['organizationId']); $query->bindValue(2, $vaultId); $query->bindValue(3, $limit, PDO::PARAM_INT); $query->bindValue(4, ($page - 1) * $limit, PDO::PARAM_INT); $query->execute();
+        $files = $query->fetchAll(); foreach ($files as &$file) $file['metadata'] = $file['metadata'] === null ? null : json_decode($file['metadata'], true); unset($file);
+        Runtime::respond(200, ['files' => $files, 'page' => $page, 'limit' => $limit, 'total' => $total]);
+    }
+    if ($method === 'POST' && $path === '/vault-audit/runs') {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $body = Runtime::jsonBody(); $vaultId = is_string($body['vaultId'] ?? null) ? trim($body['vaultId']) : '';
+        Runtime::requireVault($db, $principal, $vaultId);
+        $pageCount = $body['pageCount'] ?? 0; $findingCount = $body['findingCount'] ?? 0;
+        if (!is_int($pageCount) || $pageCount < 0 || $pageCount > 100000 || !is_int($findingCount) || $findingCount < 0 || $findingCount > 10000000) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Invalid audit counts.']);
+        $summary = $body['summary'] ?? null; if ($summary !== null && (!is_array($summary) || strlen(json_encode($summary)) > 100000)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Invalid audit summary.']);
+        $id = Runtime::uuid(); $db->prepare('INSERT INTO vault_audit_runs (id, organization_id, vault_id, requested_by, page_count, finding_count, summary) VALUES (?, ?, ?, ?, ?, ?, ?)')->execute([$id, $principal['organizationId'], $vaultId, $principal['userId'], $pageCount, $findingCount, $summary === null ? null : json_encode($summary, JSON_THROW_ON_ERROR)]);
+        Runtime::respond(201, ['id' => $id]);
+    }
+    if ($method === 'POST' && $path === '/vault-audit/repair') {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $body = Runtime::jsonBody(); $vaultId = is_string($body['vaultId'] ?? null) ? trim($body['vaultId']) : '';
+        Runtime::requireVault($db, $principal, $vaultId); $updates = $body['updates'] ?? [];
+        if (!is_array($updates) || count($updates) > 500) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A bounded update list is required.']);
+        $updated = 0; $query = $db->prepare('SELECT id FROM files WHERE id = ? AND organization_id = ? AND vault_id = ? AND deleted_at IS NULL');
+        foreach ($updates as $update) {
+            if (!is_array($update) || !is_string($update['fileId'] ?? null)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Invalid audit update.']);
+            $query->execute([$update['fileId'], $principal['organizationId'], $vaultId]); if (!$query->fetchColumn()) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Audit file not found.']);
+            $sets = []; $values = [];
+            if (array_key_exists('currentRevision', $update)) { if (!is_int($update['currentRevision']) || $update['currentRevision'] < 0) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Invalid revision.']); $sets[] = 'current_revision = ?'; $values[] = $update['currentRevision']; }
+            if (array_key_exists('contentHash', $update)) { if ($update['contentHash'] !== null && (!is_string($update['contentHash']) || !preg_match('/^[a-f0-9]{64}$/i', $update['contentHash']))) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Invalid content hash.']); $sets[] = 'content_hash = ?'; $values[] = $update['contentHash']; }
+            if (array_key_exists('metadata', $update)) { if (!is_array($update['metadata']) || strlen(json_encode($update['metadata'], JSON_THROW_ON_ERROR)) > 200000) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Invalid metadata.']); $db->prepare('INSERT INTO vault_audit_file_metadata (file_id, organization_id, vault_id, metadata) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE metadata = VALUES(metadata), updated_at = UTC_TIMESTAMP(3)')->execute([$update['fileId'], $principal['organizationId'], $vaultId, json_encode($update['metadata'], JSON_THROW_ON_ERROR)]); $updated++; }
+            if ($sets) { $values[] = $update['fileId']; $values[] = $principal['organizationId']; $values[] = $vaultId; $db->prepare('UPDATE files SET '.implode(', ', $sets).' WHERE id = ? AND organization_id = ? AND vault_id = ?')->execute($values); $updated++; }
+        }
+        Runtime::emitEvent($db, $principal['organizationId'], 'vault.audit_repaired', $vaultId, ['updated' => $updated, 'updatedBy' => $principal['userId']]);
+        Runtime::respond(200, ['updated' => $updated]);
+    }
     if ($method === 'GET' && $path === '/registration-requests') {
         if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
         $query = $db->prepare("SELECT id, email, display_name AS displayName, status, created_at AS createdAt FROM registration_requests WHERE organization_id = ? AND status = 'pending' ORDER BY created_at");

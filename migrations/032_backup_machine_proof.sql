@@ -1,0 +1,2 @@
+-- 031 includes this column for fresh installs. Migrator performs the guarded
+-- information_schema check for older installations before recording this file.
