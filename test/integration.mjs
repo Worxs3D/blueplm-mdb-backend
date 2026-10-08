@@ -1244,6 +1244,26 @@ const duplicatePart = await request('/files/import', {
 const retryCheckout = await request(`/files/${imported.id}/checkout`, {
   method: 'POST', body: JSON.stringify({ clientWorkingPath: workspace }),
 }, token)
+const explicitContentFields = {
+  mode: 'content',
+  requestId: randomUUID(),
+  canonicalPath: 'parts/hash-size-validation.sldprt',
+  fileName: 'hash-size-validation.sldprt',
+  checkoutToken: retryCheckout.checkoutToken,
+  storageRelativePath: 'immutable/hash-size-validation.sldprt',
+}
+for (const incompletePayload of [
+  { ...explicitContentFields, requestId: randomUUID(), sizeBytes: 0 },
+  { ...explicitContentFields, requestId: randomUUID(), contentHash: null, sizeBytes: 0 },
+  { ...explicitContentFields, requestId: randomUUID(), contentHash: 'a'.repeat(64) },
+  { ...explicitContentFields, requestId: randomUUID(), contentHash: 'a'.repeat(64), sizeBytes: null },
+]) {
+  const invalidContentResponse = await requestStatus(`/files/${imported.id}/checkin`, {
+    method: 'POST', body: JSON.stringify(incompletePayload),
+  }, token)
+  assert.equal(invalidContentResponse.status, 400)
+  assert.equal(invalidContentResponse.body.error, 'INVALID_REQUEST')
+}
 for (const invalidPath of ['../escape.sldprt', '/absolute.sldprt', 'parts\\windows.sldprt']) {
   const invalidPathResponse = await requestStatus(`/files/${imported.id}/checkin`, {
     method: 'POST',

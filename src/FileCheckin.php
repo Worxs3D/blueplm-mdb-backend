@@ -44,6 +44,8 @@ final class FileCheckin
             if (!is_string($body['storageRelativePath'] ?? null) || trim($body['storageRelativePath']) === '') throw new FileCheckinFailure(400, 'INVALID_REQUEST', 'storageRelativePath is required for content check-in.');
             $relativePath = ltrim(str_replace('\\', '/', trim($body['storageRelativePath'])), '/');
             if ($relativePath === '' || str_contains($relativePath, '../')) throw new FileCheckinFailure(400, 'INVALID_REQUEST', 'storageRelativePath must be a normalized vault-relative path.');
+            if ($explicitMode && (!is_string($body['contentHash'] ?? null) || !preg_match('/^[a-f0-9]{64}$/i', $body['contentHash']))) throw new FileCheckinFailure(400, 'INVALID_REQUEST', 'contentHash must be a SHA-256 hex string for explicit content check-in.');
+            if ($explicitMode && (!is_int($body['sizeBytes'] ?? null) || $body['sizeBytes'] < 0)) throw new FileCheckinFailure(400, 'INVALID_REQUEST', 'sizeBytes must be a non-negative integer for explicit content check-in.');
             if (array_key_exists('contentHash', $body) && $body['contentHash'] !== null && (!is_string($body['contentHash']) || !preg_match('/^[a-f0-9]{64}$/i', $body['contentHash']))) throw new FileCheckinFailure(400, 'INVALID_REQUEST', 'contentHash must be a SHA-256 hex string or null.');
             if (array_key_exists('sizeBytes', $body) && $body['sizeBytes'] !== null && (!is_int($body['sizeBytes']) || $body['sizeBytes'] < 0)) throw new FileCheckinFailure(400, 'INVALID_REQUEST', 'sizeBytes must be a non-negative integer or null.');
             $hash = is_string($body['contentHash'] ?? null) ? strtolower($body['contentHash']) : null;

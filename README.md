@@ -86,10 +86,12 @@ persists this location in the same transaction as the check-in result. In
 content mode, `storageRelativePath` remains the separate immutable content
 revision location; it is not the canonical path.
 
-Content mode also requires `storageRelativePath` and accepts `contentHash`,
-`sizeBytes`, `comment`, `partNumber`, `pendingMetadata`, and
-`committedCustomProperties`. It creates one file revision even if the content
-hash matches the preceding revision. Metadata-only mode omits all content
+Explicit content mode also requires `storageRelativePath`, a SHA-256 hex
+`contentHash`, and a non-negative integer `sizeBytes`; it accepts `comment`,
+`partNumber`, `pendingMetadata`, and `committedCustomProperties`. It creates
+one file revision even if the content hash matches the preceding revision.
+Legacy content check-ins without `mode` remain compatible with callers that
+omit or send null for the hash or size. Metadata-only mode omits all content
 fields, persists the new canonical location, pending datacard values, and
 custom properties, consumes the lease, and does not increment the content
 revision or create a revision row. `pendingMetadata` supports `part_number`,
