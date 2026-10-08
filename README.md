@@ -71,6 +71,32 @@ directory listings. The health check is `GET /health`; a healthy MDB response
 contains `ok: true`, `runtime: "php"`, `supabase: false`, and the supported
 `apiVersion`.
 
+## File check-in contract
+
+`POST /files/{fileId}/checkin` accepts an explicit `mode` (`content` or
+`metadata-only`) and a client-generated UUID `requestId`. The same request ID
+must be reused for retries of one logical operation and must not be reused for
+another payload. Check-in, metadata persistence, request-result recording, and
+checkout-lease consumption are committed in one database transaction.
+
+Content mode requires `storageRelativePath` and accepts `contentHash`,
+`sizeBytes`, `comment`, `partNumber`, `pendingMetadata`, and
+`committedCustomProperties`. It creates one file revision. Metadata-only mode
+omits all content fields, persists the pending datacard values and custom
+properties, consumes the lease, and does not increment the content revision or
+create a revision row. `pendingMetadata` supports `part_number`, `description`,
+`revision`, `config_tabs`, and `config_descriptions`; configuration maps are
+merged into `_config_tabs` and `_config_descriptions` in custom properties.
+
+The success response includes `fileId`, `revision`, `mode`,
+`contentChanged`, `metadataChanged`, `replayed`, and the persisted `file`
+snapshot. An exact replay returns that original result with `replayed: true`.
+Reusing a request ID with a different payload returns `409 IDEMPOTENCY_KEY_REUSED`;
+a missing, expired, consumed, or mismatched checkout lease returns
+`409 INVALID_CHECKOUT`. Calls using the legacy body without
+`mode` remain accepted as content check-ins when `storageRelativePath` is
+provided, but clients should use the explicit contract for durable retries.
+
 ## Tests
 
 The integration test covers installer authorization, new installation,

@@ -1227,4 +1227,126 @@ assert.equal(
   true,
 )
 
+// Check-in mode, metadata and lease consumption share one transaction. The
+// durable request ID makes a successful retry replay its original response.
+const duplicatePart = await request('/files/import', {
+  method: 'POST',
+  body: JSON.stringify({
+    vaultId: vault.id,
+    canonicalPath: 'duplicate-part.sldprt',
+    storageRelativePath: 'duplicate-part.sldprt',
+    fileName: 'duplicate-part.sldprt',
+    partNumber: 'PN-DUPLICATE-CHECKIN',
+    contentHash: 'b'.repeat(64),
+    sizeBytes: 1,
+  }),
+}, token)
+const retryCheckout = await request(`/files/${imported.id}/checkout`, {
+  method: 'POST', body: JSON.stringify({ clientWorkingPath: workspace }),
+}, token)
+const failedAtomicCheckin = await requestStatus(`/files/${imported.id}/checkin`, {
+  method: 'POST',
+  body: JSON.stringify({
+    mode: 'content',
+    requestId: randomUUID(),
+    checkoutToken: retryCheckout.checkoutToken,
+    storageRelativePath: 'drawing-revision-3.sldprt',
+    contentHash: 'c'.repeat(64),
+    sizeBytes: 7,
+    pendingMetadata: { part_number: 'PN-DUPLICATE-CHECKIN', description: 'must roll back' },
+  }),
+}, token)
+assert.equal(failedAtomicCheckin.status, 409)
+assert.equal(failedAtomicCheckin.body.error, 'PART_NUMBER_EXISTS')
+const fileAfterRollback = (await request(`/vaults/${vault.id}/files`, {}, token)).files.find(file => file.id === imported.id)
+assert.equal(fileAfterRollback.currentRevision, 2)
+assert.equal(fileAfterRollback.partNumber, 'PN-00043')
+assert.equal(fileAfterRollback.description, null)
+
+const contentRequest = {
+  mode: 'content',
+  requestId: randomUUID(),
+  checkoutToken: retryCheckout.checkoutToken,
+  storageRelativePath: 'drawing-revision-3.sldprt',
+  contentHash: 'c'.repeat(64),
+  sizeBytes: 7,
+  comment: 'content and datacard commit atomically',
+  pendingMetadata: { part_number: 'PN-00044', description: 'New description', revision: 'B' },
+  committedCustomProperties: { category: 'mechanical', _config_tabs: { A: 'old', B: 'kept' } },
+}
+const contentResult = await request(`/files/${imported.id}/checkin`, {
+  method: 'POST', body: JSON.stringify(contentRequest),
+}, token)
+assert.deepEqual(
+  { mode: contentResult.mode, revision: contentResult.revision, contentChanged: contentResult.contentChanged, replayed: contentResult.replayed },
+  { mode: 'content', revision: 3, contentChanged: true, replayed: false },
+)
+const contentReplay = await request(`/files/${imported.id}/checkin`, {
+  method: 'POST', body: JSON.stringify(contentRequest),
+}, token)
+assert.equal(contentReplay.replayed, true)
+assert.equal(contentReplay.revision, 3)
+const conflictingReplay = await requestStatus(`/files/${imported.id}/checkin`, {
+  method: 'POST', body: JSON.stringify({ ...contentRequest, comment: 'changed payload' }),
+}, token)
+assert.equal(conflictingReplay.status, 409)
+assert.equal(conflictingReplay.body.error, 'IDEMPOTENCY_KEY_REUSED')
+assert.equal((await request(`/vaults/${vault.id}/files`, {}, token)).files.find(file => file.id === imported.id).currentRevision, 3)
+const committedRevision = (await request(`/files/${imported.id}/revisions`, {}, token)).revisions[0]
+assert.equal(committedRevision.revisionNumber, 3)
+assert.equal(committedRevision.partNumber, 'PN-00044')
+assert.deepEqual(committedRevision.customProperties, contentRequest.committedCustomProperties)
+
+const metadataCheckout = await request(`/files/${imported.id}/checkout`, {
+  method: 'POST', body: JSON.stringify({ clientWorkingPath: workspace }),
+}, token)
+const metadataRequest = {
+  mode: 'metadata-only',
+  requestId: randomUUID(),
+  checkoutToken: metadataCheckout.checkoutToken,
+  comment: 'metadata-only update',
+  pendingMetadata: {
+    part_number: 'PN-00045',
+    description: 'Metadata without a new binary revision',
+    revision: 'C',
+    config_tabs: { A: 'new' },
+    config_descriptions: { A: 'Updated configuration' },
+  },
+  committedCustomProperties: {
+    category: 'mechanical',
+    _config_tabs: { A: 'old', B: 'kept' },
+    _config_descriptions: { A: 'Old configuration', B: 'Preserve me' },
+  },
+}
+const metadataResult = await request(`/files/${imported.id}/checkin`, {
+  method: 'POST', body: JSON.stringify(metadataRequest),
+}, token)
+assert.deepEqual(
+  { mode: metadataResult.mode, revision: metadataResult.revision, contentChanged: metadataResult.contentChanged, replayed: metadataResult.replayed },
+  { mode: 'metadata-only', revision: 3, contentChanged: false, replayed: false },
+)
+assert.equal((await request(`/vaults/${vault.id}/files`, {}, token)).files.find(file => file.id === imported.id).currentRevision, 3)
+assert.equal((await request(`/files/${imported.id}/revisions`, {}, token)).revisions.length, 3)
+const metadataReplay = await request(`/files/${imported.id}/checkin`, {
+  method: 'POST', body: JSON.stringify(metadataRequest),
+}, token)
+assert.equal(metadataReplay.replayed, true)
+assert.equal(metadataReplay.revision, 3)
+const updatedFile = (await request(`/vaults/${vault.id}/files`, {}, token)).files.find(file => file.id === imported.id)
+assert.equal(updatedFile.partNumber, 'PN-00045')
+assert.equal(updatedFile.description, 'Metadata without a new binary revision')
+assert.equal(updatedFile.revision, 'C')
+assert.deepEqual(updatedFile.customProperties, {
+  category: 'mechanical',
+  _config_tabs: { A: 'new', B: 'kept' },
+  _config_descriptions: { A: 'Updated configuration', B: 'Preserve me' },
+})
+const staleLease = await requestStatus(`/files/${imported.id}/checkin`, {
+  method: 'POST',
+  body: JSON.stringify({ ...metadataRequest, requestId: randomUUID() }),
+}, token)
+assert.equal(staleLease.status, 409)
+assert.equal(staleLease.body.error, 'INVALID_CHECKOUT')
+assert.equal(duplicatePart.created, true)
+
 console.log('PHP API, installer lifecycle, MariaDB, and network vault integration passed.')

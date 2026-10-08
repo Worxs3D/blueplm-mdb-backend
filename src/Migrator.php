@@ -35,6 +35,9 @@ final class Migrator
             try {
                 if ($migration === '029_module_defaults.sql') {
                     self::ensureModuleDefaultsColumns($db);
+                } elseif ($migration === '035_checkin_metadata_idempotency.sql') {
+                    self::ensureCheckinMetadataColumns($db);
+                    $db->exec($sql);
                 } else {
                     $db->exec($sql);
                 }
@@ -90,6 +93,33 @@ final class Migrator
         $query->execute(['backup_config', 'designated_machine_proof_hash']);
         if (!$query->fetchColumn()) {
             $db->exec('ALTER TABLE backup_config ADD COLUMN designated_machine_proof_hash CHAR(64) NULL AFTER designated_machine_last_seen');
+        }
+    }
+
+    private static function ensureCheckinMetadataColumns(PDO $db): void
+    {
+        $columns = [
+            'files' => [
+                'description' => 'TEXT NULL',
+                'revision_label' => 'VARCHAR(512) NULL',
+                'custom_properties' => 'JSON NULL',
+            ],
+            'file_revisions' => [
+                'part_number' => 'VARCHAR(512) NULL',
+                'description' => 'TEXT NULL',
+                'revision_label' => 'VARCHAR(512) NULL',
+                'custom_properties' => 'JSON NULL',
+            ],
+        ];
+        $exists = $db->prepare(
+            'SELECT 1 FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?'
+        );
+        foreach ($columns as $table => $definitions) {
+            foreach ($definitions as $column => $definition) {
+                $exists->execute([$table, $column]);
+                if (!$exists->fetchColumn()) $db->exec("ALTER TABLE `{$table}` ADD COLUMN `{$column}` {$definition}");
+            }
         }
     }
 
