@@ -28,6 +28,12 @@ final class FileCheckin
         $explicitMode = array_key_exists('mode', $body);
         $mode = $explicitMode ? $body['mode'] : (array_key_exists('storageRelativePath', $body) ? 'content' : null);
         if (!in_array($mode, ['content', 'metadata-only'], true)) throw new FileCheckinFailure(400, 'INVALID_REQUEST', 'mode must be content or metadata-only.');
+        $canonicalPath = null; $fileName = null;
+        if ($explicitMode) {
+            if (!is_string($body['canonicalPath'] ?? null) || !is_string($body['fileName'] ?? null)) throw new FileCheckinFailure(400, 'INVALID_REQUEST', 'canonicalPath and fileName are required for explicit check-in.');
+            $canonicalPath = $body['canonicalPath']; $fileName = $body['fileName'];
+            if (!self::isSafeCanonicalPath($canonicalPath) || strlen($canonicalPath) > 2048 || strlen($fileName) > 512 || $fileName === '' || str_contains($fileName, '/') || !hash_equals(basename($canonicalPath), $fileName)) throw new FileCheckinFailure(400, 'INVALID_REQUEST', 'canonicalPath must be a safe normalized vault-relative path and fileName must match its basename.');
+        }
         $requestId = $body['requestId'] ?? null;
         if ($explicitMode && (!is_string($requestId) || !self::isUuid($requestId))) throw new FileCheckinFailure(400, 'INVALID_REQUEST', 'requestId must be a UUID when mode is specified.');
         if ($requestId !== null && (!is_string($requestId) || !self::isUuid($requestId))) throw new FileCheckinFailure(400, 'INVALID_REQUEST', 'requestId must be a UUID.');
@@ -72,6 +78,13 @@ final class FileCheckin
         $fingerprint = $requestId === null ? null : self::fingerprint($body);
         $db->beginTransaction();
         try {
+            // Serialize requestId lookups within a tenant. Locking a missing
+            // request row alone can deadlock when concurrent check-ins race to
+            // insert the same primary key for different files.
+            if ($requestId !== null) {
+                $organizationLock = $db->prepare('SELECT id FROM organizations WHERE id = ? FOR UPDATE');
+                $organizationLock->execute([$principal['organizationId']]);
+            }
             $fileQuery = $db->prepare('SELECT * FROM files WHERE id = ? AND organization_id = ? AND deleted_at IS NULL FOR UPDATE');
             $fileQuery->execute([$fileId, $principal['organizationId']]); $file = $fileQuery->fetch();
             if (!$file) throw new FileCheckinFailure(404, 'NOT_FOUND', 'File not found.');
@@ -105,16 +118,19 @@ final class FileCheckin
             $description = is_array($pending) && array_key_exists('description', $pending) ? $pending['description'] : $file['description'];
             $revisionLabel = is_array($pending) && array_key_exists('revision', $pending) ? $pending['revision'] : $file['revision_label'];
             $nextRevision = (int)$file['current_revision'];
+            $persistedCanonicalPath = $canonicalPath ?? $file['canonical_path'];
+            $persistedFileName = $fileName ?? $file['file_name'];
+            $canonicalLocationChanged = $persistedCanonicalPath !== $file['canonical_path'] || $persistedFileName !== $file['file_name'];
 
             if ($mode === 'content') {
                 $nextRevision++;
                 $storedPartNumber = $partNumberPresent ? $partNumber : $file['part_number'];
-                $db->prepare('UPDATE files SET current_revision = ?, storage_relative_path = ?, content_hash = ?, size_bytes = ?, part_number = ?, description = ?, revision_label = ?, custom_properties = ? WHERE id = ?')->execute([$nextRevision, $relativePath, $hash, $size, $storedPartNumber, $description, $revisionLabel, $propertiesJson, $fileId]);
+                $db->prepare('UPDATE files SET canonical_path = ?, file_name = ?, current_revision = ?, storage_relative_path = ?, content_hash = ?, size_bytes = ?, part_number = ?, description = ?, revision_label = ?, custom_properties = ? WHERE id = ?')->execute([$persistedCanonicalPath, $persistedFileName, $nextRevision, $relativePath, $hash, $size, $storedPartNumber, $description, $revisionLabel, $propertiesJson, $fileId]);
                 $revisionId = Runtime::uuid();
                 $db->prepare('INSERT INTO file_revisions (id, file_id, revision_number, content_hash, storage_relative_path, size_bytes, checked_in_by, comment, part_number, description, revision_label, custom_properties) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')->execute([$revisionId, $fileId, $nextRevision, $hash, $relativePath, $size, $principal['userId'], $comment, $storedPartNumber, $description, $revisionLabel, $propertiesJson]);
                 $db->prepare('INSERT INTO inspection_characteristic_versions (id, file_revision_id, organization_id, sort_order, balloon_number, char_id, zone, char_type, sub_type, nominal_value, unit, plus_tolerance, minus_tolerance, upper_limit, lower_limit, classification, inspection_method, operation, aql, sample_size, supplier_inspection_rate, internal_inspection_rate, reference, comments) SELECT UUID(), ?, organization_id, sort_order, balloon_number, char_id, zone, char_type, sub_type, nominal_value, unit, plus_tolerance, minus_tolerance, upper_limit, lower_limit, classification, inspection_method, operation, aql, sample_size, supplier_inspection_rate, internal_inspection_rate, reference, comments FROM inspection_characteristics WHERE file_id = ?')->execute([$revisionId, $fileId]);
             } else {
-                $db->prepare('UPDATE files SET part_number = ?, description = ?, revision_label = ?, custom_properties = ? WHERE id = ?')->execute([$partNumberPresent ? $partNumber : $file['part_number'], $description, $revisionLabel, $propertiesJson, $fileId]);
+                $db->prepare('UPDATE files SET canonical_path = ?, file_name = ?, part_number = ?, description = ?, revision_label = ?, custom_properties = ? WHERE id = ?')->execute([$persistedCanonicalPath, $persistedFileName, $partNumberPresent ? $partNumber : $file['part_number'], $description, $revisionLabel, $propertiesJson, $fileId]);
             }
 
             $storedPartNumber = $partNumberPresent ? $partNumber : $file['part_number'];
@@ -123,10 +139,12 @@ final class FileCheckin
                 'revision' => $nextRevision,
                 'mode' => $mode,
                 'contentChanged' => $mode === 'content',
-                'metadataChanged' => $partNumberPresent || (is_array($pending) && $pending !== []) || $committedProperties !== null,
+                'metadataChanged' => $canonicalLocationChanged || $partNumberPresent || (is_array($pending) && $pending !== []) || $committedProperties !== null,
                 'replayed' => false,
                 'file' => [
                     'id' => $fileId,
+                    'canonical_path' => $persistedCanonicalPath,
+                    'file_name' => $persistedFileName,
                     'part_number' => $storedPartNumber,
                     'description' => $description,
                     'revision' => $revisionLabel,
@@ -145,6 +163,7 @@ final class FileCheckin
             if ($db->inTransaction()) $db->rollBack();
             if ($error instanceof FileCheckinFailure) throw $error;
             if ($error instanceof PDOException && $error->getCode() === '23000' && str_contains($error->getMessage(), 'uq_files_org_part_number')) throw new FileCheckinFailure(409, 'PART_NUMBER_EXISTS', 'This part number is already assigned to another file.');
+            if ($error instanceof PDOException && $error->getCode() === '23000' && str_contains($error->getMessage(), 'uq_file_active_path')) throw new FileCheckinFailure(409, 'PATH_EXISTS', 'A file already exists at this vault path.');
             throw $error;
         }
     }
@@ -152,6 +171,13 @@ final class FileCheckin
     private static function isUuid(string $value): bool
     {
         return (bool)preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i', $value);
+    }
+
+    private static function isSafeCanonicalPath(string $value): bool
+    {
+        if ($value === '' || trim($value) !== $value || str_contains($value, '\\') || str_starts_with($value, '/') || preg_match('/[\x00-\x1f\x7f<>:"|?*]/', $value)) return false;
+        foreach (explode('/', $value) as $segment) if ($segment === '' || $segment === '.' || $segment === '..' || rtrim($segment, ' .') !== $segment) return false;
+        return true;
     }
 
     private static function isObject(mixed $value): bool

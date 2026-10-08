@@ -79,14 +79,23 @@ must be reused for retries of one logical operation and must not be reused for
 another payload. Check-in, metadata persistence, request-result recording, and
 checkout-lease consumption are committed in one database transaction.
 
-Content mode requires `storageRelativePath` and accepts `contentHash`,
+Both explicit modes require `canonicalPath` and `fileName`. The path must be a
+normalized, safe vault-relative path using `/`, and `fileName` must exactly
+match its final segment. The active path is unique within its vault. The server
+persists this location in the same transaction as the check-in result. In
+content mode, `storageRelativePath` remains the separate immutable content
+revision location; it is not the canonical path.
+
+Content mode also requires `storageRelativePath` and accepts `contentHash`,
 `sizeBytes`, `comment`, `partNumber`, `pendingMetadata`, and
-`committedCustomProperties`. It creates one file revision. Metadata-only mode
-omits all content fields, persists the pending datacard values and custom
-properties, consumes the lease, and does not increment the content revision or
-create a revision row. `pendingMetadata` supports `part_number`, `description`,
-`revision`, `config_tabs`, and `config_descriptions`; configuration maps are
-merged into `_config_tabs` and `_config_descriptions` in custom properties.
+`committedCustomProperties`. It creates one file revision even if the content
+hash matches the preceding revision. Metadata-only mode omits all content
+fields, persists the new canonical location, pending datacard values, and
+custom properties, consumes the lease, and does not increment the content
+revision or create a revision row. `pendingMetadata` supports `part_number`,
+`description`, `revision`, `config_tabs`, and `config_descriptions`;
+configuration maps are merged into `_config_tabs` and `_config_descriptions` in
+custom properties.
 
 The success response includes `fileId`, `revision`, `mode`,
 `contentChanged`, `metadataChanged`, `replayed`, and the persisted `file`

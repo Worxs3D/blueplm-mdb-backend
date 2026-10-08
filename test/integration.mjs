@@ -1244,11 +1244,48 @@ const duplicatePart = await request('/files/import', {
 const retryCheckout = await request(`/files/${imported.id}/checkout`, {
   method: 'POST', body: JSON.stringify({ clientWorkingPath: workspace }),
 }, token)
+for (const invalidPath of ['../escape.sldprt', '/absolute.sldprt', 'parts\\windows.sldprt']) {
+  const invalidPathResponse = await requestStatus(`/files/${imported.id}/checkin`, {
+    method: 'POST',
+    body: JSON.stringify({
+      mode: 'content',
+      requestId: randomUUID(),
+      canonicalPath: invalidPath,
+      fileName: 'escape.sldprt',
+      checkoutToken: retryCheckout.checkoutToken,
+      storageRelativePath: 'immutable/invalid.sldprt',
+    }),
+  }, token)
+  assert.equal(invalidPathResponse.status, 400)
+  assert.equal(invalidPathResponse.body.error, 'INVALID_REQUEST')
+}
+const invalidFileNameResponse = await requestStatus(`/files/${imported.id}/checkin`, {
+  method: 'POST',
+  body: JSON.stringify({
+    mode: 'metadata-only',
+    requestId: randomUUID(),
+    canonicalPath: 'parts/actual-name.sldprt',
+    fileName: 'different-name.sldprt',
+    checkoutToken: retryCheckout.checkoutToken,
+  }),
+}, token)
+assert.equal(invalidFileNameResponse.status, 400)
+const missingPathResponse = await requestStatus(`/files/${imported.id}/checkin`, {
+  method: 'POST',
+  body: JSON.stringify({
+    mode: 'metadata-only',
+    requestId: randomUUID(),
+    checkoutToken: retryCheckout.checkoutToken,
+  }),
+}, token)
+assert.equal(missingPathResponse.status, 400)
 const failedAtomicCheckin = await requestStatus(`/files/${imported.id}/checkin`, {
   method: 'POST',
   body: JSON.stringify({
     mode: 'content',
     requestId: randomUUID(),
+    canonicalPath: 'drawings/drawing.txt',
+    fileName: 'drawing.txt',
     checkoutToken: retryCheckout.checkoutToken,
     storageRelativePath: 'drawing-revision-3.sldprt',
     contentHash: 'c'.repeat(64),
@@ -1263,11 +1300,32 @@ assert.equal(fileAfterRollback.currentRevision, 2)
 assert.equal(fileAfterRollback.partNumber, 'PN-00043')
 assert.equal(fileAfterRollback.description, null)
 
+const duplicatePathCheckin = await requestStatus(`/files/${imported.id}/checkin`, {
+  method: 'POST',
+  body: JSON.stringify({
+    mode: 'content',
+    requestId: randomUUID(),
+    canonicalPath: 'duplicate-part.sldprt',
+    fileName: 'duplicate-part.sldprt',
+    checkoutToken: retryCheckout.checkoutToken,
+    storageRelativePath: 'immutable/revision-3.sldprt',
+    contentHash: 'c'.repeat(64),
+    sizeBytes: 7,
+  }),
+}, token)
+assert.equal(duplicatePathCheckin.status, 409)
+assert.equal(duplicatePathCheckin.body.error, 'PATH_EXISTS')
+const fileAfterPathRollback = (await request(`/vaults/${vault.id}/files`, {}, token)).files.find(file => file.id === imported.id)
+assert.equal(fileAfterPathRollback.currentRevision, 2)
+assert.equal(fileAfterPathRollback.canonicalPath, 'drawing.txt')
+
 const contentRequest = {
   mode: 'content',
   requestId: randomUUID(),
+  canonicalPath: 'drawings/drawing-renamed.sldprt',
+  fileName: 'drawing-renamed.sldprt',
   checkoutToken: retryCheckout.checkoutToken,
-  storageRelativePath: 'drawing-revision-3.sldprt',
+  storageRelativePath: 'immutable/revision-3.sldprt',
   contentHash: 'c'.repeat(64),
   sizeBytes: 7,
   comment: 'content and datacard commit atomically',
@@ -1281,11 +1339,17 @@ assert.deepEqual(
   { mode: contentResult.mode, revision: contentResult.revision, contentChanged: contentResult.contentChanged, replayed: contentResult.replayed },
   { mode: 'content', revision: 3, contentChanged: true, replayed: false },
 )
+assert.equal(contentResult.file.canonical_path, 'drawings/drawing-renamed.sldprt')
+assert.equal(contentResult.file.file_name, 'drawing-renamed.sldprt')
+assert.equal(contentResult.file.storage_relative_path, 'immutable/revision-3.sldprt')
 const contentReplay = await request(`/files/${imported.id}/checkin`, {
   method: 'POST', body: JSON.stringify(contentRequest),
 }, token)
 assert.equal(contentReplay.replayed, true)
 assert.equal(contentReplay.revision, 3)
+assert.equal(contentReplay.file.canonical_path, contentResult.file.canonical_path)
+assert.equal(contentReplay.file.file_name, contentResult.file.file_name)
+assert.equal(contentReplay.file.storage_relative_path, contentResult.file.storage_relative_path)
 const conflictingReplay = await requestStatus(`/files/${imported.id}/checkin`, {
   method: 'POST', body: JSON.stringify({ ...contentRequest, comment: 'changed payload' }),
 }, token)
@@ -1303,6 +1367,8 @@ const metadataCheckout = await request(`/files/${imported.id}/checkout`, {
 const metadataRequest = {
   mode: 'metadata-only',
   requestId: randomUUID(),
+  canonicalPath: 'released/drawing-final.sldprt',
+  fileName: 'drawing-final.sldprt',
   checkoutToken: metadataCheckout.checkoutToken,
   comment: 'metadata-only update',
   pendingMetadata: {
@@ -1332,7 +1398,19 @@ const metadataReplay = await request(`/files/${imported.id}/checkin`, {
 }, token)
 assert.equal(metadataReplay.replayed, true)
 assert.equal(metadataReplay.revision, 3)
+assert.equal(metadataResult.file.canonical_path, 'released/drawing-final.sldprt')
+assert.equal(metadataResult.file.file_name, 'drawing-final.sldprt')
+assert.equal(metadataReplay.file.canonical_path, metadataResult.file.canonical_path)
+assert.equal(metadataReplay.file.file_name, metadataResult.file.file_name)
+const originalContentReplay = await request(`/files/${imported.id}/checkin`, {
+  method: 'POST', body: JSON.stringify(contentRequest),
+}, token)
+assert.equal(originalContentReplay.replayed, true)
+assert.equal(originalContentReplay.file.canonical_path, 'drawings/drawing-renamed.sldprt')
+assert.equal(originalContentReplay.file.file_name, 'drawing-renamed.sldprt')
 const updatedFile = (await request(`/vaults/${vault.id}/files`, {}, token)).files.find(file => file.id === imported.id)
+assert.equal(updatedFile.canonicalPath, 'released/drawing-final.sldprt')
+assert.equal(updatedFile.fileName, 'drawing-final.sldprt')
 assert.equal(updatedFile.partNumber, 'PN-00045')
 assert.equal(updatedFile.description, 'Metadata without a new binary revision')
 assert.equal(updatedFile.revision, 'C')
@@ -1347,6 +1425,65 @@ const staleLease = await requestStatus(`/files/${imported.id}/checkin`, {
 }, token)
 assert.equal(staleLease.status, 409)
 assert.equal(staleLease.body.error, 'INVALID_CHECKOUT')
+
+// Explicit content check-in always creates a revision, including when the
+// source restores bytes whose hash matches the preceding revision.
+const rollbackCheckout = await request(`/files/${imported.id}/checkout`, {
+  method: 'POST', body: JSON.stringify({ clientWorkingPath: workspace }),
+}, token)
+const sameHashRequest = {
+  mode: 'content',
+  requestId: randomUUID(),
+  canonicalPath: 'released/drawing-final.sldprt',
+  fileName: 'drawing-final.sldprt',
+  checkoutToken: rollbackCheckout.checkoutToken,
+  storageRelativePath: 'immutable/revision-4-rollback.sldprt',
+  contentHash: contentRequest.contentHash,
+  sizeBytes: contentRequest.sizeBytes,
+  comment: 'Restored bytes with matching hash still create a revision',
+}
+const sameHashRollback = await request(`/files/${imported.id}/checkin`, {
+  method: 'POST',
+  body: JSON.stringify(sameHashRequest),
+}, token)
+assert.equal(sameHashRollback.revision, 4)
+assert.equal(sameHashRollback.file.content_hash, contentRequest.contentHash)
+assert.equal((await request(`/files/${imported.id}/revisions`, {}, token)).revisions.length, 4)
+const sameHashReplay = await request(`/files/${imported.id}/checkin`, {
+  method: 'POST', body: JSON.stringify(sameHashRequest),
+}, token)
+assert.equal(sameHashReplay.replayed, true)
+assert.equal(sameHashReplay.revision, 4)
+
+// Concurrent reuse of one request ID across different files is serialized, so
+// one operation commits and the other receives a stable idempotency conflict.
+const [raceCheckoutA, raceCheckoutB] = await Promise.all([
+  request(`/files/${imported.id}/checkout`, {
+    method: 'POST', body: JSON.stringify({ clientWorkingPath: workspace }),
+  }, token),
+  request(`/files/${duplicatePart.id}/checkout`, {
+    method: 'POST', body: JSON.stringify({ clientWorkingPath: workspace }),
+  }, token),
+])
+const sharedRequestId = randomUUID()
+const [raceA, raceB] = await Promise.all([
+  requestStatus(`/files/${imported.id}/checkin`, {
+    method: 'POST', body: JSON.stringify({
+      mode: 'metadata-only', requestId: sharedRequestId,
+      canonicalPath: 'race/imported.sldprt', fileName: 'imported.sldprt',
+      checkoutToken: raceCheckoutA.checkoutToken,
+    }),
+  }, token),
+  requestStatus(`/files/${duplicatePart.id}/checkin`, {
+    method: 'POST', body: JSON.stringify({
+      mode: 'metadata-only', requestId: sharedRequestId,
+      canonicalPath: 'race/duplicate-part.sldprt', fileName: 'duplicate-part.sldprt',
+      checkoutToken: raceCheckoutB.checkoutToken,
+    }),
+  }, token),
+])
+assert.deepEqual([raceA.status, raceB.status].sort(), [200, 409])
+assert.equal([raceA, raceB].find(result => result.status === 409).body.error, 'IDEMPOTENCY_KEY_REUSED')
 assert.equal(duplicatePart.created, true)
 
 console.log('PHP API, installer lifecycle, MariaDB, and network vault integration passed.')
