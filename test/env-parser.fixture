@@ -1,0 +1,2 @@
+BLUEPLM_ENV_FORMAT=2
+BLUEPLM_ENV_PARSER_CASE="  edge \"quote\" \\slash \$dollar #hash=tag\nnext\rreturn "

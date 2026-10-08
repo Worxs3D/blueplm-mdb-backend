@@ -143,7 +143,9 @@ final class Runtime
         }
         if (!is_file($path)) return $values;
         $section = '';
-        foreach (file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [] as $line) {
+        $lines = file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [];
+        $escapedEnvironment = in_array('BLUEPLM_ENV_FORMAT=2', array_map('trim', $lines), true);
+        foreach ($lines as $line) {
             $line = trim($line);
             if ($line === '' || str_starts_with($line, '#')) continue;
             if (preg_match('/^\[([^\]]+)]$/', $line, $matches)) {
@@ -153,7 +155,7 @@ final class Runtime
             if (!str_contains($line, '=')) continue;
             [$key, $value] = explode('=', $line, 2);
             $key = trim($key);
-            $value = trim($value, " \t\n\r\0\x0B\"");
+            $value = self::parseEnvironmentValue($value, $escapedEnvironment);
             // The shared project configuration predates the MDB adapter
             // and keeps database values in an INI-like [Mariadb] section.
             // Map only that local section; explicit MARIADB_* variables always
@@ -171,6 +173,37 @@ final class Runtime
             $values[$key] ??= $value;
         }
         return $values;
+    }
+
+    private static function parseEnvironmentValue(string $value, bool $escapedEnvironment): string
+    {
+        $value = trim($value);
+        if (!$escapedEnvironment) return trim($value, " \t\n\r\0\x0B\"");
+        if (strlen($value) < 2 || $value[0] !== '"' || $value[strlen($value) - 1] !== '"') {
+            return trim($value, " \t\n\r\0\x0B\"");
+        }
+
+        $quoted = substr($value, 1, -1);
+        $decoded = '';
+        $length = strlen($quoted);
+        for ($index = 0; $index < $length; $index++) {
+            $character = $quoted[$index];
+            if ($character !== '\\' || $index + 1 >= $length) {
+                $decoded .= $character;
+                continue;
+            }
+
+            $escaped = $quoted[++$index];
+            $decoded .= match ($escaped) {
+                '\\' => '\\',
+                '"' => '"',
+                '$' => '$',
+                'n' => "\n",
+                'r' => "\r",
+                default => '\\' . $escaped,
+            };
+        }
+        return $decoded;
     }
 
     /** @param array<string, string> $env */
