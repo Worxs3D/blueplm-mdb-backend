@@ -249,8 +249,13 @@ if (in_array($path, ['/installer/database-status', '/installer/commit'], true)) 
     $providedToken = is_string($body['installationToken'] ?? null) ? $body['installationToken'] : '';
     $expectedToken = $pendingEnv['BLUEPLM_INSTALLATION_TOKEN'] ?? '';
     if (strlen($expectedToken) < 32 || !hash_equals($expectedToken, $providedToken)) {
-        Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Installation authorization failed.']);
+        Runtime::respond(403, [
+            'error' => 'FORBIDDEN',
+            'message' => 'Installation authorization failed.',
+            'databaseCommitState' => 'not-committed',
+        ]);
     }
+    $databaseCommitState = 'not-committed';
     try {
         $db = Runtime::database($pendingEnv);
         $inspection = DatabaseLifecycle::inspect($db, $root . '/migrations');
@@ -263,12 +268,20 @@ if (in_array($path, ['/installer/database-status', '/installer/commit'], true)) 
         if ($action === 'migrate') {
             if (!in_array($inspection['state'], ['managed', 'legacy'], true)) {
                 @unlink($pendingEnvironmentPath);
-                Runtime::respond(409, ['error' => 'MIGRATION_UNSAFE', 'message' => 'Only a recognized BluePLM database can be migrated automatically.']);
+                Runtime::respond(409, [
+                    'error' => 'MIGRATION_UNSAFE',
+                    'message' => 'Only a recognized BluePLM database can be migrated automatically.',
+                    'databaseCommitState' => 'not-committed',
+                ]);
             }
         } elseif ($action === 'reset') {
         } elseif ($action !== 'install' || $inspection['state'] !== 'empty') {
             @unlink($pendingEnvironmentPath);
-            Runtime::respond(409, ['error' => 'DATABASE_STATE_CHANGED', 'message' => 'Inspect the database again before continuing.']);
+            Runtime::respond(409, [
+                'error' => 'DATABASE_STATE_CHANGED',
+                'message' => 'Inspect the database again before continuing.',
+                'databaseCommitState' => 'not-committed',
+            ]);
         }
 
         $needsBootstrap = $action !== 'migrate' || !$inspection['bootstrapped'];
@@ -278,11 +291,31 @@ if (in_array($path, ['/installer/database-status', '/installer/commit'], true)) 
             foreach (['organizationName', 'organizationSlug', 'email', 'displayName', 'password'] as $key) {
                 if (!is_string($bootstrap[$key] ?? null) || trim($bootstrap[$key]) === '') {
                     @unlink($pendingEnvironmentPath);
-                    Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => "{$key} is required."]);
+                    Runtime::respond(400, [
+                        'error' => 'INVALID_REQUEST',
+                        'message' => "{$key} is required.",
+                        'databaseCommitState' => 'not-committed',
+                    ]);
                 }
             }
         }
 
+        if ($action === 'reset') {
+            $confirmation = is_string($body['confirmation'] ?? null) ? $body['confirmation'] : '';
+            if (!hash_equals('DELETE ALL DATABASE DATA', $confirmation)) {
+                @unlink($pendingEnvironmentPath);
+                Runtime::respond(400, [
+                    'error' => 'INVALID_REQUEST',
+                    'message' => 'The database reset confirmation is invalid.',
+                    'databaseCommitState' => 'not-committed',
+                ]);
+            }
+        }
+
+        // Reset and migration can persist non-transactional schema changes. From
+        // here until the complete action is known to have finished, a failure is
+        // conservatively reported as an unknown commit outcome.
+        $databaseCommitState = 'unknown';
         if ($action === 'reset') {
             DatabaseLifecycle::reset($db, is_string($body['confirmation'] ?? null) ? $body['confirmation'] : '');
             $inspection = DatabaseLifecycle::inspect($db, $root . '/migrations');
@@ -301,10 +334,13 @@ if (in_array($path, ['/installer/database-status', '/installer/commit'], true)) 
                 'networkRoot' => is_string($bootstrap['networkRoot'] ?? null) ? $bootstrap['networkRoot'] : '',
                 'enableTotp' => false,
             ]);
+            $databaseCommitState = 'committed';
             $sessionToken = Runtime::issueSession($db, $pendingEnv, $result['userId'], $result['organizationId']);
             if (!Installation::retireBootstrapToken($pendingEnvironmentPath)) {
                 throw new \RuntimeException('The one-time bootstrap token could not be retired.');
             }
+        } else {
+            $databaseCommitState = 'committed';
         }
 
         $activationRoot = is_string($_SERVER['BLUEPLM_LIVE_ROOT'] ?? null)
@@ -325,13 +361,22 @@ if (in_array($path, ['/installer/database-status', '/installer/commit'], true)) 
             'bootstrapped' => $needsBootstrap,
             'token' => $sessionToken,
             'promoteEnvironment' => $promoteEnvironment,
+            'databaseCommitState' => $databaseCommitState,
         ]);
     } catch (\InvalidArgumentException $error) {
         @unlink($pendingEnvironmentPath);
-        Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => $error->getMessage()]);
+        Runtime::respond(400, [
+            'error' => 'INVALID_REQUEST',
+            'message' => $error->getMessage(),
+            'databaseCommitState' => $databaseCommitState,
+        ]);
     } catch (\Throwable $error) {
         @unlink($pendingEnvironmentPath);
-        Runtime::respond(500, ['error' => 'INSTALLATION_FAILED', 'message' => $error->getMessage()]);
+        Runtime::respond(500, [
+            'error' => 'INSTALLATION_FAILED',
+            'message' => $error->getMessage(),
+            'databaseCommitState' => $databaseCommitState,
+        ]);
     }
 }
 

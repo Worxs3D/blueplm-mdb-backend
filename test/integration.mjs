@@ -147,11 +147,31 @@ const deniedInstall = await fetch(`${server}/installer/commit`, {
   body: JSON.stringify({ installationToken: 'invalid', action: 'install' }),
 })
 assert.equal(deniedInstall.status, 403)
-const installed = await request('/installer/commit', {
+assert.equal((await deniedInstall.json()).databaseCommitState, 'not-committed')
+stagePendingEnvironment()
+const interruptedInstall = await requestStatus('/installer/commit', {
   method: 'POST',
   body: JSON.stringify({
     installationToken,
     action: 'install',
+    bootstrap: {
+      organizationName: 'Integration Org',
+      organizationSlug: 'Invalid Slug',
+      email: 'owner@example.test',
+      displayName: 'Owner',
+      password,
+    },
+  }),
+})
+assert.equal(interruptedInstall.status, 400)
+assert.equal(interruptedInstall.body.databaseCommitState, 'unknown')
+stagePendingEnvironment()
+const installed = await request('/installer/commit', {
+  method: 'POST',
+  body: JSON.stringify({
+    installationToken,
+    action: 'reset',
+    confirmation: 'DELETE ALL DATABASE DATA',
     bootstrap: {
       organizationName: 'Integration Org',
       organizationSlug: 'integration-org',
@@ -167,6 +187,7 @@ execFileSync('docker', [
   'compose', '-f', 'docker-compose.test.yml', 'exec', '-T', 'api',
   'php', 'test/color-swatches-migration.php',
 ], { cwd: process.cwd(), stdio: 'pipe' })
+assert.equal(installed.databaseCommitState, 'committed')
 const rejectedMaintenance = await requestStatus('/admin/migrate', {
   method: 'POST',
   body: JSON.stringify({ maintenanceToken: 'wrong-maintenance-token' }),
@@ -1026,6 +1047,7 @@ const migrated = await request('/installer/commit', {
 })
 assert.equal(migrated.bootstrapped, false)
 assert.ok((await request('/health')).capabilities.includes('checkoutRequestIdempotency'))
+assert.equal(migrated.databaseCommitState, 'committed')
 const usersAfterMigration = await request('/users', {}, token)
 assert.ok(usersAfterMigration.users.some((user) => user.email === 'renamed.member@example.test'))
 const imported = await request(
