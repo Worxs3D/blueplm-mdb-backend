@@ -67,8 +67,9 @@ async function waitForOutput(worker, expected, timeoutMs = 5000) {
 }
 
 function checkoutRequestLockName(organizationId, requestId) {
+  const databaseName = queryTestDatabase('SELECT DATABASE();')
   const digest = createHash('sha256')
-    .update(['blueplm', 'checkout', organizationId.toLowerCase(), requestId.toLowerCase()].join('\0'))
+    .update([databaseName, 'checkout', organizationId.toLowerCase(), requestId.toLowerCase()].join('\0'))
     .digest('hex')
     .slice(0, 56)
   return `blueplm:${digest}`
@@ -145,6 +146,10 @@ assert.equal(Object.hasOwn(inaccessibleCheckoutReplay.body, 'checkoutToken'), fa
 const renewedCheckout = await request(`/files/${duplicatePart.id}/checkout/renew`, {
   method: 'POST', body: JSON.stringify({ checkoutToken: checkoutAcquisitionA.checkoutToken }),
 }, token)
+const renewedUppercaseFileId = await request(`/files/${duplicatePart.id.toUpperCase()}/checkout/renew`, {
+  method: 'POST', body: JSON.stringify({ checkoutToken: checkoutAcquisitionA.checkoutToken }),
+}, token)
+assert.equal(typeof renewedUppercaseFileId.expiresAt, 'string')
 const renewedCheckoutReplay = await request(`/files/${duplicatePart.id}/checkout`, {
   method: 'POST', body: JSON.stringify({ clientWorkingPath: workspace, requestId: checkoutRequestId }),
 }, token)
@@ -172,6 +177,15 @@ assert.equal(afterConcurrentRenewReplay.expiresAt, concurrentRenew.expiresAt)
 await request(`/files/${duplicatePart.id}/checkout/cancel`, {
   method: 'POST', body: JSON.stringify({ checkoutToken: checkoutAcquisitionA.checkoutToken }),
 }, token)
+const caseRouteFile = await request('/files/import', {
+  method: 'POST', body: JSON.stringify({ vaultId: vault.id, canonicalPath: 'uppercase-cancel.sldprt', fileName: 'uppercase-cancel.sldprt', storageRelativePath: 'uppercase-cancel.sldprt' }),
+}, token)
+const caseRouteLease = await request(`/files/${caseRouteFile.id}/checkout`, {
+  method: 'POST', body: JSON.stringify({ clientWorkingPath: workspace }),
+}, token)
+assert.equal((await requestStatus(`/files/${caseRouteFile.id.toUpperCase()}/checkout/cancel`, {
+  method: 'POST', body: JSON.stringify({ checkoutToken: caseRouteLease.checkoutToken }),
+}, token)).status, 204)
 const cancelledCheckoutReplay = await requestStatus(`/files/${duplicatePart.id}/checkout`, {
   method: 'POST', body: JSON.stringify({ clientWorkingPath: workspace, requestId: checkoutRequestId }),
 }, token)
@@ -351,14 +365,20 @@ const concurrentAcquireRequestId = randomUUID()
 const concurrentAcquireLockName = checkoutRequestLockName(testOrganizationId, concurrentAcquireRequestId)
 const concurrentAcquire = requestStatus(`/files/${checkoutRaceFileB.id}/checkout`, {
   method: 'POST', body: JSON.stringify({ clientWorkingPath: workspace, requestId: concurrentAcquireRequestId }),
-}, token)
+}, token).then(value => ({ value }), error => ({ error }))
+let lockWaitError = null
 try {
   await waitForCheckoutRequestLockWait(concurrentAcquireLockName)
+} catch (error) {
+  lockWaitError = error
 } finally {
   cancelLockHolder.child.stdin.write('continue\n')
   await cancelLockHolder.done
 }
-const acquiredAfterConcurrentCancel = await concurrentAcquire
+const acquireResult = await concurrentAcquire
+if (lockWaitError) throw lockWaitError
+if (acquireResult.error) throw acquireResult.error
+const acquiredAfterConcurrentCancel = acquireResult.value
 assert.equal(acquiredAfterConcurrentCancel.status, 200)
 assert.deepEqual(checkoutRequestState(cancelledDuringAcquireRequestId), { status: 'cancelled', tokenPurged: true })
 await request(`/files/${checkoutRaceFileB.id}/checkout/cancel`, {
@@ -438,9 +458,20 @@ const removalRequestId = randomUUID()
 await request(`/files/${removalFile.id}/checkout`, {
   method: 'POST', body: JSON.stringify({ clientWorkingPath: workspace, requestId: removalRequestId }),
 }, removalLogin.token)
+const secondOrgRemovalFileId = randomUUID()
+const secondOrgRemovalRequestId = randomUUID()
+const secondOrgRemovalLeaseHash = 'e'.repeat(64)
+queryTestDatabase(`
+  INSERT INTO organization_memberships (organization_id, user_id, role) VALUES ('${foreignOrgId}', '${removalUser.id}', 'member');
+  INSERT INTO files (id, organization_id, vault_id, canonical_path, file_name, storage_relative_path) VALUES ('${secondOrgRemovalFileId}', '${foreignOrgId}', '${foreignLeaseVaultId}', 'foreign/same-user.sldprt', 'same-user.sldprt', 'foreign/same-user.sldprt');
+  INSERT INTO checkouts (file_id, user_id, token_hash, client_working_path, expires_at) VALUES ('${secondOrgRemovalFileId}', '${removalUser.id}', '${secondOrgRemovalLeaseHash}', 'C:/foreign-workspace', DATE_ADD(UTC_TIMESTAMP(3), INTERVAL 1 HOUR));
+  INSERT INTO checkout_acquisition_requests (organization_id, request_id, user_id, file_id, vault_id, client_working_path, request_fingerprint, token_hash, token_ciphertext, expires_at, status) VALUES ('${foreignOrgId}', '${secondOrgRemovalRequestId}', '${removalUser.id}', '${secondOrgRemovalFileId}', '${foreignLeaseVaultId}', 'C:/foreign-workspace', '${'b'.repeat(64)}', '${secondOrgRemovalLeaseHash}', 'same-user-foreign-org-ciphertext', DATE_ADD(UTC_TIMESTAMP(3), INTERVAL 1 HOUR), 'active');
+`)
 await request(`/users/${removalUser.id}`, { method: 'DELETE' }, token)
 assert.deepEqual(checkoutRequestState(removalRequestId), { status: 'cancelled', tokenPurged: true })
 assert.equal(queryTestDatabase(`SELECT COUNT(*) FROM checkouts WHERE file_id = '${removalFile.id}';`), '0')
+assert.equal(queryTestDatabase(`SELECT status, token_ciphertext IS NOT NULL FROM checkout_acquisition_requests WHERE organization_id = '${foreignOrgId}' AND request_id = '${secondOrgRemovalRequestId}';`), 'active\t1')
+assert.equal(queryTestDatabase(`SELECT COUNT(*) FROM checkouts WHERE file_id = '${secondOrgRemovalFileId}' AND user_id = '${removalUser.id}';`), '1')
 assert.equal(queryTestDatabase(`SELECT status, token_ciphertext IS NOT NULL FROM checkout_acquisition_requests WHERE organization_id = '${foreignOrgId}' AND request_id = '${foreignLeaseRequestId}';`), 'active\t1')
 assert.equal(queryTestDatabase(`SELECT COUNT(*) FROM checkouts WHERE file_id = '${foreignLeaseFileId}' AND user_id = '${foreignUser.id}';`), '1')
 
@@ -457,8 +488,19 @@ const selfRemovalRequestId = randomUUID()
 await request(`/files/${removalFile.id}/checkout`, {
   method: 'POST', body: JSON.stringify({ clientWorkingPath: workspace, requestId: selfRemovalRequestId }),
 }, selfRemovalLogin.token)
+const selfRemovalForeignFileId = randomUUID()
+const selfRemovalForeignRequestId = randomUUID()
+const selfRemovalForeignLeaseHash = 'd'.repeat(64)
+queryTestDatabase(`
+  INSERT INTO organization_memberships (organization_id, user_id, role) VALUES ('${foreignOrgId}', '${selfRemovalUser.id}', 'member');
+  INSERT INTO files (id, organization_id, vault_id, canonical_path, file_name, storage_relative_path) VALUES ('${selfRemovalForeignFileId}', '${foreignOrgId}', '${foreignLeaseVaultId}', 'foreign/self-delete.sldprt', 'self-delete.sldprt', 'foreign/self-delete.sldprt');
+  INSERT INTO checkouts (file_id, user_id, token_hash, client_working_path, expires_at) VALUES ('${selfRemovalForeignFileId}', '${selfRemovalUser.id}', '${selfRemovalForeignLeaseHash}', 'C:/foreign-workspace', DATE_ADD(UTC_TIMESTAMP(3), INTERVAL 1 HOUR));
+  INSERT INTO checkout_acquisition_requests (organization_id, request_id, user_id, file_id, vault_id, client_working_path, request_fingerprint, token_hash, token_ciphertext, expires_at, status) VALUES ('${foreignOrgId}', '${selfRemovalForeignRequestId}', '${selfRemovalUser.id}', '${selfRemovalForeignFileId}', '${foreignLeaseVaultId}', 'C:/foreign-workspace', '${'c'.repeat(64)}', '${selfRemovalForeignLeaseHash}', 'self-delete-foreign-ciphertext', DATE_ADD(UTC_TIMESTAMP(3), INTERVAL 1 HOUR), 'active');
+`)
 assert.equal((await requestStatus('/account', { method: 'DELETE' }, selfRemovalLogin.token)).status, 204)
 assert.deepEqual(checkoutRequestState(selfRemovalRequestId), { status: 'cancelled', tokenPurged: true })
+assert.equal(queryTestDatabase(`SELECT status, token_ciphertext IS NOT NULL FROM checkout_acquisition_requests WHERE organization_id = '${foreignOrgId}' AND request_id = '${selfRemovalForeignRequestId}';`), 'cancelled\t0')
+assert.equal(queryTestDatabase(`SELECT COUNT(*) FROM checkouts WHERE file_id = '${selfRemovalForeignFileId}';`), '0')
 
 // Non-migration SQL failures in direct ledger updates must fail closed and
 // roll back the matching legacy checkout mutation.

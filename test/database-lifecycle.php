@@ -40,8 +40,23 @@ if ($foreign['state'] !== 'foreign') throw new RuntimeException('Expected a fore
 DatabaseLifecycle::reset($db, 'DELETE ALL DATABASE DATA');
 
 $applied = Migrator::apply($db, $migrations);
-if (!in_array('036_checkout_request_idempotency.sql', $applied, true) || !FileCheckout::supportsRequestIds($db)) {
+if (!in_array('036_checkout_request_idempotency.sql', $applied, true)
+    || !in_array('037_checkout_user_index.sql', $applied, true)
+    || !FileCheckout::supportsRequestIds($db)) {
     throw new RuntimeException('Expected the checkout request-id recovery migration to apply to an existing schema.');
+}
+$checkoutUserIndex = $db->prepare(
+    'SELECT COUNT(*) FROM information_schema.STATISTICS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ? AND SEQ_IN_INDEX = 1'
+);
+$checkoutUserIndex->execute(['checkouts', 'user_id']);
+if ((int)$checkoutUserIndex->fetchColumn() < 1) {
+    throw new RuntimeException('Expected a leading checkouts.user_id index for membership-removal lease lookup.');
+}
+$db->prepare('DELETE FROM schema_migrations WHERE migration = ?')->execute(['037_checkout_user_index.sql']);
+$upgradeApplied = Migrator::apply($db, $migrations);
+if ($upgradeApplied !== ['037_checkout_user_index.sql']) {
+    throw new RuntimeException('Expected the user index upgrade to run independently when migration 036 is already applied.');
 }
 $schemaTable = $db->query("SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'checkout_acquisition_requests'")->fetchColumn();
 if ((int)$schemaTable !== 1) throw new RuntimeException('Expected the durable checkout request table after migration.');
@@ -53,7 +68,9 @@ if (FileCheckout::supportsRequestIds($db)) throw new RuntimeException('The check
 $legacy = DatabaseLifecycle::inspect($db, $migrations);
 if ($legacy['state'] !== 'legacy') throw new RuntimeException('Expected a legacy BluePLM database.');
 $legacyApplied = Migrator::apply($db, $migrations);
-if (!in_array('036_checkout_request_idempotency.sql', $legacyApplied, true) || !FileCheckout::supportsRequestIds($db)) {
+if (!in_array('036_checkout_request_idempotency.sql', $legacyApplied, true)
+    || !in_array('037_checkout_user_index.sql', $legacyApplied, true)
+    || !FileCheckout::supportsRequestIds($db)) {
     throw new RuntimeException('Expected the checkout request-id migration to apply during legacy adoption.');
 }
 $secondApply = Migrator::apply($db, $migrations);

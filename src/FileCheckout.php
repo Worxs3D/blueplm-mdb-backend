@@ -170,10 +170,15 @@ final class FileCheckout
         }
     }
 
-    public static function markUserCheckoutsTerminal(PDO $db, string $userId): void
+    public static function markUserCheckoutsTerminal(PDO $db, string $userId, ?string $organizationId = null): void
     {
-        $query = $db->prepare('SELECT file_id, token_hash FROM checkouts WHERE user_id = ? FOR UPDATE');
-        $query->execute([$userId]);
+        if ($organizationId === null) {
+            $query = $db->prepare('SELECT file_id, token_hash FROM checkouts WHERE user_id = ? FOR UPDATE');
+            $query->execute([$userId]);
+        } else {
+            $query = $db->prepare('SELECT c.file_id, c.token_hash FROM checkouts c JOIN files f ON f.id = c.file_id WHERE c.user_id = ? AND f.organization_id = ? FOR UPDATE');
+            $query->execute([$userId, $organizationId]);
+        }
         foreach ($query->fetchAll() as $checkout) {
             self::markTerminalByHash($db, $checkout['file_id'], $checkout['token_hash'], 'cancelled');
         }

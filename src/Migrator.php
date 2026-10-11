@@ -41,6 +41,7 @@ final class Migrator
                 } else {
                     $db->exec($sql);
                 }
+                if ($migration === '037_checkout_user_index.sql') self::ensureCheckoutUserIndex($db);
                 if ($migration === '015_eco_metadata.sql') self::ensureEcoMetadataConstraints($db);
                 if ($migration === '024_file_part_numbers.sql') self::ensureFilePartNumberConstraint($db);
                 if ($migration === '032_backup_machine_proof.sql') self::ensureBackupMachineProofColumn($db);
@@ -79,6 +80,19 @@ final class Migrator
         $query->execute(['files', 'uq_files_org_part_number']);
         if (!$query->fetchColumn()) {
             $db->exec('ALTER TABLE files ADD UNIQUE KEY uq_files_org_part_number (organization_id, part_number)');
+        }
+    }
+
+    private static function ensureCheckoutUserIndex(PDO $db): void
+    {
+        $query = $db->prepare(
+            'SELECT 1 FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ? AND SEQ_IN_INDEX = 1
+             LIMIT 1'
+        );
+        $query->execute(['checkouts', 'user_id']);
+        if (!$query->fetchColumn()) {
+            $db->exec('ALTER TABLE checkouts ADD INDEX idx_checkout_user_id (user_id)');
         }
     }
 

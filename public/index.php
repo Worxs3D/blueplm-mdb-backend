@@ -1221,8 +1221,8 @@ try {
         if ($targetRow['role'] === 'owner') { $owners = $db->prepare("SELECT COUNT(*) FROM organization_memberships WHERE organization_id = ? AND role = 'owner'"); $owners->execute([$principal['organizationId']]); if ((int)$owners->fetchColumn() <= 1) Runtime::respond(409, ['error' => 'LAST_OWNER', 'message' => 'The last organization owner cannot be removed.']); }
         $db->beginTransaction();
         try {
-            FileCheckout::markUserCheckoutsTerminal($db, $targetId);
-            $db->prepare('DELETE FROM checkouts WHERE user_id = ?')->execute([$targetId]);
+            FileCheckout::markUserCheckoutsTerminal($db, $targetId, $principal['organizationId']);
+            $db->prepare('DELETE c FROM checkouts c JOIN files f ON f.id = c.file_id WHERE c.user_id = ? AND f.organization_id = ?')->execute([$targetId, $principal['organizationId']]);
             $db->prepare('DELETE FROM sessions WHERE user_id = ? AND organization_id = ?')->execute([$targetId, $principal['organizationId']]);
             $db->prepare('DELETE FROM organization_memberships WHERE user_id = ? AND organization_id = ?')->execute([$targetId, $principal['organizationId']]);
             $db->prepare('UPDATE users SET disabled_at = UTC_TIMESTAMP(3) WHERE id = ?')->execute([$targetId]);
@@ -2621,7 +2621,7 @@ try {
         }
     }
     if ($method === 'POST' && preg_match('#^/files/([0-9a-f-]{36})/checkout/renew$#i', $path, $matches)) {
-        $body = Runtime::jsonBody(); $fileId = $matches[1];
+        $body = Runtime::jsonBody(); $fileId = strtolower($matches[1]);
         if (!is_string($body['checkoutToken'] ?? null) || strlen($body['checkoutToken']) < 20) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'checkoutToken is required.']);
         $expiresAt = Runtime::checkoutExpiry($env);
         $db->beginTransaction();
@@ -2639,7 +2639,7 @@ try {
         Runtime::respond(200, ['expiresAt' => str_replace(' ', 'T', $expiresAt) . 'Z']);
     }
     if ($method === 'POST' && preg_match('#^/files/([0-9a-f-]{36})/checkout/cancel$#i', $path, $matches)) {
-        $body = Runtime::jsonBody(); $fileId = $matches[1];
+        $body = Runtime::jsonBody(); $fileId = strtolower($matches[1]);
         if (!is_string($body['checkoutToken'] ?? null)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'checkoutToken is required.']);
         $db->beginTransaction();
         try {
