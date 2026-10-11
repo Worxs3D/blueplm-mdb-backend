@@ -207,17 +207,23 @@ final class Runtime
     }
 
     /** @param array<string, string> $env */
-    public static function database(array $env): PDO
+    public static function database(array $env, ?int $connectionTimeoutSeconds = null): PDO
     {
         foreach (['MARIADB_HOST', 'MARIADB_DATABASE', 'MARIADB_USER', 'MARIADB_PASSWORD'] as $key) {
             if (!isset($env[$key]) || $env[$key] === '') throw new \RuntimeException("Missing {$key}.");
         }
         $port = $env['MARIADB_PORT'] ?? '3306';
+        $options = [
+            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+            PDO::ATTR_EMULATE_PREPARES => false,
+        ];
+        if ($connectionTimeoutSeconds !== null) $options[PDO::ATTR_TIMEOUT] = max(1, $connectionTimeoutSeconds);
         return new PDO(
             "mysql:host={$env['MARIADB_HOST']};port={$port};dbname={$env['MARIADB_DATABASE']};charset=utf8mb4",
             $env['MARIADB_USER'],
             $env['MARIADB_PASSWORD'],
-            [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC, PDO::ATTR_EMULATE_PREPARES => false],
+            $options,
         );
     }
 

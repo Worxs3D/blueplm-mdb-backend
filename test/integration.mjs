@@ -4,6 +4,7 @@ import { createHmac, generateKeyPairSync, randomUUID, sign } from 'node:crypto'
 import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { runCheckoutRequestIdRecoveryTests } from './checkout-request-id-recovery.mjs'
 
 const server = process.env.BLUEPLM_PHP_TEST_SERVER ?? 'http://127.0.0.1:18080'
 const installationToken = 'integration-installation-token-must-be-at-least-32-chars'
@@ -977,6 +978,7 @@ const migrated = await request('/installer/commit', {
   body: JSON.stringify({ installationToken, action: 'migrate' }),
 })
 assert.equal(migrated.bootstrapped, false)
+assert.ok((await request('/health')).capabilities.includes('checkoutRequestIdempotency'))
 const usersAfterMigration = await request('/users', {}, token)
 assert.ok(usersAfterMigration.users.some((user) => user.email === 'renamed.member@example.test'))
 const imported = await request(
@@ -1362,8 +1364,8 @@ assert.deepEqual(
 assert.equal(contentResult.file.canonical_path, 'drawings/drawing-renamed.sldprt')
 assert.equal(contentResult.file.file_name, 'drawing-renamed.sldprt')
 assert.equal(contentResult.file.storage_relative_path, 'immutable/revision-3.sldprt')
-const contentReplay = await request(`/files/${imported.id}/checkin`, {
-  method: 'POST', body: JSON.stringify(contentRequest),
+const contentReplay = await request(`/files/${imported.id.toUpperCase()}/checkin`, {
+  method: 'POST', body: JSON.stringify({ ...contentRequest, requestId: contentRequest.requestId.toUpperCase() }),
 }, token)
 assert.equal(contentReplay.replayed, true)
 assert.equal(contentReplay.revision, 3)
@@ -1475,35 +1477,9 @@ const sameHashReplay = await request(`/files/${imported.id}/checkin`, {
 assert.equal(sameHashReplay.replayed, true)
 assert.equal(sameHashReplay.revision, 4)
 
-// Concurrent reuse of one request ID across different files is serialized, so
-// one operation commits and the other receives a stable idempotency conflict.
-const [raceCheckoutA, raceCheckoutB] = await Promise.all([
-  request(`/files/${imported.id}/checkout`, {
-    method: 'POST', body: JSON.stringify({ clientWorkingPath: workspace }),
-  }, token),
-  request(`/files/${duplicatePart.id}/checkout`, {
-    method: 'POST', body: JSON.stringify({ clientWorkingPath: workspace }),
-  }, token),
-])
-const sharedRequestId = randomUUID()
-const [raceA, raceB] = await Promise.all([
-  requestStatus(`/files/${imported.id}/checkin`, {
-    method: 'POST', body: JSON.stringify({
-      mode: 'metadata-only', requestId: sharedRequestId,
-      canonicalPath: 'race/imported.sldprt', fileName: 'imported.sldprt',
-      checkoutToken: raceCheckoutA.checkoutToken,
-    }),
-  }, token),
-  requestStatus(`/files/${duplicatePart.id}/checkin`, {
-    method: 'POST', body: JSON.stringify({
-      mode: 'metadata-only', requestId: sharedRequestId,
-      canonicalPath: 'race/duplicate-part.sldprt', fileName: 'duplicate-part.sldprt',
-      checkoutToken: raceCheckoutB.checkoutToken,
-    }),
-  }, token),
-])
-assert.deepEqual([raceA.status, raceB.status].sort(), [200, 409])
-assert.equal([raceA, raceB].find(result => result.status === 409).body.error, 'IDEMPOTENCY_KEY_REUSED')
-assert.equal(duplicatePart.created, true)
+await runCheckoutRequestIdRecoveryTests({
+  request, requestStatus,
+  duplicatePart, imported, workspace, token, updatedMemberLogin, vault, foreignOrgId, foreignUser, sameHashRequest,
+})
 
 console.log('PHP API, installer lifecycle, MariaDB, and network vault integration passed.')

@@ -7,6 +7,8 @@ use PDO;
 use PDOException;
 use Throwable;
 
+require_once __DIR__ . '/FileCheckout.php';
+
 final class FileCheckinFailure extends \RuntimeException
 {
     public function __construct(
@@ -25,6 +27,7 @@ final class FileCheckin
     /** @return array<string, mixed> */
     public static function execute(PDO $db, array $env, array $principal, string $fileId, array $body): array
     {
+        $fileId = strtolower($fileId);
         $explicitMode = array_key_exists('mode', $body);
         $mode = $explicitMode ? $body['mode'] : (array_key_exists('storageRelativePath', $body) ? 'content' : null);
         if (!in_array($mode, ['content', 'metadata-only'], true)) throw new FileCheckinFailure(400, 'INVALID_REQUEST', 'mode must be content or metadata-only.');
@@ -37,6 +40,7 @@ final class FileCheckin
         $requestId = $body['requestId'] ?? null;
         if ($explicitMode && (!is_string($requestId) || !self::isUuid($requestId))) throw new FileCheckinFailure(400, 'INVALID_REQUEST', 'requestId must be a UUID when mode is specified.');
         if ($requestId !== null && (!is_string($requestId) || !self::isUuid($requestId))) throw new FileCheckinFailure(400, 'INVALID_REQUEST', 'requestId must be a UUID.');
+        if (is_string($requestId)) $requestId = strtolower($requestId);
         if (!is_string($body['checkoutToken'] ?? null) || $body['checkoutToken'] === '') throw new FileCheckinFailure(400, 'INVALID_REQUEST', 'checkoutToken is required.');
 
         $relativePath = null; $hash = null; $size = null;
@@ -77,23 +81,32 @@ final class FileCheckin
         $partNumber = is_string($partNumber) && trim($partNumber) !== '' ? trim($partNumber) : null;
         if ($partNumber !== null && strlen($partNumber) > 512) throw new FileCheckinFailure(400, 'INVALID_REQUEST', 'part_number is too long.');
 
+        if ($requestId !== null) $body['requestId'] = $requestId;
         $fingerprint = $requestId === null ? null : self::fingerprint($body);
-        $db->beginTransaction();
-        try {
-            // Serialize requestId lookups within a tenant. Locking a missing
-            // request row alone can deadlock when concurrent check-ins race to
-            // insert the same primary key for different files.
-            if ($requestId !== null) {
-                $organizationLock = $db->prepare('SELECT id FROM organizations WHERE id = ? FOR UPDATE');
-                $organizationLock->execute([$principal['organizationId']]);
+        $authorizationQuery = $db->prepare('SELECT vault_id FROM files WHERE id = ? AND organization_id = ? AND deleted_at IS NULL');
+        $authorizationQuery->execute([$fileId, $principal['organizationId']]);
+        $authorizationFile = $authorizationQuery->fetch();
+        if (!$authorizationFile) throw new FileCheckinFailure(404, 'NOT_FOUND', 'File not found.');
+        Runtime::requireVault($db, $principal, $authorizationFile['vault_id']);
+        $requestLock = null;
+        if ($requestId !== null) {
+            try {
+                $requestLock = FileCheckout::acquireRequestIdLock($db, 'checkin', $principal['organizationId'], $requestId);
+            } catch (Throwable) {
+                throw new FileCheckinFailure(503, 'CHECKIN_RECOVERY_UNAVAILABLE', 'Durable check-in recovery is temporarily unavailable.');
             }
+            if ($requestLock === null) throw new FileCheckinFailure(503, 'CHECKIN_RECOVERY_BUSY', 'Durable check-in recovery is busy; retry the same requestId.');
+        }
+        $operationFailure = null;
+        try {
+            $db->beginTransaction();
             $fileQuery = $db->prepare('SELECT * FROM files WHERE id = ? AND organization_id = ? AND deleted_at IS NULL FOR UPDATE');
             $fileQuery->execute([$fileId, $principal['organizationId']]); $file = $fileQuery->fetch();
             if (!$file) throw new FileCheckinFailure(404, 'NOT_FOUND', 'File not found.');
-            Runtime::requireVault($db, $principal, $file['vault_id']);
+            if ($file['vault_id'] !== $authorizationFile['vault_id']) throw new FileCheckinFailure(404, 'NOT_FOUND', 'File not found.');
 
             if ($requestId !== null) {
-                $prior = $db->prepare('SELECT file_id, user_id, request_fingerprint, response FROM file_checkin_requests WHERE organization_id = ? AND request_id = ? FOR UPDATE');
+                $prior = $db->prepare('SELECT file_id, user_id, request_fingerprint, response FROM file_checkin_requests WHERE organization_id = ? AND request_id = ?');
                 $prior->execute([$principal['organizationId'], $requestId]); $existing = $prior->fetch();
                 if ($existing) {
                     if ($existing['file_id'] !== $fileId || $existing['user_id'] !== $principal['userId'] || !hash_equals($existing['request_fingerprint'], $fingerprint)) throw new FileCheckinFailure(409, 'IDEMPOTENCY_KEY_REUSED', 'requestId was already used with a different check-in request.');
@@ -158,15 +171,24 @@ final class FileCheckin
                 ],
             ];
             Runtime::emitEvent($db, $principal['organizationId'], $mode === 'content' ? 'file.checked_in' : 'file.metadata_checked_in', $fileId, ['revision' => $nextRevision, 'userId' => $principal['userId'], 'comment' => $comment, 'requestId' => $requestId]);
+            FileCheckout::markTerminalByHash($db, $fileId, $lease['token_hash'], 'consumed');
             $db->prepare('DELETE FROM checkouts WHERE file_id = ?')->execute([$fileId]);
             if ($requestId !== null) $db->prepare('INSERT INTO file_checkin_requests (request_id, organization_id, file_id, user_id, request_fingerprint, response) VALUES (?, ?, ?, ?, ?, ?)')->execute([$requestId, $principal['organizationId'], $fileId, $principal['userId'], $fingerprint, json_encode($response, JSON_THROW_ON_ERROR)]);
             $db->commit(); return $response;
         } catch (Throwable $error) {
             if ($db->inTransaction()) $db->rollBack();
-            if ($error instanceof FileCheckinFailure) throw $error;
-            if ($error instanceof PDOException && $error->getCode() === '23000' && str_contains($error->getMessage(), 'uq_files_org_part_number')) throw new FileCheckinFailure(409, 'PART_NUMBER_EXISTS', 'This part number is already assigned to another file.');
-            if ($error instanceof PDOException && $error->getCode() === '23000' && str_contains($error->getMessage(), 'uq_file_active_path')) throw new FileCheckinFailure(409, 'PATH_EXISTS', 'A file already exists at this vault path.');
+            if ($error instanceof PDOException && $error->getCode() === '23000' && str_contains($error->getMessage(), 'uq_files_org_part_number')) $error = new FileCheckinFailure(409, 'PART_NUMBER_EXISTS', 'This part number is already assigned to another file.');
+            if ($error instanceof PDOException && $error->getCode() === '23000' && str_contains($error->getMessage(), 'uq_file_active_path')) $error = new FileCheckinFailure(409, 'PATH_EXISTS', 'A file already exists at this vault path.');
+            $operationFailure = $error;
             throw $error;
+        } finally {
+            if ($requestLock !== null) {
+                try {
+                    if (!FileCheckout::releaseRequestIdLock($db, $requestLock)) throw new \RuntimeException('Check-in request lock was not released.');
+                } catch (Throwable) {
+                    if ($operationFailure === null) throw new FileCheckinFailure(503, 'CHECKIN_RECOVERY_UNAVAILABLE', 'The check-in result should be retried with the same requestId.');
+                }
+            }
         }
     }
 

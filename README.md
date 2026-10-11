@@ -107,6 +107,28 @@ a missing, expired, consumed, or mismatched checkout lease returns
 `409 INVALID_CHECKOUT`. Calls using the legacy body without
 `mode` remain accepted as content check-ins when `storageRelativePath` is
 provided, but clients should use the explicit contract for durable retries.
+When request-ID serialization is busy or unavailable, check-in returns
+`503 CHECKIN_RECOVERY_BUSY` or `503 CHECKIN_RECOVERY_UNAVAILABLE`; retry with
+the same request ID.
+
+## Durable checkout acquisition
+
+`POST /files/{fileId}/checkout` remains compatible with legacy callers that send
+only `clientWorkingPath`. New clients may include a UUID `requestId` and must
+reuse it only for retries of that same acquisition. An exact retry returns the
+same active lease token and current expiry; changing the file or path with that
+ID returns `409 IDEMPOTENCY_KEY_REUSED`. A different request ID cannot replace
+an active lease (`409 CHECKED_OUT`). The server exposes the
+`checkoutRequestIdempotency` health capability only when migration
+`036_checkout_request_idempotency.sql` is applied and its request journal is
+present. If request-ID locking is busy, the server returns retryable
+`503 CHECKOUT_RECOVERY_BUSY`; when the durable journal or lock service is
+unavailable it returns `503 CHECKOUT_RECOVERY_UNAVAILABLE`. Retries must retain
+the original request ID. Cancellation, check-in, and replacement by a legacy
+checkout terminalize the request and erase its encrypted token so it cannot be
+replayed later. An expired request is terminalized when the server next
+observes the expired lease. The API relies on MariaDB named-lock support for
+bounded per-request serialization.
 
 ## Tests
 
