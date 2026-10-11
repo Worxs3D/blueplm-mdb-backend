@@ -816,6 +816,61 @@ assert.equal((await requestStatus(`/files/${updateFailureFile.id}/checkout/cance
 }, token)).status, 204)
 assert.deepEqual(checkoutRequestState(updateFailureRequestId), { status: 'cancelled', tokenPurged: true })
 
+// Membership removal must roll back lease, ledger, membership, and session
+// changes together if terminalizing the durable request fails.
+const failedRemovalUser = await request('/users', {
+  method: 'POST', body: JSON.stringify({ email: 'failed-removal@example.test', displayName: 'Failed Removal', password: 'Failed removal password 123!' }),
+}, token)
+await request(`/users/${failedRemovalUser.id}/vault-access`, {
+  method: 'PUT', body: JSON.stringify({ vaultIds: [vault.id] }),
+}, token)
+const failedRemovalLogin = await request('/auth/login', {
+  method: 'POST', body: JSON.stringify({ email: 'failed-removal@example.test', password: 'Failed removal password 123!' }),
+})
+const failedRemovalFile = await request('/files/import', {
+  method: 'POST', body: JSON.stringify({ vaultId: vault.id, canonicalPath: 'failed-removal.sldprt', fileName: 'failed-removal.sldprt', storageRelativePath: 'failed-removal.sldprt' }),
+}, token)
+const failedRemovalRequestId = randomUUID()
+await request(`/files/${failedRemovalFile.id}/checkout`, {
+  method: 'POST', body: JSON.stringify({ clientWorkingPath: workspace, requestId: failedRemovalRequestId }),
+}, failedRemovalLogin.token)
+const failedRemovalForeignFileId = randomUUID()
+const failedRemovalForeignRequestId = randomUUID()
+const failedRemovalForeignLeaseHash = '9'.repeat(64)
+queryTestDatabase(`
+  INSERT INTO organization_memberships (organization_id, user_id, role) VALUES ('${foreignOrgId}', '${failedRemovalUser.id}', 'member');
+  INSERT INTO files (id, organization_id, vault_id, canonical_path, file_name, storage_relative_path) VALUES ('${failedRemovalForeignFileId}', '${foreignOrgId}', '${foreignLeaseVaultId}', 'foreign/failed-removal.sldprt', 'failed-removal.sldprt', 'foreign/failed-removal.sldprt');
+  INSERT INTO checkouts (file_id, user_id, token_hash, client_working_path, expires_at) VALUES ('${failedRemovalForeignFileId}', '${failedRemovalUser.id}', '${failedRemovalForeignLeaseHash}', 'C:/foreign-workspace', DATE_ADD(UTC_TIMESTAMP(3), INTERVAL 1 HOUR));
+  INSERT INTO checkout_acquisition_requests (organization_id, request_id, user_id, file_id, vault_id, client_working_path, request_fingerprint, token_hash, token_ciphertext, expires_at, status) VALUES ('${foreignOrgId}', '${failedRemovalForeignRequestId}', '${failedRemovalUser.id}', '${failedRemovalForeignFileId}', '${foreignLeaseVaultId}', 'C:/foreign-workspace', '${'9'.repeat(64)}', '${failedRemovalForeignLeaseHash}', 'failed-removal-foreign-ciphertext', DATE_ADD(UTC_TIMESTAMP(3), INTERVAL 1 HOUR), 'active');
+`)
+const failedRemovalSnapshotSql = `
+  SELECT 'checkout', COALESCE(GROUP_CONCAT(CONCAT_WS(':', file_id, user_id, token_hash, client_working_path, DATE_FORMAT(expires_at, '%Y-%m-%d %H:%i:%s.%f')) ORDER BY file_id SEPARATOR '|'), '') FROM checkouts WHERE user_id = '${failedRemovalUser.id}';
+  SELECT 'ledger', COALESCE(GROUP_CONCAT(CONCAT_WS(':', organization_id, request_id, file_id, status, token_hash, token_ciphertext, DATE_FORMAT(expires_at, '%Y-%m-%d %H:%i:%s.%f')) ORDER BY organization_id, request_id SEPARATOR '|'), '') FROM checkout_acquisition_requests WHERE user_id = '${failedRemovalUser.id}';
+  SELECT 'membership', COALESCE(GROUP_CONCAT(CONCAT_WS(':', organization_id, user_id, role) ORDER BY organization_id SEPARATOR '|'), '') FROM organization_memberships WHERE user_id = '${failedRemovalUser.id}';
+  SELECT 'session', COALESCE(GROUP_CONCAT(CONCAT_WS(':', organization_id, token_hash, DATE_FORMAT(expires_at, '%Y-%m-%d %H:%i:%s.%f')) ORDER BY organization_id, token_hash SEPARATOR '|'), '') FROM sessions WHERE user_id = '${failedRemovalUser.id}';
+  SELECT 'disabled_at', COALESCE(DATE_FORMAT(disabled_at, '%Y-%m-%d %H:%i:%s.%f'), 'NULL') FROM users WHERE id = '${failedRemovalUser.id}';
+`
+const failedRemovalStateBefore = queryTestDatabase(failedRemovalSnapshotSql)
+queryTestDatabase("CREATE TRIGGER test_fail_removal_event_insert BEFORE INSERT ON events FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'injected removal event failure';")
+try {
+  const failedMemberRemoval = await requestStatus(`/users/${failedRemovalUser.id}`, { method: 'DELETE' }, token)
+  assert.equal(failedMemberRemoval.status, 500)
+  assert.equal(failedMemberRemoval.body.error, 'INTERNAL_ERROR')
+  assert.equal(queryTestDatabase(failedRemovalSnapshotSql), failedRemovalStateBefore)
+} finally {
+  queryTestDatabase('DROP TRIGGER IF EXISTS test_fail_removal_event_insert;')
+}
+const retriedMemberRemoval = await requestStatus(`/users/${failedRemovalUser.id}`, { method: 'DELETE' }, token)
+assert.equal(retriedMemberRemoval.status, 204)
+assert.equal(queryTestDatabase(`SELECT COUNT(*) FROM checkouts WHERE file_id = '${failedRemovalFile.id}';`), '0')
+assert.deepEqual(checkoutRequestState(failedRemovalRequestId), { status: 'cancelled', tokenPurged: true })
+assert.equal(queryTestDatabase(`SELECT COUNT(*) FROM organization_memberships WHERE organization_id = '${testOrganizationId}' AND user_id = '${failedRemovalUser.id}';`), '0')
+assert.equal(queryTestDatabase(`SELECT COUNT(*) FROM sessions WHERE user_id = '${failedRemovalUser.id}';`), '0')
+assert.equal(queryTestDatabase(`SELECT disabled_at IS NOT NULL FROM users WHERE id = '${failedRemovalUser.id}';`), '1')
+assert.equal(queryTestDatabase(`SELECT COUNT(*) FROM checkouts WHERE file_id = '${failedRemovalForeignFileId}' AND user_id = '${failedRemovalUser.id}';`), '1')
+assert.equal(queryTestDatabase(`SELECT status, token_ciphertext IS NOT NULL FROM checkout_acquisition_requests WHERE organization_id = '${foreignOrgId}' AND request_id = '${failedRemovalForeignRequestId}';`), 'active\t1')
+assert.equal(queryTestDatabase(`SELECT COUNT(*) FROM organization_memberships WHERE organization_id = '${foreignOrgId}' AND user_id = '${failedRemovalUser.id}';`), '1')
+
 // An exact missing-table 1146 remains compatible with legacy clients that do
 // not send request IDs; both direct ledger updates may be a no-op on old schema.
 const legacyCompatibilityFile = await request('/files/import', {
