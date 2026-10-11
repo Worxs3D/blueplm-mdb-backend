@@ -128,7 +128,13 @@ the original request ID. Cancellation, check-in, and replacement by a legacy
 checkout terminalize the request and erase its encrypted token so it cannot be
 replayed later. An expired request is terminalized when the server next
 observes the expired lease. The API relies on MariaDB named-lock support for
-bounded per-request serialization.
+bounded per-request serialization. The per-user checkout lifecycle mutex waits
+up to five seconds; contention fails closed with `503 CHECKOUT_BUSY`. This may
+affect durable or legacy checkout and user/account removal. Only durable
+checkout uses a request ID, so reuse the same ID when retrying that checkout.
+Legacy checkout and deletion have no request-ID idempotency; inspect the current
+lease/account state before retrying when the response may have been lost after
+the operation completed.
 
 ## Tests
 
@@ -141,6 +147,7 @@ docker compose -f docker-compose.test.yml up --build -d
 node test/integration.mjs
 docker compose -f docker-compose.test.yml exec -T api php test/database-lifecycle.php
 docker compose -f docker-compose.test.yml exec -T api php test/module-defaults-migration.php
+docker compose -f docker-compose.test.yml exec -T api php test/checkout-lifecycle-lock-release.php
 docker compose -f docker-compose.test.yml down -v
 ```
 

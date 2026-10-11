@@ -1213,22 +1213,33 @@ try {
     }
     if ($method === 'DELETE' && preg_match('#^/users/([0-9a-f-]{36})$#i', $path, $matches)) {
         if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
-        $targetId = $matches[1];
+        $targetId = strtolower($matches[1]);
         if ($targetId === $principal['userId']) Runtime::respond(400, ['error' => 'SELF_DELETE', 'message' => 'Use the account deletion flow for your own account.']);
         $target = $db->prepare('SELECT m.role FROM organization_memberships m JOIN users u ON u.id = m.user_id WHERE m.organization_id = ? AND m.user_id = ? AND u.disabled_at IS NULL');
         $target->execute([$principal['organizationId'], $targetId]); $targetRow = $target->fetch();
         if (!$targetRow) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'User not found.']);
         if ($targetRow['role'] === 'owner') { $owners = $db->prepare("SELECT COUNT(*) FROM organization_memberships WHERE organization_id = ? AND role = 'owner'"); $owners->execute([$principal['organizationId']]); if ((int)$owners->fetchColumn() <= 1) Runtime::respond(409, ['error' => 'LAST_OWNER', 'message' => 'The last organization owner cannot be removed.']); }
-        $db->beginTransaction();
+        try { $lifecycleLock = FileCheckout::acquireUserLifecycleLock($db, $targetId); }
+        catch (Throwable) { Runtime::respond(503, ['error' => 'CHECKOUT_BUSY', 'message' => 'User checkout cleanup is temporarily busy; retry the removal.']); }
+        if ($lifecycleLock === null) Runtime::respond(503, ['error' => 'CHECKOUT_BUSY', 'message' => 'User checkout cleanup is temporarily busy; retry the removal.']);
+        $operationFailure = null;
+        $committed = false;
         try {
-            FileCheckout::markUserCheckoutsTerminal($db, $targetId, $principal['organizationId']);
-            $db->prepare('DELETE c FROM checkouts c JOIN files f ON f.id = c.file_id WHERE c.user_id = ? AND f.organization_id = ?')->execute([$targetId, $principal['organizationId']]);
+            $db->beginTransaction();
+            $terminalizedFileIds = FileCheckout::markUserCheckoutsTerminal($db, $targetId, $principal['organizationId']);
+            $deleteCheckout = $db->prepare('DELETE FROM checkouts WHERE file_id = ? AND user_id = ?');
+            // Delete only rows still owned by this user; a newer foreign owner's lease is preserved.
+            foreach ($terminalizedFileIds as $fileId) $deleteCheckout->execute([$fileId, $targetId]);
             $db->prepare('DELETE FROM sessions WHERE user_id = ? AND organization_id = ?')->execute([$targetId, $principal['organizationId']]);
             $db->prepare('DELETE FROM organization_memberships WHERE user_id = ? AND organization_id = ?')->execute([$targetId, $principal['organizationId']]);
             $db->prepare('UPDATE users SET disabled_at = UTC_TIMESTAMP(3) WHERE id = ?')->execute([$targetId]);
             Runtime::emitEvent($db, $principal['organizationId'], 'user.removed', $targetId, ['userId' => $targetId, 'removedBy' => $principal['userId']]);
             $db->commit();
-        } catch (Throwable $error) { if ($db->inTransaction()) $db->rollBack(); throw $error; }
+            $committed = true;
+        } catch (Throwable $error) { if ($db->inTransaction()) $db->rollBack(); $operationFailure = $error; throw $error; }
+        finally { FileCheckout::finishUserLifecycleLock($db, $lifecycleLock, $committed, $operationFailure); }
+        // A release failure after commit must not make callers retry the deletion as if it rolled back.
+        // Runtime::respond exits this request; Runtime::database uses non-persistent PDO, so request shutdown closes it.
         Runtime::respond(204);
     }
     if ($method === 'GET' && $path === '/workflow-roles') {
@@ -1704,7 +1715,16 @@ try {
     }
     if ($method === 'DELETE' && $path === '/account') {
         if ($principal['role'] === 'owner') { $owners = $db->prepare("SELECT 1 FROM organization_memberships WHERE organization_id = ? AND role = 'owner' AND user_id <> ? LIMIT 1"); $owners->execute([$principal['organizationId'], $principal['userId']]); if (!$owners->fetch()) Runtime::respond(409, ['error' => 'LAST_OWNER', 'message' => 'Transfer organization ownership before deleting the last owner account.']); }
-        $db->beginTransaction(); try { FileCheckout::markUserCheckoutsTerminal($db, $principal['userId']); $db->prepare('DELETE FROM checkouts WHERE user_id = ?')->execute([$principal['userId']]); $db->prepare('DELETE FROM sessions WHERE user_id = ?')->execute([$principal['userId']]); $db->prepare('DELETE FROM organization_memberships WHERE user_id = ? AND organization_id = ?')->execute([$principal['userId'], $principal['organizationId']]); $db->prepare('UPDATE users SET disabled_at = UTC_TIMESTAMP(3) WHERE id = ?')->execute([$principal['userId']]); Runtime::emitEvent($db, $principal['organizationId'], 'account.deleted', $principal['userId'], ['userId' => $principal['userId']]); $db->commit(); } catch (Throwable $error) { if ($db->inTransaction()) $db->rollBack(); throw $error; } Runtime::respond(204);
+        try { $lifecycleLock = FileCheckout::acquireUserLifecycleLock($db, $principal['userId']); }
+        catch (Throwable) { Runtime::respond(503, ['error' => 'CHECKOUT_BUSY', 'message' => 'Account checkout cleanup is temporarily busy; retry deletion.']); }
+        if ($lifecycleLock === null) Runtime::respond(503, ['error' => 'CHECKOUT_BUSY', 'message' => 'Account checkout cleanup is temporarily busy; retry deletion.']);
+        $operationFailure = null;
+        $committed = false;
+        try { $db->beginTransaction(); $terminalizedFileIds = FileCheckout::markUserCheckoutsTerminal($db, $principal['userId']); $deleteCheckout = $db->prepare('DELETE FROM checkouts WHERE file_id = ? AND user_id = ?'); foreach ($terminalizedFileIds as $fileId) $deleteCheckout->execute([$fileId, $principal['userId']]); $db->prepare('DELETE FROM sessions WHERE user_id = ?')->execute([$principal['userId']]); $db->prepare('DELETE FROM organization_memberships WHERE user_id = ? AND organization_id = ?')->execute([$principal['userId'], $principal['organizationId']]); $db->prepare('UPDATE users SET disabled_at = UTC_TIMESTAMP(3) WHERE id = ?')->execute([$principal['userId']]); Runtime::emitEvent($db, $principal['organizationId'], 'account.deleted', $principal['userId'], ['userId' => $principal['userId']]); $db->commit(); $committed = true; }
+        catch (Throwable $error) { if ($db->inTransaction()) $db->rollBack(); $operationFailure = $error; throw $error; }
+        finally { FileCheckout::finishUserLifecycleLock($db, $lifecycleLock, $committed, $operationFailure); }
+        // Keep the committed outcome authoritative; the non-persistent connection closes at request shutdown.
+        Runtime::respond(204);
     }
     if ($method === 'POST' && $path === '/recovery-codes') {
         if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']); $body = Runtime::jsonBody(); $days = is_int($body['expiresInDays'] ?? null) ? $body['expiresInDays'] : 90; if ($days < 1 || $days > 3650) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'expiresInDays must be between 1 and 3650.']); $description = is_string($body['description'] ?? null) ? substr($body['description'], 0, 1024) : null;
@@ -2596,22 +2616,34 @@ try {
                 Runtime::respond($error->status, ['error' => $error->errorCode, 'message' => $error->getMessage()]);
             }
         }
-        $token = rtrim(strtr(base64_encode(random_bytes(48)), '+/', '-_'), '=');
-        $expiresAt = Runtime::checkoutExpiry($env);
-        $db->beginTransaction();
+        try { $lifecycleLock = FileCheckout::acquireUserLifecycleLock($db, $principal['userId']); }
+        catch (Throwable) { Runtime::respond(503, ['error' => 'CHECKOUT_BUSY', 'message' => 'Checkout is temporarily busy; retry the request.']); }
+        if ($lifecycleLock === null) Runtime::respond(503, ['error' => 'CHECKOUT_BUSY', 'message' => 'Checkout is temporarily busy; retry the request.']);
+        $operationFailure = null;
+        $checkoutResult = null;
+        $committed = false;
         try {
+            FileCheckout::assertCheckoutPrincipalActive($db, $principal);
+            $token = rtrim(strtr(base64_encode(random_bytes(48)), '+/', '-_'), '=');
+            $expiresAt = Runtime::checkoutExpiry($env);
+            $db->beginTransaction();
             $fileLock = $db->prepare('SELECT id FROM files WHERE id = ? AND organization_id = ? AND deleted_at IS NULL FOR UPDATE'); $fileLock->execute([$fileId, $principal['organizationId']]);
-            if (!$fileLock->fetch()) { $db->rollBack(); Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'File not found.']); }
+            if (!$fileLock->fetch()) throw new CheckoutLeaseFailure(404, 'NOT_FOUND', 'File not found.');
             $lock = $db->prepare('SELECT user_id, token_hash, (expires_at > UTC_TIMESTAMP(3)) AS lease_active FROM checkouts WHERE file_id = ?'); $lock->execute([$fileId]);
             $priorLease = $lock->fetch();
-            if ($priorLease && (int)$priorLease['lease_active'] === 1) { $db->rollBack(); Runtime::respond(409, ['error' => 'CHECKED_OUT', 'message' => 'File is checked out by another client.']); }
+            if ($priorLease && (int)$priorLease['lease_active'] === 1) throw new CheckoutLeaseFailure(409, 'CHECKED_OUT', 'File is checked out by another client.');
             if ($priorLease) FileCheckout::markTerminalByHash($db, $fileId, $priorLease['token_hash'], 'expired');
             $db->prepare('DELETE FROM checkouts WHERE file_id = ?')->execute([$fileId]);
             $db->prepare('INSERT INTO checkouts (file_id, user_id, token_hash, client_working_path, expires_at) VALUES (?, ?, ?, ?, ?)')->execute([$fileId, $principal['userId'], Runtime::tokenHash($token, $env), $body['clientWorkingPath'], $expiresAt]);
             Runtime::emitEvent($db, $principal['organizationId'], 'file.checked_out', $fileId, ['userId' => $principal['userId'], 'expiresAt' => str_replace(' ', 'T', $expiresAt) . 'Z']);
             $db->commit();
-        } catch (Throwable $error) { if ($db->inTransaction()) $db->rollBack(); throw $error; }
-        Runtime::respond(200, ['checkoutToken' => $token, 'expiresAt' => str_replace(' ', 'T', $expiresAt) . 'Z']);
+            $committed = true;
+            $checkoutResult = ['checkoutToken' => $token, 'expiresAt' => str_replace(' ', 'T', $expiresAt) . 'Z'];
+        } catch (Throwable $error) { if ($db->inTransaction()) $db->rollBack(); $operationFailure = $error; }
+        finally { FileCheckout::finishUserLifecycleLock($db, $lifecycleLock, $committed, $operationFailure); }
+        if ($operationFailure instanceof CheckoutLeaseFailure) Runtime::respond($operationFailure->status, ['error' => $operationFailure->errorCode, 'message' => $operationFailure->getMessage()]);
+        if ($operationFailure !== null) throw $operationFailure;
+        Runtime::respond(200, $checkoutResult);
     }
     if ($method === 'POST' && preg_match('#^/files/([0-9a-f-]{36})/checkin$#i', $path, $matches)) {
         try {

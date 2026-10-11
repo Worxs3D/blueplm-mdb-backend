@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { execFileSync, spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
+import { performance } from 'node:perf_hooks'
 
 function queryTestDatabase(sql) {
   return execFileSync('docker', [
@@ -16,11 +17,13 @@ function checkoutRequestState(requestId) {
   return { status, tokenPurged: tokenPurged === '1' }
 }
 
-function spawnCheckoutCancelLockHolder(fileId, organizationId) {
-  const child = spawn('docker', [
+function spawnCheckoutCancelLockHolder(fileId, organizationId, fileOnly = false) {
+  const args = [
     'compose', '-f', 'docker-compose.test.yml', 'exec', '-T', 'api',
     'php', 'test/checkout-cancel-lock-holder.php', fileId, organizationId,
-  ], { cwd: process.cwd(), stdio: ['pipe', 'pipe', 'pipe'] })
+  ]
+  if (fileOnly) args.push('file-only')
+  const child = spawn('docker', args, { cwd: process.cwd(), stdio: ['pipe', 'pipe', 'pipe'] })
   let stdout = ''
   let stderr = ''
   child.stdout.setEncoding('utf8')
@@ -32,6 +35,27 @@ function spawnCheckoutCancelLockHolder(fileId, organizationId) {
     child.once('close', (code) => {
       if (code === 0) resolve({ stdout, stderr })
       else reject(new Error(`Checkout lock holder exited ${code}: ${stderr}`))
+    })
+  })
+  return { child, done, output: () => stdout }
+}
+
+function spawnUserLifecycleLockHolder(userId) {
+  const child = spawn('docker', [
+    'compose', '-f', 'docker-compose.test.yml', 'exec', '-T', 'api',
+    'php', 'test/checkout-user-lifecycle-lock-holder.php', userId,
+  ], { cwd: process.cwd(), stdio: ['pipe', 'pipe', 'pipe'] })
+  let stdout = ''
+  let stderr = ''
+  child.stdout.setEncoding('utf8')
+  child.stderr.setEncoding('utf8')
+  child.stdout.on('data', chunk => { stdout += chunk })
+  child.stderr.on('data', chunk => { stderr += chunk })
+  const done = new Promise((resolve, reject) => {
+    child.once('error', reject)
+    child.once('close', code => {
+      if (code === 0) resolve({ stdout, stderr })
+      else reject(new Error(`Checkout lifecycle lock holder exited ${code}: ${stderr}`))
     })
   })
   return { child, done, output: () => stdout }
@@ -58,12 +82,18 @@ function spawnRequestLockHolder(operation, organizationId, requestId) {
   return { child, done, output: () => stdout }
 }
 
-async function waitForOutput(worker, expected, timeoutMs = 5000) {
+async function waitForOutput(worker, expected, timeoutMs = 20000) {
   const started = Date.now()
   while (!worker.output().includes(expected)) {
     if (Date.now() - started >= timeoutMs) throw new Error(`Timed out waiting for worker output ${expected}.`)
     await new Promise(resolve => setTimeout(resolve, 25))
   }
+}
+
+function releaseLockHolder(worker) {
+  if (worker.child.exitCode !== null) return
+  worker.child.stdin.on('error', () => {})
+  worker.child.stdin.write('continue\n')
 }
 
 function checkoutRequestLockName(organizationId, requestId) {
@@ -75,18 +105,76 @@ function checkoutRequestLockName(organizationId, requestId) {
   return `blueplm:${digest}`
 }
 
-function checkoutRequestLockWaitCount(lockName) {
-  const sql = `SELECT COUNT(*) FROM information_schema.INNODB_LOCK_WAITS w JOIN information_schema.INNODB_TRX t ON t.trx_id = w.requesting_trx_id WHERE t.trx_mysql_thread_id = IS_USED_LOCK('${lockName}');`
-  return Number(execFileSync('docker', [
-    'compose', '-f', 'docker-compose.test.yml', 'exec', '-T', 'mariadb',
-    'mariadb', '-N', '-B', '-uroot', '-proot-test-password', 'blueplm', '-e', sql,
-  ], { cwd: process.cwd(), stdio: 'pipe' }).toString().trim())
+function userLifecycleLockName(userId) {
+  const databaseName = queryTestDatabase('SELECT DATABASE();')
+  const digest = createHash('sha256')
+    .update([databaseName, 'checkout-user-lifecycle', userId.toLowerCase()].join('\0'))
+    .digest('hex')
+    .slice(0, 56)
+  return `blueplm:${digest}`
 }
 
-async function waitForCheckoutRequestLockWait(lockName, timeoutMs = 5000) {
+function queryTestDatabaseAsRoot(sql, timeoutMs = 0) {
+  const options = { cwd: process.cwd(), stdio: 'pipe' }
+  if (timeoutMs > 0) options.timeout = timeoutMs
+  return execFileSync('docker', [
+    'compose', '-f', 'docker-compose.test.yml', 'exec', '-T', 'mariadb',
+    'mariadb', '-N', '-B', '-uroot', '-proot-test-password', 'blueplm', '-e', sql,
+  ], options).toString().trim()
+}
+
+function advisoryLockOwner(lockName) {
+  return Number(queryTestDatabaseAsRoot(`SELECT COALESCE(IS_USED_LOCK('${lockName}'), 0);`))
+}
+
+async function waitForAdvisoryLockOwner(lockName, timeoutMs = 20000) {
   const started = Date.now()
-  while (checkoutRequestLockWaitCount(lockName) === 0) {
-    if (Date.now() - started >= timeoutMs) throw new Error('Checkout request did not reach its expected InnoDB file-lock wait.')
+  while (advisoryLockOwner(lockName) === 0) {
+    if (Date.now() - started >= timeoutMs) throw new Error('Checkout lifecycle mutex was not acquired.')
+    await new Promise(resolve => setTimeout(resolve, 25))
+  }
+}
+
+function userLifecycleLockWaitCount(timeoutMs) {
+  // Native PDO prepares hide the bound lock name in PROCESSLIST.INFO. These
+  // serial scenarios assert a zero-waiter baseline before starting one contender.
+  return Number(queryTestDatabaseAsRoot("SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE DB = 'blueplm' AND USER = 'blueplm' AND STATE = 'User lock' AND INFO LIKE '%GET_LOCK%';", timeoutMs))
+}
+
+async function waitForUserLifecycleLockWaitCount(lockName, expectedCount, timeoutMs = 4500) {
+  const deadline = performance.now() + timeoutMs
+  let probeTimedOut = false
+  while (true) {
+    const remainingMs = deadline - performance.now()
+    if (remainingMs <= 0) {
+      const detail = probeTimedOut ? ' Database waiter probes also timed out under load.' : ''
+      throw new Error(`Expected exactly ${expectedCount} API waiter for lifecycle mutex ${lockName}.${detail}`)
+    }
+    let observedCount
+    try {
+      observedCount = userLifecycleLockWaitCount(Math.min(1000, remainingMs))
+    } catch (error) {
+      if (error.code === 'ETIMEDOUT') {
+        probeTimedOut = true
+        continue
+      }
+      throw error
+    }
+    if (observedCount > expectedCount) throw new Error(`Expected exactly ${expectedCount} API waiter for lifecycle mutex ${lockName}, observed ${observedCount}.`)
+    if (observedCount === expectedCount) return
+    await new Promise(resolve => setTimeout(resolve, Math.min(25, Math.max(1, deadline - performance.now()))))
+  }
+}
+
+function namedLockFileWaitCount(lockName) {
+  const sql = `SELECT COUNT(*) FROM information_schema.INNODB_LOCK_WAITS w JOIN information_schema.INNODB_TRX t ON t.trx_id = w.requesting_trx_id WHERE t.trx_mysql_thread_id = IS_USED_LOCK('${lockName}');`
+  return Number(queryTestDatabaseAsRoot(sql))
+}
+
+async function waitForNamedLockFileWait(lockName, timeoutMs = 20000) {
+  const started = Date.now()
+  while (namedLockFileWaitCount(lockName) === 0) {
+    if (Date.now() - started >= timeoutMs) throw new Error('Named-lock owner did not reach its expected InnoDB file-lock wait.')
     await new Promise(resolve => setTimeout(resolve, 25))
   }
 }
@@ -101,6 +189,16 @@ const busyCheckinCheckout = await request(`/files/${imported.id}/checkout`, {
 }, token)
 const busyCheckinRequestId = randomUUID()
 const testOrganizationId = queryTestDatabase("SELECT id FROM organizations WHERE slug = 'integration-org';")
+const selfDeleteAdmin = await request('/users', {
+  method: 'POST', body: JSON.stringify({ email: 'uppercase-self-delete@example.test', displayName: 'Uppercase Self Delete', password: 'Uppercase self delete password 123!', role: 'admin' }),
+}, token)
+const selfDeleteAdminLogin = await request('/auth/login', {
+  method: 'POST', body: JSON.stringify({ email: 'uppercase-self-delete@example.test', password: 'Uppercase self delete password 123!' }),
+})
+const uppercaseSelfDelete = await requestStatus(`/users/${selfDeleteAdmin.id.toUpperCase()}`, { method: 'DELETE' }, selfDeleteAdminLogin.token)
+assert.equal(uppercaseSelfDelete.status, 400)
+assert.equal(uppercaseSelfDelete.body.error, 'SELF_DELETE')
+assert.equal(queryTestDatabase(`SELECT COUNT(*) FROM organization_memberships WHERE organization_id = '${testOrganizationId}' AND user_id = '${selfDeleteAdmin.id}';`), '1')
 const checkinLockHolder = spawnRequestLockHolder('checkin', testOrganizationId, busyCheckinRequestId)
 await waitForOutput(checkinLockHolder, 'READY')
 const busyCheckinRevisionCount = (await request(`/files/${imported.id}/revisions`, {}, token)).revisions.length
@@ -116,7 +214,7 @@ const busyCheckin = await requestStatus(`/files/${imported.id}/checkin`, {
 assert.equal(busyCheckin.status, 503)
 assert.equal(busyCheckin.body.error, 'CHECKIN_RECOVERY_BUSY')
 assert.equal((await request(`/files/${imported.id}/revisions`, {}, token)).revisions.length, busyCheckinRevisionCount)
-checkinLockHolder.child.stdin.write('continue\n')
+releaseLockHolder(checkinLockHolder)
 await checkinLockHolder.done
 const retriedBusyCheckin = await request(`/files/${imported.id}/checkin`, {
   method: 'POST', body: JSON.stringify(busyCheckinBody),
@@ -143,13 +241,9 @@ const inaccessibleCheckoutReplay = await requestStatus(`/files/${duplicatePart.i
 }, updatedMemberLogin.token)
 assert.equal(inaccessibleCheckoutReplay.status, 404)
 assert.equal(Object.hasOwn(inaccessibleCheckoutReplay.body, 'checkoutToken'), false)
-const renewedCheckout = await request(`/files/${duplicatePart.id}/checkout/renew`, {
+const renewedCheckout = await request(`/files/${duplicatePart.id.toUpperCase()}/checkout/renew`, {
   method: 'POST', body: JSON.stringify({ checkoutToken: checkoutAcquisitionA.checkoutToken }),
 }, token)
-const renewedUppercaseFileId = await request(`/files/${duplicatePart.id.toUpperCase()}/checkout/renew`, {
-  method: 'POST', body: JSON.stringify({ checkoutToken: checkoutAcquisitionA.checkoutToken }),
-}, token)
-assert.equal(typeof renewedUppercaseFileId.expiresAt, 'string')
 const renewedCheckoutReplay = await request(`/files/${duplicatePart.id}/checkout`, {
   method: 'POST', body: JSON.stringify({ clientWorkingPath: workspace, requestId: checkoutRequestId }),
 }, token)
@@ -345,7 +439,7 @@ const busyCheckout = await requestStatus(`/files/${checkoutRaceFileA.id}/checkou
 }, token)
 assert.equal(busyCheckout.status, 503)
 assert.equal(busyCheckout.body.error, 'CHECKOUT_RECOVERY_BUSY')
-requestLockHolder.child.stdin.write('continue\n')
+releaseLockHolder(requestLockHolder)
 await requestLockHolder.done
 assert.equal(queryTestDatabase(`SELECT COUNT(*) FROM checkout_acquisition_requests WHERE organization_id = '${testOrganizationId}' AND request_id = '${busyCheckoutRequestId}';`), '0')
 const retryAfterBusyCheckout = await request(`/files/${checkoutRaceFileA.id}/checkout`, {
@@ -368,11 +462,11 @@ const concurrentAcquire = requestStatus(`/files/${checkoutRaceFileB.id}/checkout
 }, token).then(value => ({ value }), error => ({ error }))
 let lockWaitError = null
 try {
-  await waitForCheckoutRequestLockWait(concurrentAcquireLockName)
+  await waitForNamedLockFileWait(concurrentAcquireLockName)
 } catch (error) {
   lockWaitError = error
 } finally {
-  cancelLockHolder.child.stdin.write('continue\n')
+  releaseLockHolder(cancelLockHolder)
   await cancelLockHolder.done
 }
 const acquireResult = await concurrentAcquire
@@ -467,13 +561,204 @@ queryTestDatabase(`
   INSERT INTO checkouts (file_id, user_id, token_hash, client_working_path, expires_at) VALUES ('${secondOrgRemovalFileId}', '${removalUser.id}', '${secondOrgRemovalLeaseHash}', 'C:/foreign-workspace', DATE_ADD(UTC_TIMESTAMP(3), INTERVAL 1 HOUR));
   INSERT INTO checkout_acquisition_requests (organization_id, request_id, user_id, file_id, vault_id, client_working_path, request_fingerprint, token_hash, token_ciphertext, expires_at, status) VALUES ('${foreignOrgId}', '${secondOrgRemovalRequestId}', '${removalUser.id}', '${secondOrgRemovalFileId}', '${foreignLeaseVaultId}', 'C:/foreign-workspace', '${'b'.repeat(64)}', '${secondOrgRemovalLeaseHash}', 'same-user-foreign-org-ciphertext', DATE_ADD(UTC_TIMESTAMP(3), INTERVAL 1 HOUR), 'active');
 `)
-await request(`/users/${removalUser.id}`, { method: 'DELETE' }, token)
+const removalLockHolder = spawnCheckoutCancelLockHolder(removalFile.id, testOrganizationId)
+await waitForOutput(removalLockHolder, 'READY')
+const removalAdditionalFile = await request('/files/import', {
+  method: 'POST', body: JSON.stringify({ vaultId: vault.id, canonicalPath: 'lease-removal-additional.sldprt', fileName: 'lease-removal-additional.sldprt', storageRelativePath: 'lease-removal-additional.sldprt' }),
+}, token)
+const removalAdditionalRequestId = randomUUID()
+await request(`/files/${removalAdditionalFile.id}/checkout`, {
+  method: 'POST', body: JSON.stringify({ clientWorkingPath: workspace, requestId: removalAdditionalRequestId }),
+}, removalLogin.token)
+const removalMutexName = userLifecycleLockName(removalUser.id)
+const concurrentRemovalCheckout = requestStatus(`/files/${removalFile.id}/checkout`, {
+  method: 'POST', body: JSON.stringify({ clientWorkingPath: workspace, requestId: removalRequestId }),
+}, removalLogin.token).then(value => ({ value }), error => ({ error }))
+let concurrentMemberRemoval = null
+let concurrentRemovalLockError = null
+try {
+  await waitForNamedLockFileWait(removalMutexName)
+  assert.equal(userLifecycleLockWaitCount(1000), 0)
+  concurrentMemberRemoval = requestStatus(`/users/${removalUser.id.toUpperCase()}`, { method: 'DELETE' }, token)
+    .then(value => ({ value }), error => ({ error }))
+  await waitForUserLifecycleLockWaitCount(removalMutexName, 1)
+} catch (error) {
+  concurrentRemovalLockError = error
+} finally {
+  if (removalLockHolder.child.exitCode === null) releaseLockHolder(removalLockHolder)
+  try { await removalLockHolder.done } catch (error) { if (!concurrentRemovalLockError) concurrentRemovalLockError = error }
+}
+const [concurrentCheckoutResult, concurrentRemovalResult] = await Promise.all([concurrentRemovalCheckout, concurrentMemberRemoval])
+if (concurrentRemovalLockError) throw concurrentRemovalLockError
+assert.equal(concurrentRemovalResult.error, undefined)
+assert.equal(concurrentRemovalResult.value.status, 204)
+assert.equal(concurrentCheckoutResult.error, undefined)
+assert.equal(concurrentCheckoutResult.value.status, 409)
+assert.equal(concurrentCheckoutResult.value.body.error, 'CHECKOUT_REQUEST_TERMINAL')
 assert.deepEqual(checkoutRequestState(removalRequestId), { status: 'cancelled', tokenPurged: true })
 assert.equal(queryTestDatabase(`SELECT COUNT(*) FROM checkouts WHERE file_id = '${removalFile.id}';`), '0')
+assert.deepEqual(checkoutRequestState(removalAdditionalRequestId), { status: 'cancelled', tokenPurged: true })
+assert.equal(queryTestDatabase(`SELECT COUNT(*) FROM checkouts WHERE file_id = '${removalAdditionalFile.id}';`), '0')
 assert.equal(queryTestDatabase(`SELECT status, token_ciphertext IS NOT NULL FROM checkout_acquisition_requests WHERE organization_id = '${foreignOrgId}' AND request_id = '${secondOrgRemovalRequestId}';`), 'active\t1')
 assert.equal(queryTestDatabase(`SELECT COUNT(*) FROM checkouts WHERE file_id = '${secondOrgRemovalFileId}' AND user_id = '${removalUser.id}';`), '1')
 assert.equal(queryTestDatabase(`SELECT status, token_ciphertext IS NOT NULL FROM checkout_acquisition_requests WHERE organization_id = '${foreignOrgId}' AND request_id = '${foreignLeaseRequestId}';`), 'active\t1')
 assert.equal(queryTestDatabase(`SELECT COUNT(*) FROM checkouts WHERE file_id = '${foreignLeaseFileId}' AND user_id = '${foreignUser.id}';`), '1')
+
+// An acquisition that owns the per-user mutex first must be visible to the
+// later removal scan and be terminalized before removal commits.
+const acquireFirstUser = await request('/users', {
+  method: 'POST', body: JSON.stringify({ email: 'acquire-first@example.test', displayName: 'Acquire First', password: 'Acquire first password 123!' }),
+}, token)
+await request(`/users/${acquireFirstUser.id}/vault-access`, { method: 'PUT', body: JSON.stringify({ vaultIds: [vault.id] }) }, token)
+const acquireFirstLogin = await request('/auth/login', {
+  method: 'POST', body: JSON.stringify({ email: 'acquire-first@example.test', password: 'Acquire first password 123!' }),
+})
+const acquireFirstFile = await request('/files/import', {
+  method: 'POST', body: JSON.stringify({ vaultId: vault.id, canonicalPath: 'acquire-first.sldprt', fileName: 'acquire-first.sldprt', storageRelativePath: 'acquire-first.sldprt' }),
+}, token)
+const acquireFirstFileHolder = spawnCheckoutCancelLockHolder(acquireFirstFile.id, testOrganizationId, true)
+await waitForOutput(acquireFirstFileHolder, 'READY')
+const acquireFirstRequestId = randomUUID()
+const acquireFirstMutexName = userLifecycleLockName(acquireFirstUser.id)
+const acquireFirstRequest = requestStatus(`/files/${acquireFirstFile.id}/checkout`, {
+  method: 'POST', body: JSON.stringify({ clientWorkingPath: workspace, requestId: acquireFirstRequestId }),
+}, acquireFirstLogin.token).then(value => ({ value }), error => ({ error }))
+let acquireFirstInterleavingError = null
+try {
+  await waitForNamedLockFileWait(acquireFirstMutexName)
+  assert.equal(userLifecycleLockWaitCount(1000), 0)
+  const acquireFirstRemoval = requestStatus(`/users/${acquireFirstUser.id}`, { method: 'DELETE' }, token)
+    .then(value => ({ value }), error => ({ error }))
+  await waitForUserLifecycleLockWaitCount(acquireFirstMutexName, 1)
+  releaseLockHolder(acquireFirstFileHolder)
+  const acquireFirstHolderResult = await acquireFirstFileHolder.done
+  const [checkoutResult, removalResult] = await Promise.all([acquireFirstRequest, acquireFirstRemoval])
+  assert.equal(checkoutResult.error, undefined)
+  assert.equal(checkoutResult.value.status, 200)
+  assert.equal(removalResult.error, undefined)
+  assert.equal(removalResult.value.status, 204)
+  assert.ok(acquireFirstHolderResult.stdout.includes('COMMITTED'))
+} catch (error) {
+  acquireFirstInterleavingError = error
+} finally {
+  if (acquireFirstFileHolder.child.exitCode === null) {
+    releaseLockHolder(acquireFirstFileHolder)
+    await acquireFirstFileHolder.done
+  }
+}
+if (acquireFirstInterleavingError) throw acquireFirstInterleavingError
+assert.deepEqual(checkoutRequestState(acquireFirstRequestId), { status: 'cancelled', tokenPurged: true })
+assert.equal(queryTestDatabase(`SELECT COUNT(*) FROM checkouts WHERE file_id = '${acquireFirstFile.id}';`), '0')
+
+// A removal that owns the mutex first waits for its existing File-first
+// cancellation, then denies a stale authenticated acquisition on another file.
+const removeFirstUser = await request('/users', {
+  method: 'POST', body: JSON.stringify({ email: 'remove-first@example.test', displayName: 'Remove First', password: 'Remove first password 123!' }),
+}, token)
+await request(`/users/${removeFirstUser.id}/vault-access`, { method: 'PUT', body: JSON.stringify({ vaultIds: [vault.id] }) }, token)
+const removeFirstLogin = await request('/auth/login', {
+  method: 'POST', body: JSON.stringify({ email: 'remove-first@example.test', password: 'Remove first password 123!' }),
+})
+const removeFirstLeasedFile = await request('/files/import', {
+  method: 'POST', body: JSON.stringify({ vaultId: vault.id, canonicalPath: 'remove-first-existing.sldprt', fileName: 'remove-first-existing.sldprt', storageRelativePath: 'remove-first-existing.sldprt' }),
+}, token)
+const removeFirstTargetFile = await request('/files/import', {
+  method: 'POST', body: JSON.stringify({ vaultId: vault.id, canonicalPath: 'remove-first-target.sldprt', fileName: 'remove-first-target.sldprt', storageRelativePath: 'remove-first-target.sldprt' }),
+}, token)
+const removeFirstExistingLease = await request(`/files/${removeFirstLeasedFile.id}/checkout`, {
+  method: 'POST', body: JSON.stringify({ clientWorkingPath: workspace }),
+}, removeFirstLogin.token)
+const removeFirstFileHolder = spawnCheckoutCancelLockHolder(removeFirstLeasedFile.id, testOrganizationId)
+await waitForOutput(removeFirstFileHolder, 'READY')
+const removeFirstMutexName = userLifecycleLockName(removeFirstUser.id)
+const removeFirstRemoval = requestStatus(`/users/${removeFirstUser.id}`, { method: 'DELETE' }, token)
+  .then(value => ({ value }), error => ({ error }))
+let removeFirstInterleavingError = null
+try {
+  await waitForAdvisoryLockOwner(removeFirstMutexName)
+  await waitForNamedLockFileWait(removeFirstMutexName)
+  assert.equal(userLifecycleLockWaitCount(1000), 0)
+  const deniedStaleCheckout = requestStatus(`/files/${removeFirstTargetFile.id}/checkout`, {
+    method: 'POST', body: JSON.stringify({ clientWorkingPath: workspace }),
+  }, removeFirstLogin.token).then(value => ({ value }), error => ({ error }))
+  await waitForUserLifecycleLockWaitCount(removeFirstMutexName, 1)
+  releaseLockHolder(removeFirstFileHolder)
+  const removeFirstHolderResult = await removeFirstFileHolder.done
+  const [removalResult, checkoutResult] = await Promise.all([removeFirstRemoval, deniedStaleCheckout])
+  assert.equal(removalResult.error, undefined)
+  assert.equal(removalResult.value.status, 204)
+  assert.equal(checkoutResult.error, undefined)
+  assert.equal(checkoutResult.value.status, 401)
+  assert.equal(checkoutResult.value.body.error, 'UNAUTHENTICATED')
+  assert.ok(removeFirstHolderResult.stdout.includes('COMMITTED'))
+} catch (error) {
+  removeFirstInterleavingError = error
+} finally {
+  if (removeFirstFileHolder.child.exitCode === null) {
+    releaseLockHolder(removeFirstFileHolder)
+    await removeFirstFileHolder.done
+  }
+}
+if (removeFirstInterleavingError) throw removeFirstInterleavingError
+assert.equal(queryTestDatabase(`SELECT COUNT(*) FROM checkouts WHERE file_id IN ('${removeFirstLeasedFile.id}', '${removeFirstTargetFile.id}');`), '0')
+assert.equal(typeof removeFirstExistingLease.checkoutToken, 'string')
+
+// Lifecycle contention fails closed for both checkout contracts and removal;
+// the same durable request ID is retryable after the held mutex is released.
+const busyLifecycleUser = await request('/users', {
+  method: 'POST', body: JSON.stringify({ email: 'busy-lifecycle@example.test', displayName: 'Busy Lifecycle', password: 'Busy lifecycle password 123!' }),
+}, token)
+await request(`/users/${busyLifecycleUser.id}/vault-access`, { method: 'PUT', body: JSON.stringify({ vaultIds: [vault.id] }) }, token)
+const busyLifecycleLogin = await request('/auth/login', {
+  method: 'POST', body: JSON.stringify({ email: 'busy-lifecycle@example.test', password: 'Busy lifecycle password 123!' }),
+})
+const busyLifecycleDurableFile = await request('/files/import', {
+  method: 'POST', body: JSON.stringify({ vaultId: vault.id, canonicalPath: 'busy-lifecycle-durable.sldprt', fileName: 'busy-lifecycle-durable.sldprt', storageRelativePath: 'busy-lifecycle-durable.sldprt' }),
+}, token)
+const busyLifecycleLegacyFile = await request('/files/import', {
+  method: 'POST', body: JSON.stringify({ vaultId: vault.id, canonicalPath: 'busy-lifecycle-legacy.sldprt', fileName: 'busy-lifecycle-legacy.sldprt', storageRelativePath: 'busy-lifecycle-legacy.sldprt' }),
+}, token)
+const busyLifecycleRequestId = randomUUID()
+const busyLifecycleLockName = userLifecycleLockName(busyLifecycleUser.id)
+const busyLifecycleHolder = spawnUserLifecycleLockHolder(busyLifecycleUser.id)
+await waitForOutput(busyLifecycleHolder, 'READY')
+let busyLifecycleResults
+let busyLifecycleHolderResult
+try {
+  await waitForAdvisoryLockOwner(busyLifecycleLockName)
+  const requests = [
+    requestStatus(`/files/${busyLifecycleDurableFile.id}/checkout`, {
+      method: 'POST', body: JSON.stringify({ clientWorkingPath: workspace, requestId: busyLifecycleRequestId }),
+    }, busyLifecycleLogin.token),
+    requestStatus(`/files/${busyLifecycleLegacyFile.id}/checkout`, {
+      method: 'POST', body: JSON.stringify({ clientWorkingPath: workspace }),
+    }, busyLifecycleLogin.token),
+    requestStatus(`/users/${busyLifecycleUser.id}`, { method: 'DELETE' }, token),
+  ]
+  busyLifecycleResults = await Promise.all(requests)
+} finally {
+  releaseLockHolder(busyLifecycleHolder)
+  busyLifecycleHolderResult = await busyLifecycleHolder.done
+}
+assert.ok(busyLifecycleHolderResult.stdout.includes('RELEASED'))
+for (const result of busyLifecycleResults) {
+  assert.equal(result.status, 503)
+  assert.equal(result.body.error, 'CHECKOUT_BUSY')
+}
+assert.equal(queryTestDatabase(`SELECT COUNT(*) FROM checkouts WHERE file_id IN ('${busyLifecycleDurableFile.id}', '${busyLifecycleLegacyFile.id}');`), '0')
+assert.equal(queryTestDatabase(`SELECT COUNT(*) FROM checkout_acquisition_requests WHERE organization_id = '${testOrganizationId}' AND request_id = '${busyLifecycleRequestId}';`), '0')
+const retriedBusyDurableCheckout = await request(`/files/${busyLifecycleDurableFile.id}/checkout`, {
+  method: 'POST', body: JSON.stringify({ clientWorkingPath: workspace, requestId: busyLifecycleRequestId }),
+}, busyLifecycleLogin.token)
+const retriedBusyLegacyCheckout = await request(`/files/${busyLifecycleLegacyFile.id}/checkout`, {
+  method: 'POST', body: JSON.stringify({ clientWorkingPath: workspace }),
+}, busyLifecycleLogin.token)
+assert.equal(retriedBusyDurableCheckout.replayed, false)
+assert.equal(typeof retriedBusyLegacyCheckout.checkoutToken, 'string')
+const retriedBusyUserRemoval = await requestStatus(`/users/${busyLifecycleUser.id}`, { method: 'DELETE' }, token)
+assert.equal(retriedBusyUserRemoval.status, 204)
+assert.deepEqual(checkoutRequestState(busyLifecycleRequestId), { status: 'cancelled', tokenPurged: true })
+assert.equal(queryTestDatabase(`SELECT COUNT(*) FROM checkouts WHERE file_id IN ('${busyLifecycleDurableFile.id}', '${busyLifecycleLegacyFile.id}');`), '0')
 
 const selfRemovalUser = await request('/users', {
   method: 'POST', body: JSON.stringify({ email: 'self-removal@example.test', displayName: 'Self Removal', password: 'Self removal password 123!' }),

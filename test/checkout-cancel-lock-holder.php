@@ -7,12 +7,13 @@ require_once dirname(__DIR__) . '/src/FileCheckout.php';
 use BluePlm\FileCheckout;
 use BluePlm\Runtime;
 
-if ($argc !== 3) {
-    fwrite(STDERR, "Expected fileId and organizationId.\n");
+if ($argc < 3 || $argc > 4) {
+    fwrite(STDERR, "Expected fileId, organizationId, and optional file-only mode.\n");
     exit(2);
 }
 
 [, $fileId, $organizationId] = $argv;
+$fileOnly = ($argv[3] ?? '') === 'file-only';
 $db = Runtime::database(getenv());
 $db->beginTransaction();
 try {
@@ -22,6 +23,12 @@ try {
     fwrite(STDOUT, "READY\n");
     fflush(STDOUT);
     if (trim((string)fgets(STDIN)) !== 'continue') throw new RuntimeException('Concurrency test was not released.');
+
+    if ($fileOnly) {
+        $db->commit();
+        fwrite(STDOUT, "COMMITTED\n");
+        exit(0);
+    }
 
     $leaseQuery = $db->prepare('SELECT token_hash FROM checkouts WHERE file_id = ? FOR UPDATE');
     $leaseQuery->execute([$fileId]);

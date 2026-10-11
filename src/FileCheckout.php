@@ -20,6 +20,41 @@ final class CheckoutLeaseFailure extends \RuntimeException
 
 final class FileCheckout
 {
+    public static function acquireUserLifecycleLock(PDO $db, string $userId): ?string
+    {
+        $database = $db->query('SELECT DATABASE()')->fetchColumn();
+        if (!is_string($database) || $database === '') throw new \RuntimeException('Database name is unavailable for checkout lifecycle locking.');
+        $lockName = 'blueplm:' . substr(hash('sha256', implode("\0", [$database, 'checkout-user-lifecycle', strtolower($userId)])), 0, 56);
+        $query = $db->prepare('SELECT GET_LOCK(?, 5)');
+        $query->execute([$lockName]);
+        return (int)$query->fetchColumn() === 1 ? $lockName : null;
+    }
+
+    public static function releaseUserLifecycleLock(PDO $db, string $lockName): bool
+    {
+        $query = $db->prepare('SELECT RELEASE_LOCK(?)');
+        $query->execute([$lockName]);
+        return (int)$query->fetchColumn() === 1;
+    }
+
+    public static function finishUserLifecycleLock(PDO $db, string $lockName, bool $committed, ?Throwable $operationFailure): void
+    {
+        try {
+            $released = self::releaseUserLifecycleLock($db, $lockName);
+        } catch (Throwable) {
+            $released = false;
+        }
+        if (!$released && !$committed && $operationFailure === null) throw new \RuntimeException('User checkout lifecycle lock was not released.');
+    }
+
+    /** @param array<string, mixed> $principal */
+    public static function assertCheckoutPrincipalActive(PDO $db, array $principal): void
+    {
+        $query = $db->prepare('SELECT 1 FROM users u JOIN organization_memberships m ON m.user_id = u.id WHERE u.id = ? AND m.organization_id = ? AND u.disabled_at IS NULL LIMIT 1');
+        $query->execute([$principal['userId'], $principal['organizationId']]);
+        if (!$query->fetchColumn()) throw new CheckoutLeaseFailure(401, 'UNAUTHENTICATED', 'Session is invalid or expired.');
+    }
+
     public static function acquireRequestIdLock(PDO $db, string $operation, string $organizationId, string $requestId): ?string
     {
         if (!in_array($operation, ['checkout', 'checkin'], true)) throw new \InvalidArgumentException('Invalid request-lock operation.');
@@ -43,14 +78,22 @@ final class FileCheckout
     {
         $requestId = strtolower($requestId);
         if (!self::supportsRequestIds($db)) throw new CheckoutLeaseFailure(503, 'CHECKOUT_RECOVERY_UNAVAILABLE', 'This server has not enabled durable checkout recovery.');
-        $operationFailure = null;
         try {
-            $requestLock = self::acquireRequestIdLock($db, 'checkout', $principal['organizationId'], $requestId);
+            $lifecycleLock = self::acquireUserLifecycleLock($db, $principal['userId']);
         } catch (Throwable) {
-            throw new CheckoutLeaseFailure(503, 'CHECKOUT_RECOVERY_UNAVAILABLE', 'Durable checkout recovery is temporarily unavailable.');
+            throw new CheckoutLeaseFailure(503, 'CHECKOUT_BUSY', 'Checkout is temporarily busy; retry the same requestId.');
         }
-        if ($requestLock === null) throw new CheckoutLeaseFailure(503, 'CHECKOUT_RECOVERY_BUSY', 'Durable checkout recovery is busy; retry the same requestId.');
+        if ($lifecycleLock === null) throw new CheckoutLeaseFailure(503, 'CHECKOUT_BUSY', 'Checkout is temporarily busy; retry the same requestId.');
+        $operationFailure = null;
+        $requestLock = null;
         try {
+            self::assertCheckoutPrincipalActive($db, $principal);
+            try {
+                $requestLock = self::acquireRequestIdLock($db, 'checkout', $principal['organizationId'], $requestId);
+            } catch (Throwable) {
+                throw new CheckoutLeaseFailure(503, 'CHECKOUT_RECOVERY_UNAVAILABLE', 'Durable checkout recovery is temporarily unavailable.');
+            }
+            if ($requestLock === null) throw new CheckoutLeaseFailure(503, 'CHECKOUT_RECOVERY_BUSY', 'Durable checkout recovery is busy; retry the same requestId.');
             $fingerprint = hash('sha256', json_encode([
                 'fileId' => $fileId,
                 'vaultId' => $vaultId,
@@ -141,11 +184,18 @@ final class FileCheckout
             $operationFailure = $error;
             throw $error;
         } finally {
+            $releaseFailed = false;
             try {
-                if (!self::releaseRequestIdLock($db, $requestLock)) throw new \RuntimeException('Checkout request lock was not released.');
+                if ($requestLock !== null && !self::releaseRequestIdLock($db, $requestLock)) $releaseFailed = true;
             } catch (Throwable) {
-                if ($operationFailure === null) throw new CheckoutLeaseFailure(503, 'CHECKOUT_RECOVERY_UNAVAILABLE', 'The checkout result should be retried with the same requestId.');
+                $releaseFailed = true;
             }
+            try {
+                if (!self::releaseUserLifecycleLock($db, $lifecycleLock)) $releaseFailed = true;
+            } catch (Throwable) {
+                $releaseFailed = true;
+            }
+            if ($releaseFailed && $operationFailure === null) throw new CheckoutLeaseFailure(503, 'CHECKOUT_RECOVERY_UNAVAILABLE', 'The checkout result should be retried with the same requestId.');
         }
     }
 
@@ -170,18 +220,41 @@ final class FileCheckout
         }
     }
 
-    public static function markUserCheckoutsTerminal(PDO $db, string $userId, ?string $organizationId = null): void
+    /** @return list<string> File IDs still owned by the user and terminalized. */
+    public static function markUserCheckoutsTerminal(PDO $db, string $userId, ?string $organizationId = null): array
     {
         if ($organizationId === null) {
-            $query = $db->prepare('SELECT file_id, token_hash FROM checkouts WHERE user_id = ? FOR UPDATE');
+            $query = $db->prepare('SELECT file_id FROM checkouts WHERE user_id = ? ORDER BY file_id');
             $query->execute([$userId]);
         } else {
-            $query = $db->prepare('SELECT c.file_id, c.token_hash FROM checkouts c JOIN files f ON f.id = c.file_id WHERE c.user_id = ? AND f.organization_id = ? FOR UPDATE');
+            $query = $db->prepare('SELECT c.file_id FROM checkouts c JOIN files f ON f.id = c.file_id WHERE c.user_id = ? AND f.organization_id = ? ORDER BY c.file_id');
             $query->execute([$userId, $organizationId]);
         }
-        foreach ($query->fetchAll() as $checkout) {
-            self::markTerminalByHash($db, $checkout['file_id'], $checkout['token_hash'], 'cancelled');
+        $terminalizedFileIds = [];
+        $fileQuery = $organizationId === null
+            ? $db->prepare('SELECT id FROM files WHERE id = ? FOR UPDATE')
+            : $db->prepare('SELECT id FROM files WHERE id = ? AND organization_id = ? FOR UPDATE');
+        $checkoutQuery = $db->prepare('SELECT user_id, token_hash FROM checkouts WHERE file_id = ? FOR UPDATE');
+        foreach ($query->fetchAll() as $candidate) {
+            $fileId = $candidate['file_id'];
+            // Existing checkout writers lock files before checkouts. New
+            // writers must preserve that order; revalidate current ownership
+            // after taking the file lock because the initial scan is unlocked.
+            if ($organizationId === null) {
+                $fileQuery->execute([$fileId]);
+            } else {
+                $fileQuery->execute([$fileId, $organizationId]);
+            }
+            if (!$fileQuery->fetchColumn()) continue;
+
+            $checkoutQuery->execute([$fileId]);
+            $checkout = $checkoutQuery->fetch();
+            if (!$checkout || strcasecmp($checkout['user_id'], $userId) !== 0) continue;
+
+            self::markTerminalByHash($db, $fileId, $checkout['token_hash'], 'cancelled');
+            $terminalizedFileIds[] = $fileId;
         }
+        return $terminalizedFileIds;
     }
 
     public static function supportsRequestIds(PDO $db): bool
