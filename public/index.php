@@ -2426,9 +2426,9 @@ try {
         }
         $vaultId = $body['vaultId'];
         Runtime::requireVault($db, $principal, $vaultId);
-        $canonicalPath = ltrim(str_replace('\\', '/', trim($body['canonicalPath'])), '/');
-        $storageRelativePath = ltrim(str_replace('\\', '/', trim($body['storageRelativePath'])), '/');
-        if ($canonicalPath === '' || $storageRelativePath === '' || str_contains($canonicalPath, '../') || str_contains($storageRelativePath, '../')) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'File paths must be normalized vault-relative paths.']);
+        $canonicalPath = \BluePlm\VaultRelativePath::normalize($body['canonicalPath']);
+        $storageRelativePath = \BluePlm\VaultRelativePath::normalize($body['storageRelativePath']);
+        if ($canonicalPath === null || $storageRelativePath === null) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'File paths must be normalized vault-relative paths.']);
         $fileName = is_string($body['fileName'] ?? null) && trim($body['fileName']) !== '' ? trim($body['fileName']) : basename($canonicalPath);
         $partNumber = is_string($body['partNumber'] ?? null) && trim($body['partNumber']) !== '' ? trim($body['partNumber']) : null;
         if ($partNumber !== null && strlen($partNumber) > 512) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'partNumber is too long.']);

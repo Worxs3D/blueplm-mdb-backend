@@ -8,6 +8,7 @@ use PDOException;
 use Throwable;
 
 require_once __DIR__ . '/FileCheckout.php';
+require_once __DIR__ . '/VaultRelativePath.php';
 
 final class FileCheckinFailure extends \RuntimeException
 {
@@ -37,7 +38,7 @@ final class FileCheckin
         if ($explicitMode) {
             if (!is_string($body['canonicalPath'] ?? null) || !is_string($body['fileName'] ?? null)) throw new FileCheckinFailure(400, 'INVALID_REQUEST', 'canonicalPath and fileName are required for explicit check-in.');
             $canonicalPath = $body['canonicalPath']; $fileName = $body['fileName'];
-            if (!self::isSafeCanonicalPath($canonicalPath) || strlen($canonicalPath) > 2048 || strlen($fileName) > 512 || $fileName === '' || str_contains($fileName, '/') || !hash_equals(basename($canonicalPath), $fileName)) throw new FileCheckinFailure(400, 'INVALID_REQUEST', 'canonicalPath must be a safe normalized vault-relative path and fileName must match its basename.');
+            if (!VaultRelativePath::isNormalized($canonicalPath) || str_contains($canonicalPath, '\\') || strlen($canonicalPath) > 2048 || strlen($fileName) > 512 || $fileName === '' || str_contains($fileName, '/') || !hash_equals(basename($canonicalPath), $fileName)) throw new FileCheckinFailure(400, 'INVALID_REQUEST', 'canonicalPath must be a safe normalized vault-relative path and fileName must match its basename.');
         }
         $requestId = $body['requestId'] ?? null;
         if ($explicitMode && (!is_string($requestId) || !self::isUuid($requestId))) throw new FileCheckinFailure(400, 'INVALID_REQUEST', 'requestId must be a UUID when mode is specified.');
@@ -48,8 +49,8 @@ final class FileCheckin
         $relativePath = null; $hash = null; $size = null;
         if ($mode === 'content') {
             if (!is_string($body['storageRelativePath'] ?? null) || trim($body['storageRelativePath']) === '') throw new FileCheckinFailure(400, 'INVALID_REQUEST', 'storageRelativePath is required for content check-in.');
-            $relativePath = ltrim(str_replace('\\', '/', trim($body['storageRelativePath'])), '/');
-            if (strlen($relativePath) > self::MAX_STORAGE_RELATIVE_PATH_BYTES || !self::isNormalizedStorageRelativePath($relativePath)) throw new FileCheckinFailure(400, 'INVALID_REQUEST', 'storageRelativePath must be a normalized vault-relative path within the supported length.');
+            $relativePath = VaultRelativePath::normalize($body['storageRelativePath']);
+            if ($relativePath === null || strlen($relativePath) > self::MAX_STORAGE_RELATIVE_PATH_BYTES) throw new FileCheckinFailure(400, 'INVALID_REQUEST', 'storageRelativePath must be a normalized vault-relative path within the supported length.');
             if ($explicitMode && (!is_string($body['contentHash'] ?? null) || !preg_match('/^[a-f0-9]{64}$/i', $body['contentHash']))) throw new FileCheckinFailure(400, 'INVALID_REQUEST', 'contentHash must be a SHA-256 hex string for explicit content check-in.');
             if ($explicitMode && (!is_int($body['sizeBytes'] ?? null) || $body['sizeBytes'] < 0)) throw new FileCheckinFailure(400, 'INVALID_REQUEST', 'sizeBytes must be a non-negative integer for explicit content check-in.');
             if (array_key_exists('contentHash', $body) && $body['contentHash'] !== null && (!is_string($body['contentHash']) || !preg_match('/^[a-f0-9]{64}$/i', $body['contentHash']))) throw new FileCheckinFailure(400, 'INVALID_REQUEST', 'contentHash must be a SHA-256 hex string or null.');
@@ -277,13 +278,6 @@ final class FileCheckin
         return (bool)preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i', $value);
     }
 
-    private static function isNormalizedStorageRelativePath(string $value): bool
-    {
-        if ($value === '') return false;
-        foreach (explode('/', $value) as $segment) if ($segment === '' || $segment === '.' || $segment === '..') return false;
-        return true;
-    }
-
     private static function supportsRequestIds(PDO $db): bool
     {
         try {
@@ -300,13 +294,6 @@ final class FileCheckin
         return $error->getCode() === '42S02'
             && (int)($error->errorInfo[1] ?? 0) === 1146
             && str_contains($error->getMessage(), 'file_checkin_requests');
-    }
-
-    private static function isSafeCanonicalPath(string $value): bool
-    {
-        if ($value === '' || trim($value) !== $value || str_contains($value, '\\') || str_starts_with($value, '/') || preg_match('/[\x00-\x1f\x7f<>:"|?*]/', $value)) return false;
-        foreach (explode('/', $value) as $segment) if ($segment === '' || $segment === '.' || $segment === '..' || rtrim($segment, ' .') !== $segment) return false;
-        return true;
     }
 
     private static function isObject(mixed $value): bool

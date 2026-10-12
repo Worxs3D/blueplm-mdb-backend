@@ -12,6 +12,8 @@ function queryTestDatabase(sql) {
 /** @param {Record<string, Function>} context */
 export async function runCheckinReviewRegressionTests(context) {
   const { request, requestStatus, imported, vault, workspace, token } = context
+  await runImportPathBoundaryTests(context)
+  await runCheckinPathBoundaryTests(context)
   const fileId = imported.id
   const failures = []
   async function scenario(name, run) {
@@ -172,4 +174,178 @@ export async function runCheckinReviewRegressionTests(context) {
   })
 
   assert.deepEqual(failures, [])
+}
+
+export async function runImportPathBoundaryTests(context) {
+  const { requestStatus, vault, token } = context
+  const suffix = randomUUID()
+  const invalidPaths = [
+    `/absolute-${suffix}.sldprt`,
+    `\\absolute-${suffix}.sldprt`,
+    `//server/share/${suffix}.sldprt`,
+    `\\\\server\\share\\${suffix}.sldprt`,
+    `C:\\absolute-${suffix}.sldprt`,
+    `C:/absolute-${suffix}.sldprt`,
+    `C:relative-${suffix}.sldprt`,
+    `\\\\?\\C:\\absolute-${suffix}.sldprt`,
+    `\\\\.\\device-${suffix}.sldprt`,
+    `\\/mixed-root-${suffix}.sldprt`,
+    `folder/bad:${suffix}.sldprt`,
+    `folder/bad?${suffix}.sldprt`,
+    `folder/control\u0001${suffix}.sldprt`,
+    `folder/trailing-${suffix}.sldprt.`,
+    `folder/trailing-space-${suffix}.sldprt `,
+    'folder/CON.sldprt',
+    'folder/COM¹.sldprt',
+    'folder/LPT³.txt',
+  ]
+  const countBefore = Number(queryTestDatabase(`SELECT COUNT(*) FROM files WHERE vault_id = '${vault.id}';`))
+  const revisionsBefore = Number(queryTestDatabase(`SELECT COUNT(*) FROM file_revisions r JOIN files f ON f.id = r.file_id WHERE f.vault_id = '${vault.id}';`))
+
+  for (const [field, invalidPath] of invalidPaths.flatMap(path => [
+    ['canonicalPath', path],
+    ['storageRelativePath', path],
+  ])) {
+    const body = {
+      vaultId: vault.id,
+      canonicalPath: `path-boundary-${suffix}/candidate-${randomUUID()}.sldprt`,
+      fileName: 'path-boundary-candidate.sldprt',
+      storageRelativePath: `path-boundary-${suffix}/content-${randomUUID()}.sldprt`,
+    }
+    body[field] = invalidPath
+    const response = await requestStatus('/files/import', {
+      method: 'POST', body: JSON.stringify(body),
+    }, token)
+    assert.equal(response.status, 400, `${field} accepted unsafe path ${JSON.stringify(invalidPath)}: ${JSON.stringify(response.body)}`)
+    assert.equal(response.body.error, 'INVALID_REQUEST')
+  }
+
+  assert.equal(Number(queryTestDatabase(`SELECT COUNT(*) FROM files WHERE vault_id = '${vault.id}';`)), countBefore)
+  assert.equal(Number(queryTestDatabase(`SELECT COUNT(*) FROM file_revisions r JOIN files f ON f.id = r.file_id WHERE f.vault_id = '${vault.id}';`)), revisionsBefore)
+
+  const safePath = `path-boundary-${suffix}\\relative-file.sldprt`
+  const safeStoragePath = `legacy\\relative-object-${suffix}.sldprt`
+  const accepted = await requestStatus('/files/import', {
+    method: 'POST',
+    body: JSON.stringify({
+      vaultId: vault.id,
+      canonicalPath: safePath,
+      fileName: 'relative-file.sldprt',
+      storageRelativePath: safeStoragePath,
+    }),
+  }, token)
+  assert.equal(accepted.status, 201, JSON.stringify(accepted.body))
+  assert.equal(queryTestDatabase(`SELECT CONCAT(canonical_path, '|', storage_relative_path) FROM files WHERE id = '${accepted.body.id}';`), `path-boundary-${suffix}/relative-file.sldprt|legacy/relative-object-${suffix}.sldprt`)
+  const unicodePath = `unicode-${suffix}\\über-file.sldprt`
+  const unicodeAccepted = await requestStatus('/files/import', {
+    method: 'POST',
+    body: JSON.stringify({
+      vaultId: vault.id,
+      canonicalPath: unicodePath,
+      fileName: 'über-file.sldprt',
+      storageRelativePath: `legacy\\objekt-ß-${suffix}.sldprt`,
+    }),
+  }, token)
+  assert.equal(unicodeAccepted.status, 201, JSON.stringify(unicodeAccepted.body))
+  assert.equal(queryTestDatabase(`SELECT CONCAT(canonical_path, '|', storage_relative_path) FROM files WHERE id = '${unicodeAccepted.body.id}';`), `unicode-${suffix}/über-file.sldprt|legacy/objekt-ß-${suffix}.sldprt`)
+  const nonReservedDeviceLikePath = `path-boundary-${suffix}/COM10.sldprt`
+  const nonReservedDeviceLike = await requestStatus('/files/import', {
+    method: 'POST',
+    body: JSON.stringify({
+      vaultId: vault.id,
+      canonicalPath: nonReservedDeviceLikePath,
+      fileName: 'COM10.sldprt',
+      storageRelativePath: nonReservedDeviceLikePath,
+    }),
+  }, token)
+  assert.equal(nonReservedDeviceLike.status, 201, JSON.stringify(nonReservedDeviceLike.body))
+}
+
+export async function runCheckinPathBoundaryTests(context) {
+  const { request, requestStatus, vault, token } = context
+  const suffix = randomUUID()
+  const canonicalPath = `path-boundary-${suffix}/part.sldprt`
+  const file = await request('/files/import', {
+    method: 'POST',
+    body: JSON.stringify({
+      vaultId: vault.id,
+      canonicalPath,
+      fileName: 'part.sldprt',
+      storageRelativePath: `initial/${suffix}.sldprt`,
+      contentHash: 'a'.repeat(64),
+      sizeBytes: 1,
+    }),
+  }, token)
+  const lease = await request(`/files/${file.id}/checkout`, {
+    method: 'POST',
+    body: JSON.stringify({ clientWorkingPath: `path-boundary/${suffix}` }),
+  }, token)
+  const invalidPaths = [
+    `/absolute-${suffix}.sldprt`,
+    `\\absolute-${suffix}.sldprt`,
+    `//server/share/${suffix}.sldprt`,
+    `\\\\server\\share\\${suffix}.sldprt`,
+    `C:\\absolute-${suffix}.sldprt`,
+    `C:/absolute-${suffix}.sldprt`,
+    `C:relative-${suffix}.sldprt`,
+    `\\\\?\\C:\\absolute-${suffix}.sldprt`,
+    `\\\\.\\device-${suffix}.sldprt`,
+    `\\/mixed-root-${suffix}.sldprt`,
+    `folder/bad:${suffix}.sldprt`,
+    `folder/bad?${suffix}.sldprt`,
+    `folder/control\u0001${suffix}.sldprt`,
+    `folder/trailing-${suffix}.sldprt.`,
+    `folder/trailing-space-${suffix}.sldprt `,
+    'folder/CON.sldprt',
+    'folder/COM¹.sldprt',
+    'folder/LPT³.txt',
+  ]
+  const requestIds = []
+  const snapshot = () => queryTestDatabase([
+    `SELECT CONCAT('file|', current_revision, '|', storage_relative_path, '|', COALESCE(content_hash, ''), '|', size_bytes) FROM files WHERE id = '${file.id}';`,
+    `SELECT CONCAT('revisions|', COUNT(*)) FROM file_revisions WHERE file_id = '${file.id}';`,
+    `SELECT CONCAT('lease|', COUNT(*), '|', COALESCE(MAX(token_hash), '')) FROM checkouts WHERE file_id = '${file.id}';`,
+    `SELECT CONCAT('receipts|', COUNT(*)) FROM file_checkin_requests WHERE file_id = '${file.id}';`,
+    `SELECT CONCAT('events|', COUNT(*)) FROM events WHERE aggregate_id = '${file.id}';`,
+  ].join(' '))
+  const before = snapshot()
+
+  for (const storageRelativePath of invalidPaths) {
+    const requestId = randomUUID()
+    requestIds.push(requestId)
+    const response = await requestStatus(`/files/${file.id}/checkin`, {
+      method: 'POST',
+      body: JSON.stringify({
+        mode: 'content',
+        requestId,
+        canonicalPath,
+        fileName: 'part.sldprt',
+        checkoutToken: lease.checkoutToken,
+        storageRelativePath,
+        contentHash: 'b'.repeat(64),
+        sizeBytes: 2,
+      }),
+    }, token)
+    assert.equal(response.status, 400, `Check-in accepted unsafe storage path ${JSON.stringify(storageRelativePath)}: ${JSON.stringify(response.body)}`)
+    assert.equal(response.body.error, 'INVALID_REQUEST')
+    assert.equal(snapshot(), before, 'Rejected check-in changed file, revisions, lease, receipts, or events.')
+  }
+
+  const valid = await request(`/files/${file.id}/checkin`, {
+    method: 'POST',
+    body: JSON.stringify({
+      mode: 'content',
+      requestId: randomUUID(),
+      canonicalPath: `path-boundary-${suffix}/part-renamed.sldprt`,
+      fileName: 'part-renamed.sldprt',
+      checkoutToken: lease.checkoutToken,
+      storageRelativePath: `legacy\\COM10-relative-revision-${suffix}-ö.sldprt`,
+      contentHash: 'c'.repeat(64),
+      sizeBytes: 3,
+    }),
+  }, token)
+  assert.equal(valid.revision, 2)
+  assert.equal(valid.file.storage_relative_path, `legacy/COM10-relative-revision-${suffix}-ö.sldprt`)
+  assert.equal(queryTestDatabase(`SELECT COUNT(*) FROM checkouts WHERE file_id = '${file.id}';`), '0')
+  assert.equal(queryTestDatabase(`SELECT COUNT(*) FROM file_checkin_requests WHERE file_id = '${file.id}' AND request_id IN (${requestIds.map(id => `'${id}'`).join(',')});`), '0')
 }
