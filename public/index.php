@@ -2415,7 +2415,7 @@ try {
         );
         $query->execute([$matches[1], $principal['organizationId']]);
         $files = $query->fetchAll();
-        foreach ($files as &$listedFile) $listedFile['customProperties'] = $listedFile['customProperties'] === null ? null : json_decode($listedFile['customProperties'], true, 512, JSON_THROW_ON_ERROR);
+        foreach ($files as &$listedFile) $listedFile['customProperties'] = $listedFile['customProperties'] === null ? null : json_decode($listedFile['customProperties'], false, 512, JSON_THROW_ON_ERROR);
         unset($listedFile);
         Runtime::respond(200, ['files' => $files]);
     }
@@ -2488,7 +2488,7 @@ try {
         $query = $db->prepare('SELECT id, revision_number AS revisionNumber, content_hash AS contentHash, storage_relative_path AS storageRelativePath, size_bytes AS sizeBytes, comment, part_number AS partNumber, description, revision_label AS revision, custom_properties AS customProperties, created_at AS createdAt, checked_in_by AS checkedInBy FROM file_revisions WHERE file_id = ? ORDER BY revision_number DESC');
         $query->execute([$fileId]);
         $revisions = $query->fetchAll();
-        foreach ($revisions as &$revisionRow) $revisionRow['customProperties'] = $revisionRow['customProperties'] === null ? null : json_decode($revisionRow['customProperties'], true, 512, JSON_THROW_ON_ERROR);
+        foreach ($revisions as &$revisionRow) $revisionRow['customProperties'] = $revisionRow['customProperties'] === null ? null : json_decode($revisionRow['customProperties'], false, 512, JSON_THROW_ON_ERROR);
         unset($revisionRow);
         Runtime::respond(200, ['revisions' => $revisions]);
     }

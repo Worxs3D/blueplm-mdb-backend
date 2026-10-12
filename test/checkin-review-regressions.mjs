@@ -105,6 +105,36 @@ export async function runCheckinReviewRegressionTests(context) {
     assert.deepEqual(metadataFailures, [])
   })
 
+  const objectPath = `review-object-shape-${randomUUID()}.sldprt`
+  const emptyPath = `review-empty-object-${randomUUID()}.sldprt`
+  const objectFile = await request('/files/import', {
+    method: 'POST',
+    body: JSON.stringify({ vaultId: vault.id, canonicalPath: objectPath, fileName: objectPath, storageRelativePath: objectPath }),
+  }, token)
+  const emptyFile = await request('/files/import', {
+    method: 'POST',
+    body: JSON.stringify({ vaultId: vault.id, canonicalPath: emptyPath, fileName: emptyPath, storageRelativePath: emptyPath }),
+  }, token)
+  const objectProperties = `JSON_OBJECT('_config_tabs', JSON_OBJECT(), '_config_descriptions', JSON_OBJECT())`
+  queryTestDatabase(`UPDATE files SET custom_properties = ${objectProperties} WHERE id = '${objectFile.id}'; UPDATE file_revisions SET custom_properties = ${objectProperties} WHERE file_id = '${objectFile.id}' AND revision_number = 1; UPDATE files SET custom_properties = JSON_OBJECT() WHERE id = '${emptyFile.id}'; UPDATE file_revisions SET custom_properties = JSON_OBJECT() WHERE file_id = '${emptyFile.id}' AND revision_number = 1;`)
+
+  await scenario('file-list metadata preserves nested empty objects', async () => {
+    const listed = (await request(`/vaults/${vault.id}/files`, {}, token)).files.find(file => file.id === objectFile.id)
+    assert.deepEqual(listed.customProperties, { _config_tabs: {}, _config_descriptions: {} })
+  })
+  await scenario('file-list metadata preserves empty objects', async () => {
+    const listed = (await request(`/vaults/${vault.id}/files`, {}, token)).files.find(file => file.id === emptyFile.id)
+    assert.deepEqual(listed.customProperties, {})
+  })
+  await scenario('revision metadata preserves nested empty objects', async () => {
+    const revision = (await request(`/files/${objectFile.id}/revisions`, {}, token)).revisions[0]
+    assert.deepEqual(revision.customProperties, { _config_tabs: {}, _config_descriptions: {} })
+  })
+  await scenario('revision metadata preserves empty objects', async () => {
+    const revision = (await request(`/files/${emptyFile.id}/revisions`, {}, token)).revisions[0]
+    assert.deepEqual(revision.customProperties, {})
+  })
+
   await scenario('missing durable check-in journal mapping', async () => {
     const journalPath = `review-journal-${randomUUID()}.sldprt`
     const journalFile = await request('/files/import', {
