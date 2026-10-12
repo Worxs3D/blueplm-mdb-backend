@@ -38,6 +38,9 @@ final class Migrator
                 } elseif ($migration === '035_checkin_metadata_idempotency.sql') {
                     self::ensureCheckinMetadataColumns($db);
                     $db->exec($sql);
+                } elseif ($migration === '038_checkin_request_retention_indexes.sql') {
+                    self::ensureCheckinRequestRetentionIndexes($db);
+                    $db->exec($sql);
                 } else {
                     $db->exec($sql);
                 }
@@ -93,6 +96,23 @@ final class Migrator
         $query->execute(['checkouts', 'user_id']);
         if (!$query->fetchColumn()) {
             $db->exec('ALTER TABLE checkouts ADD INDEX idx_checkout_user_id (user_id)');
+        }
+    }
+
+    private static function ensureCheckinRequestRetentionIndexes(PDO $db): void
+    {
+        $indexes = [
+            ['idx_file_checkin_requests_user_scope', 'user_id, created_at'],
+            ['idx_file_checkin_requests_org_scope', 'organization_id, created_at'],
+            ['idx_file_checkin_requests_created', 'created_at'],
+        ];
+        $query = $db->prepare(
+            'SELECT 1 FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ? LIMIT 1'
+        );
+        foreach ($indexes as [$name, $columns]) {
+            $query->execute(['file_checkin_requests', $name]);
+            if (!$query->fetchColumn()) $db->exec("ALTER TABLE file_checkin_requests ADD INDEX `{$name}` ({$columns})");
         }
     }
 

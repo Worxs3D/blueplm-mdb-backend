@@ -41,6 +41,7 @@ DatabaseLifecycle::reset($db, 'DELETE ALL DATABASE DATA');
 
 $applied = Migrator::apply($db, $migrations);
 if (!in_array('036_checkout_request_idempotency.sql', $applied, true)
+    || !in_array('038_checkin_request_retention_indexes.sql', $applied, true)
     || !in_array('037_checkout_user_index.sql', $applied, true)
     || !FileCheckout::supportsRequestIds($db)) {
     throw new RuntimeException('Expected the checkout request-id recovery migration to apply to an existing schema.');
@@ -69,6 +70,7 @@ $legacy = DatabaseLifecycle::inspect($db, $migrations);
 if ($legacy['state'] !== 'legacy') throw new RuntimeException('Expected a legacy BluePLM database.');
 $legacyApplied = Migrator::apply($db, $migrations);
 if (!in_array('036_checkout_request_idempotency.sql', $legacyApplied, true)
+    || !in_array('038_checkin_request_retention_indexes.sql', $legacyApplied, true)
     || !in_array('037_checkout_user_index.sql', $legacyApplied, true)
     || !FileCheckout::supportsRequestIds($db)) {
     throw new RuntimeException('Expected the checkout request-id migration to apply during legacy adoption.');
@@ -76,6 +78,19 @@ if (!in_array('036_checkout_request_idempotency.sql', $legacyApplied, true)
 $secondApply = Migrator::apply($db, $migrations);
 if ($secondApply !== [] || !FileCheckout::supportsRequestIds($db)) {
     throw new RuntimeException('Expected the checkout request-id migration to remain idempotent.');
+}
+$retentionIndexes = $db->prepare(
+    'SELECT COUNT(DISTINCT INDEX_NAME) FROM information_schema.STATISTICS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME IN (?, ?, ?)'
+);
+$retentionIndexes->execute([
+    'file_checkin_requests',
+    'idx_file_checkin_requests_user_scope',
+    'idx_file_checkin_requests_org_scope',
+    'idx_file_checkin_requests_created',
+]);
+if ((int)$retentionIndexes->fetchColumn() !== 3) {
+    throw new RuntimeException('Expected indexed global user, organization, and expiry receipt lookups.');
 }
 $adopted = DatabaseLifecycle::inspect($db, $migrations);
 if ($adopted['state'] !== 'managed' || $adopted['pendingMigrations'] !== 0) {

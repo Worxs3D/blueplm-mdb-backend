@@ -121,6 +121,16 @@ execFileSync(
   ['compose', '-f', 'docker-compose.test.yml', 'exec', '-T', 'api', 'php', 'test/env-parser.php'],
   { cwd: process.cwd(), stdio: 'pipe' },
 )
+execFileSync(
+  'docker',
+  ['compose', '-f', 'docker-compose.test.yml', 'exec', '-T', 'api', 'php', 'test/checkin-retention-config.php'],
+  { cwd: process.cwd(), stdio: 'pipe' },
+)
+execFileSync(
+  'docker',
+  ['compose', '-f', 'docker-compose.test.yml', 'exec', '-T', 'api', 'php', 'test/checkout-lifecycle-lock-release.php'],
+  { cwd: process.cwd(), stdio: 'pipe' },
+)
 const corsResponse = await fetch(`${server}/health`, { headers: { Origin: 'null' } })
 assert.equal(corsResponse.headers.get('access-control-allow-origin'), 'null')
 const deniedInstall = await fetch(`${server}/installer/commit`, {

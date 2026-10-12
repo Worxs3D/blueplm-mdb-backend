@@ -101,10 +101,52 @@ custom properties.
 
 The success response includes `fileId`, `revision`, `mode`,
 `contentChanged`, `metadataChanged`, `replayed`, and the persisted `file`
-snapshot. An exact replay returns that original result with `replayed: true`.
-Reusing a persisted request ID with a different payload returns `409 IDEMPOTENCY_KEY_REUSED`;
-a request rejected before its durable result is written can be corrected and retried
-with that ID. Check-in validates the final merged custom-properties object against
+snapshot. An exact replay returns that original result with `replayed: true` while
+its receipt is logically retained for 30 days by default; set
+`BLUEPLM_CHECKIN_REQUEST_TTL_DAYS` to a value from 1 to 3650 to change the
+retention period. The active journal is limited to 200 receipts per file, 1000
+per global user ID across all organizations, and 10000 per organization by
+default. These limits can be changed
+with `BLUEPLM_CHECKIN_REQUEST_MAX_PER_FILE`,
+`BLUEPLM_CHECKIN_REQUEST_MAX_PER_USER`, and
+`BLUEPLM_CHECKIN_REQUEST_MAX_PER_ORGANIZATION`; each must be a positive integer.
+At a limit, a new check-in returns `429 CHECKIN_RECEIPT_QUOTA_EXCEEDED` before
+changing file metadata, creating a revision, consuming the lease, or recording
+the request. An exact retained replay is still returned at quota. After expiry,
+the receipt is deleted in bounded batches and replay of that request ID is no
+longer guaranteed. Reusing a retained request ID with a different payload
+returns `409 IDEMPOTENCY_KEY_REUSED`; a request rejected before its durable
+result is written can be corrected and retried with that ID. Expired receipts
+stop being eligible for replay as soon as their age reaches the TTL. The TTL is
+evaluated against `created_at` on every request, so changing the TTL immediately
+changes the replay window for existing receipts. Expired receipts are excluded
+from replay and quota counts. Physical cleanup is opportunistic: each successful
+new check-in prunes an indexed batch of at most 500 expired receipts and may
+also delete the current request ID's expired receipt if it remains afterward;
+therefore at most 501 rows can be deleted by one check-in. Other expired rows
+may remain stored until a later successful check-in reaches them.
+Receipt `created_at` values are stored as UTC wall-clock values: new check-ins
+write `UTC_TIMESTAMP(3)` explicitly, so their retention window is independent
+of the database connection time zone. Older receipts created before this rule
+used the session's implicit timestamp time zone; `DATETIME` stores no zone
+metadata, so the original offset cannot be inferred or safely backfilled.
+Those legacy values are interpreted as UTC and may therefore have a shifted
+replay window if an earlier database session used a non-UTC time zone.
+Invalid retention settings fail closed with
+`503 CHECKIN_RECOVERY_UNAVAILABLE` before database access or check-in mutation.
+If a quota is reached, an administrator can raise the corresponding positive
+limit in the service configuration to restore new check-ins while retaining
+unresolved receipts, or wait for those receipts to expire; exact retained
+replays continue to work while at quota. Do not manually delete journal rows to
+relieve pressure, since that can discard a result needed for safe recovery.
+Physical cleanup only runs after a successful new check-in and deletes up to 500
+expired rows in the indexed batch, plus at most one targeted expired row for the
+current request ID (501 total at most), so increasing the relevant limit may be
+needed to allow cleanup to proceed. Code that requires durable check-in recovery
+must ship with migration `038_checkin_request_retention_indexes.sql`; until both
+migrations `035` and `038` are applied, request-ID check-ins fail closed.
+Check-in validates
+the final merged custom-properties object against
 a 200,000-byte encoded JSON limit before changing files, revisions, leases, or the
 request journal. Over-limit requests fail with `400 INVALID_REQUEST` and preserve
 the lease and stored properties; legacy over-limit properties require an explicit
@@ -157,6 +199,30 @@ docker compose -f docker-compose.test.yml exec -T api php test/module-defaults-m
 docker compose -f docker-compose.test.yml exec -T api php test/checkout-lifecycle-lock-release.php
 docker compose -f docker-compose.test.yml down -v
 ```
+
+The focused retention contract test requires intentionally small test-only
+limits. Run it in a separate disposable Compose project with a free host port;
+do not use the shared/default project, the standard integration project, or a
+production database. Keep all three isolation variables explicit and choose a
+project name that is not already in use:
+
+```powershell
+$env:COMPOSE_PROJECT_NAME = 'blueplm-checkin-retention-local'
+$env:BLUEPLM_PHP_TEST_PORT = '18123'
+$env:BLUEPLM_PHP_TEST_SERVER = 'http://127.0.0.1:18123'
+$env:BLUEPLM_CHECKIN_REQUEST_TTL_DAYS = '1'
+$env:BLUEPLM_CHECKIN_REQUEST_MAX_PER_FILE = '2'
+$env:BLUEPLM_CHECKIN_REQUEST_MAX_PER_USER = '5'
+$env:BLUEPLM_CHECKIN_REQUEST_MAX_PER_ORGANIZATION = '5'
+docker compose -p $env:COMPOSE_PROJECT_NAME -f docker-compose.test.yml up --build -d
+node test/checkin-retention.mjs
+docker compose -p $env:COMPOSE_PROJECT_NAME -f docker-compose.test.yml down -v
+```
+
+Use the standard integration commands above separately with their normal test
+configuration. Before running either suite, confirm the named project and host
+port are not already in use; never drop `-p` or point these commands at a live
+service.
 
 All credentials in `test/install-env.fixture` are isolated test values for the
 disposable Docker database.

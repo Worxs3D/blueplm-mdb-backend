@@ -112,6 +112,33 @@ final class Runtime
         return gmdate('Y-m-d H:i:s.v', time() + $minutes * 60);
     }
 
+    /** @param array<string, string> $env @return array{ttlDays:int, perFile:int, perUser:int, perOrganization:int} */
+    public static function checkinRequestRetention(array $env): array
+    {
+        return [
+            'ttlDays' => self::positiveIntegerSetting($env, 'BLUEPLM_CHECKIN_REQUEST_TTL_DAYS', 30),
+            'perFile' => self::positiveIntegerSetting($env, 'BLUEPLM_CHECKIN_REQUEST_MAX_PER_FILE', 200),
+            'perUser' => self::positiveIntegerSetting($env, 'BLUEPLM_CHECKIN_REQUEST_MAX_PER_USER', 1000),
+            'perOrganization' => self::positiveIntegerSetting($env, 'BLUEPLM_CHECKIN_REQUEST_MAX_PER_ORGANIZATION', 10000),
+        ];
+    }
+
+    /** @param array<string, string> $env */
+    private static function positiveIntegerSetting(array $env, string $key, int $default): int
+    {
+        if (!array_key_exists($key, $env)) return $default;
+        $value = $env[$key];
+        if (!is_string($value) || !preg_match('/^[1-9][0-9]*$/', $value)) {
+            throw new \RuntimeException($key . ' must be a positive integer.');
+        }
+        $parsed = filter_var($value, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1, 'max_range' => PHP_INT_MAX]]);
+        if (!is_int($parsed) || ($key === 'BLUEPLM_CHECKIN_REQUEST_TTL_DAYS' && $parsed > 3650)) {
+            $range = $key === 'BLUEPLM_CHECKIN_REQUEST_TTL_DAYS' ? 'between 1 and 3650' : 'a positive integer';
+            throw new \RuntimeException($key . ' must be ' . $range . '.');
+        }
+        return $parsed;
+    }
+
     /** @param array<string, mixed> $principal */
     public static function requireVault(PDO $db, array $principal, string $vaultId): array
     {

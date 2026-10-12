@@ -85,6 +85,11 @@ final class FileCheckin
 
         if ($requestId !== null) $body['requestId'] = $requestId;
         $fingerprint = $requestId === null ? null : self::fingerprint($body);
+        try {
+            $retention = $requestId === null ? null : Runtime::checkinRequestRetention($env);
+        } catch (\RuntimeException) {
+            throw new FileCheckinFailure(503, 'CHECKIN_RECOVERY_UNAVAILABLE', 'Durable check-in recovery is temporarily unavailable.');
+        }
         $authorizationQuery = $db->prepare('SELECT vault_id FROM files WHERE id = ? AND organization_id = ? AND deleted_at IS NULL');
         $authorizationQuery->execute([$fileId, $principal['organizationId']]);
         $authorizationFile = $authorizationQuery->fetch();
@@ -92,6 +97,8 @@ final class FileCheckin
         Runtime::requireVault($db, $principal, $authorizationFile['vault_id']);
         if ($requestId !== null && !self::supportsRequestIds($db)) throw new FileCheckinFailure(503, 'CHECKIN_RECOVERY_UNAVAILABLE', 'Durable check-in recovery is temporarily unavailable.');
         $requestLock = null;
+        $userQuotaLock = null;
+        $quotaLock = null;
         if ($requestId !== null) {
             try {
                 $requestLock = FileCheckout::acquireRequestIdLock($db, 'checkin', $principal['organizationId'], $requestId);
@@ -99,6 +106,26 @@ final class FileCheckin
                 throw new FileCheckinFailure(503, 'CHECKIN_RECOVERY_UNAVAILABLE', 'Durable check-in recovery is temporarily unavailable.');
             }
             if ($requestLock === null) throw new FileCheckinFailure(503, 'CHECKIN_RECOVERY_BUSY', 'Durable check-in recovery is busy; retry the same requestId.');
+            try {
+                $userQuotaLock = FileCheckout::acquireUserCheckinLock($db, $principal['userId']);
+            } catch (Throwable) {
+                self::releaseCheckinLocks($db, [$requestLock]);
+                throw new FileCheckinFailure(503, 'CHECKIN_RECOVERY_UNAVAILABLE', 'Check-in receipt quota enforcement is temporarily unavailable.');
+            }
+            if ($userQuotaLock === null) {
+                self::releaseCheckinLocks($db, [$requestLock]);
+                throw new FileCheckinFailure(503, 'CHECKIN_RECOVERY_BUSY', 'Check-in receipt quota enforcement is busy; retry the same requestId.');
+            }
+            try {
+                $quotaLock = FileCheckout::acquireOrganizationCheckinLock($db, $principal['organizationId']);
+            } catch (Throwable) {
+                self::releaseCheckinLocks($db, [$requestLock, $userQuotaLock]);
+                throw new FileCheckinFailure(503, 'CHECKIN_RECOVERY_UNAVAILABLE', 'Check-in receipt quota enforcement is temporarily unavailable.');
+            }
+            if ($quotaLock === null) {
+                self::releaseCheckinLocks($db, [$requestLock, $userQuotaLock]);
+                throw new FileCheckinFailure(503, 'CHECKIN_RECOVERY_BUSY', 'Check-in receipt quota enforcement is busy; retry the same requestId.');
+            }
         }
         $operationFailure = null;
         try {
@@ -109,7 +136,8 @@ final class FileCheckin
             if ($file['vault_id'] !== $authorizationFile['vault_id']) throw new FileCheckinFailure(404, 'NOT_FOUND', 'File not found.');
 
             if ($requestId !== null) {
-                $prior = $db->prepare('SELECT file_id, user_id, request_fingerprint, response FROM file_checkin_requests WHERE organization_id = ? AND request_id = ?');
+                $cutoff = 'DATE_SUB(UTC_TIMESTAMP(3), INTERVAL ' . $retention['ttlDays'] . ' DAY)';
+                $prior = $db->prepare('SELECT file_id, user_id, request_fingerprint, response FROM file_checkin_requests WHERE organization_id = ? AND request_id = ? AND created_at > ' . $cutoff);
                 $prior->execute([$principal['organizationId'], $requestId]); $existing = $prior->fetch();
                 if ($existing) {
                     if ($existing['file_id'] !== $fileId || $existing['user_id'] !== $principal['userId'] || !hash_equals($existing['request_fingerprint'], $fingerprint)) throw new FileCheckinFailure(409, 'IDEMPOTENCY_KEY_REUSED', 'requestId was already used with a different check-in request.');
@@ -129,6 +157,30 @@ final class FileCheckin
             $leaseQuery = $db->prepare('SELECT token_hash, user_id FROM checkouts WHERE file_id = ? AND expires_at > UTC_TIMESTAMP(3) FOR UPDATE');
             $leaseQuery->execute([$fileId]); $lease = $leaseQuery->fetch();
             if (!$lease || $lease['user_id'] !== $principal['userId'] || !hash_equals($lease['token_hash'], Runtime::tokenHash($body['checkoutToken'], $env))) throw new FileCheckinFailure(409, 'INVALID_CHECKOUT', 'A valid, unexpired checkout from this client is required.');
+
+            if ($requestId !== null) {
+                $cutoff = 'DATE_SUB(UTC_TIMESTAMP(3), INTERVAL ' . $retention['ttlDays'] . ' DAY)';
+                $counts = [
+                    ['SELECT COUNT(*) FROM file_checkin_requests WHERE organization_id = ? AND file_id = ? AND created_at > ' . $cutoff, [$principal['organizationId'], $fileId], $retention['perFile'], 'file'],
+                    ['SELECT COUNT(*) FROM file_checkin_requests WHERE user_id = ? AND created_at > ' . $cutoff, [$principal['userId']], $retention['perUser'], 'user'],
+                    ['SELECT COUNT(*) FROM file_checkin_requests WHERE organization_id = ? AND created_at > ' . $cutoff, [$principal['organizationId']], $retention['perOrganization'], 'organization'],
+                ];
+                foreach ($counts as [$sql, $parameters, $limit, $scope]) {
+                    $countQuery = $db->prepare($sql);
+                    $countQuery->execute($parameters);
+                    if ((int)$countQuery->fetchColumn() >= $limit) {
+                        throw new FileCheckinFailure(429, 'CHECKIN_RECEIPT_QUOTA_EXCEEDED', 'The ' . $scope . ' check-in receipt limit has been reached; retry after receipts expire.');
+                    }
+                }
+
+                // Remove only a bounded batch of expired receipts. The cleanup
+                // is in the same transaction as the new successful receipt,
+                // after every quota check, so rejected requests do not alter
+                // the journal or any check-in state.
+                $db->exec('DELETE FROM file_checkin_requests WHERE created_at <= ' . $cutoff . ' ORDER BY created_at ASC LIMIT 500');
+                $expiredRequest = $db->prepare('DELETE FROM file_checkin_requests WHERE organization_id = ? AND request_id = ? AND created_at <= ' . $cutoff);
+                $expiredRequest->execute([$principal['organizationId'], $requestId]);
+            }
 
             $currentProperties = json_decode($file['custom_properties'] ?? 'null', true);
             if (!self::isObject($currentProperties)) $currentProperties = [];
@@ -186,7 +238,7 @@ final class FileCheckin
             Runtime::emitEvent($db, $principal['organizationId'], $mode === 'content' ? 'file.checked_in' : 'file.metadata_checked_in', $fileId, ['revision' => $nextRevision, 'userId' => $principal['userId'], 'comment' => $comment, 'requestId' => $requestId]);
             FileCheckout::markTerminalByHash($db, $fileId, $lease['token_hash'], 'consumed');
             $db->prepare('DELETE FROM checkouts WHERE file_id = ?')->execute([$fileId]);
-            if ($requestId !== null) $db->prepare('INSERT INTO file_checkin_requests (request_id, organization_id, file_id, user_id, request_fingerprint, response) VALUES (?, ?, ?, ?, ?, ?)')->execute([$requestId, $principal['organizationId'], $fileId, $principal['userId'], $fingerprint, json_encode($response, JSON_THROW_ON_ERROR)]);
+            if ($requestId !== null) $db->prepare('INSERT INTO file_checkin_requests (request_id, organization_id, file_id, user_id, request_fingerprint, response, created_at) VALUES (?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3))')->execute([$requestId, $principal['organizationId'], $fileId, $principal['userId'], $fingerprint, json_encode($response, JSON_THROW_ON_ERROR)]);
             $db->commit(); return $response;
         } catch (Throwable $error) {
             if ($db->inTransaction()) $db->rollBack();
@@ -196,14 +248,28 @@ final class FileCheckin
             $operationFailure = $error;
             throw $error;
         } finally {
-            if ($requestLock !== null) {
-                try {
-                    if (!FileCheckout::releaseRequestIdLock($db, $requestLock)) throw new \RuntimeException('Check-in request lock was not released.');
-                } catch (Throwable) {
-                    if ($operationFailure === null) throw new FileCheckinFailure(503, 'CHECKIN_RECOVERY_UNAVAILABLE', 'The check-in result should be retried with the same requestId.');
-                }
+            $acquiredLocks = array_values(array_filter(
+                [$requestLock, $userQuotaLock, $quotaLock],
+                static fn (?string $lock): bool => $lock !== null,
+            ));
+            if (!self::releaseCheckinLocks($db, $acquiredLocks) && $operationFailure === null) {
+                throw new FileCheckinFailure(503, 'CHECKIN_RECOVERY_UNAVAILABLE', 'The check-in result should be retried with the same requestId.');
             }
         }
+    }
+
+    /** @param list<string> $acquiredLocks Lock names in acquisition order. */
+    private static function releaseCheckinLocks(PDO $db, array $acquiredLocks): bool
+    {
+        $released = true;
+        foreach (array_reverse($acquiredLocks) as $lockName) {
+            try {
+                if (!FileCheckout::releaseRequestIdLock($db, $lockName)) $released = false;
+            } catch (Throwable) {
+                $released = false;
+            }
+        }
+        return $released;
     }
 
     private static function isUuid(string $value): bool
@@ -221,9 +287,9 @@ final class FileCheckin
     private static function supportsRequestIds(PDO $db): bool
     {
         try {
-            $query = $db->prepare('SELECT 1 FROM schema_migrations m JOIN information_schema.TABLES t ON t.TABLE_SCHEMA = DATABASE() AND t.TABLE_NAME = \'file_checkin_requests\' WHERE m.migration = ? LIMIT 1');
-            $query->execute(['035_checkin_metadata_idempotency.sql']);
-            return (bool)$query->fetchColumn();
+            $query = $db->prepare('SELECT COUNT(DISTINCT m.migration) FROM schema_migrations m JOIN information_schema.TABLES t ON t.TABLE_SCHEMA = DATABASE() AND t.TABLE_NAME = \'file_checkin_requests\' WHERE m.migration IN (?, ?)');
+            $query->execute(['035_checkin_metadata_idempotency.sql', '038_checkin_request_retention_indexes.sql']);
+            return (int)$query->fetchColumn() === 2;
         } catch (Throwable) {
             return false;
         }

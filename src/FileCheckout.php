@@ -73,6 +73,26 @@ final class FileCheckout
         return (int)$query->fetchColumn() === 1;
     }
 
+    public static function acquireOrganizationCheckinLock(PDO $db, string $organizationId): ?string
+    {
+        $database = $db->query('SELECT DATABASE()')->fetchColumn();
+        if (!is_string($database) || $database === '') throw new \RuntimeException('Database name is unavailable for check-in quota locking.');
+        $lockName = 'blueplm:' . substr(hash('sha256', implode("\0", [$database, 'checkin-quota', strtolower($organizationId)])), 0, 56);
+        $query = $db->prepare('SELECT GET_LOCK(?, 5)');
+        $query->execute([$lockName]);
+        return (int)$query->fetchColumn() === 1 ? $lockName : null;
+    }
+
+    public static function acquireUserCheckinLock(PDO $db, string $userId): ?string
+    {
+        $database = $db->query('SELECT DATABASE()')->fetchColumn();
+        if (!is_string($database) || $database === '') throw new \RuntimeException('Database name is unavailable for check-in user quota locking.');
+        $lockName = 'blueplm:' . substr(hash('sha256', implode("\0", [$database, 'checkin-user-quota', strtolower($userId)])), 0, 56);
+        $query = $db->prepare('SELECT GET_LOCK(?, 5)');
+        $query->execute([$lockName]);
+        return (int)$query->fetchColumn() === 1 ? $lockName : null;
+    }
+
     /** @param array<string, string> $env @param array<string, mixed> $principal @return array<string, mixed> */
     public static function acquireWithRequestId(PDO $db, array $env, array $principal, string $fileId, string $vaultId, string $clientWorkingPath, string $requestId): array
     {
