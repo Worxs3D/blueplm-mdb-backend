@@ -5,6 +5,7 @@ import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { runCheckoutRequestIdRecoveryTests } from './checkout-request-id-recovery.mjs'
+import { runCheckinReviewRegressionTests } from './checkin-review-regressions.mjs'
 
 const server = process.env.BLUEPLM_PHP_TEST_SERVER ?? 'http://127.0.0.1:18080'
 const installationToken = 'integration-installation-token-must-be-at-least-32-chars'
@@ -1481,5 +1482,6 @@ await runCheckoutRequestIdRecoveryTests({
   request, requestStatus,
   duplicatePart, imported, workspace, token, updatedMemberLogin, vault, foreignOrgId, foreignUser, sameHashRequest,
 })
+await runCheckinReviewRegressionTests({ request, requestStatus, imported, vault, workspace, token })
 
 console.log('PHP API, installer lifecycle, MariaDB, and network vault integration passed.')

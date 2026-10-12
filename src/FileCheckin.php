@@ -22,6 +22,7 @@ final class FileCheckinFailure extends \RuntimeException
 
 final class FileCheckin
 {
+    private const MAX_STORAGE_RELATIVE_PATH_BYTES = 2048;
     private const PENDING_METADATA_KEYS = ['part_number', 'description', 'revision', 'config_tabs', 'config_descriptions'];
 
     /** @return array<string, mixed> */
@@ -47,7 +48,7 @@ final class FileCheckin
         if ($mode === 'content') {
             if (!is_string($body['storageRelativePath'] ?? null) || trim($body['storageRelativePath']) === '') throw new FileCheckinFailure(400, 'INVALID_REQUEST', 'storageRelativePath is required for content check-in.');
             $relativePath = ltrim(str_replace('\\', '/', trim($body['storageRelativePath'])), '/');
-            if ($relativePath === '' || str_contains($relativePath, '../')) throw new FileCheckinFailure(400, 'INVALID_REQUEST', 'storageRelativePath must be a normalized vault-relative path.');
+            if (strlen($relativePath) > self::MAX_STORAGE_RELATIVE_PATH_BYTES || !self::isNormalizedStorageRelativePath($relativePath)) throw new FileCheckinFailure(400, 'INVALID_REQUEST', 'storageRelativePath must be a normalized vault-relative path within the supported length.');
             if ($explicitMode && (!is_string($body['contentHash'] ?? null) || !preg_match('/^[a-f0-9]{64}$/i', $body['contentHash']))) throw new FileCheckinFailure(400, 'INVALID_REQUEST', 'contentHash must be a SHA-256 hex string for explicit content check-in.');
             if ($explicitMode && (!is_int($body['sizeBytes'] ?? null) || $body['sizeBytes'] < 0)) throw new FileCheckinFailure(400, 'INVALID_REQUEST', 'sizeBytes must be a non-negative integer for explicit content check-in.');
             if (array_key_exists('contentHash', $body) && $body['contentHash'] !== null && (!is_string($body['contentHash']) || !preg_match('/^[a-f0-9]{64}$/i', $body['contentHash']))) throw new FileCheckinFailure(400, 'INVALID_REQUEST', 'contentHash must be a SHA-256 hex string or null.');
@@ -88,6 +89,7 @@ final class FileCheckin
         $authorizationFile = $authorizationQuery->fetch();
         if (!$authorizationFile) throw new FileCheckinFailure(404, 'NOT_FOUND', 'File not found.');
         Runtime::requireVault($db, $principal, $authorizationFile['vault_id']);
+        if ($requestId !== null && !self::supportsRequestIds($db)) throw new FileCheckinFailure(503, 'CHECKIN_RECOVERY_UNAVAILABLE', 'Durable check-in recovery is temporarily unavailable.');
         $requestLock = null;
         if ($requestId !== null) {
             try {
@@ -177,6 +179,7 @@ final class FileCheckin
             $db->commit(); return $response;
         } catch (Throwable $error) {
             if ($db->inTransaction()) $db->rollBack();
+            if ($error instanceof PDOException && self::isMissingRequestTable($error)) $error = new FileCheckinFailure(503, 'CHECKIN_RECOVERY_UNAVAILABLE', 'Durable check-in recovery is temporarily unavailable.');
             if ($error instanceof PDOException && $error->getCode() === '23000' && str_contains($error->getMessage(), 'uq_files_org_part_number')) $error = new FileCheckinFailure(409, 'PART_NUMBER_EXISTS', 'This part number is already assigned to another file.');
             if ($error instanceof PDOException && $error->getCode() === '23000' && str_contains($error->getMessage(), 'uq_file_active_path')) $error = new FileCheckinFailure(409, 'PATH_EXISTS', 'A file already exists at this vault path.');
             $operationFailure = $error;
@@ -195,6 +198,31 @@ final class FileCheckin
     private static function isUuid(string $value): bool
     {
         return (bool)preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i', $value);
+    }
+
+    private static function isNormalizedStorageRelativePath(string $value): bool
+    {
+        if ($value === '') return false;
+        foreach (explode('/', $value) as $segment) if ($segment === '' || $segment === '.' || $segment === '..') return false;
+        return true;
+    }
+
+    private static function supportsRequestIds(PDO $db): bool
+    {
+        try {
+            $query = $db->prepare('SELECT 1 FROM schema_migrations m JOIN information_schema.TABLES t ON t.TABLE_SCHEMA = DATABASE() AND t.TABLE_NAME = \'file_checkin_requests\' WHERE m.migration = ? LIMIT 1');
+            $query->execute(['035_checkin_metadata_idempotency.sql']);
+            return (bool)$query->fetchColumn();
+        } catch (Throwable) {
+            return false;
+        }
+    }
+
+    private static function isMissingRequestTable(PDOException $error): bool
+    {
+        return $error->getCode() === '42S02'
+            && (int)($error->errorInfo[1] ?? 0) === 1146
+            && str_contains($error->getMessage(), 'file_checkin_requests');
     }
 
     private static function isSafeCanonicalPath(string $value): bool

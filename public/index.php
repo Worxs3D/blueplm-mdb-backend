@@ -2438,18 +2438,28 @@ try {
         $existing->execute([$vaultId, $canonicalPath]);
         $record = $existing->fetch();
         if ($record) {
-            try {
-                // A rescan after upgrading from a schema without part_number is
-                // the authoritative backfill path for existing vault contents.
-                if ($partNumber !== null && $record['part_number'] !== $partNumber) {
-                    $db->prepare('UPDATE files SET part_number = ? WHERE id = ? AND organization_id = ?')
-                        ->execute([$partNumber, $record['id'], $principal['organizationId']]);
+            if ($partNumber !== null) {
+                $db->beginTransaction();
+                try {
+                    // A rescan after upgrading from a schema without part_number is
+                    // the authoritative backfill path for existing vault contents.
+                    if ($record['part_number'] !== $partNumber) {
+                        $db->prepare('UPDATE files SET part_number = ? WHERE id = ? AND organization_id = ?')
+                            ->execute([$partNumber, $record['id'], $principal['organizationId']]);
+                    }
+                    $db->prepare('UPDATE file_revisions SET part_number = ? WHERE file_id = ? AND revision_number = 1 AND part_number IS NULL')
+                        ->execute([$partNumber, $record['id']]);
+                    $db->commit();
+                } catch (PDOException $error) {
+                    if ($db->inTransaction()) $db->rollBack();
+                    if ($error->getCode() === '23000' && str_contains($error->getMessage(), 'uq_files_org_part_number')) {
+                        Runtime::respond(409, ['error' => 'PART_NUMBER_EXISTS', 'message' => 'This part number is already assigned to another file.']);
+                    }
+                    throw $error;
+                } catch (Throwable $error) {
+                    if ($db->inTransaction()) $db->rollBack();
+                    throw $error;
                 }
-            } catch (PDOException $error) {
-                if ($error->getCode() === '23000' && str_contains($error->getMessage(), 'uq_files_org_part_number')) {
-                    Runtime::respond(409, ['error' => 'PART_NUMBER_EXISTS', 'message' => 'This part number is already assigned to another file.']);
-                }
-                throw $error;
             }
             Runtime::respond(200, ['id' => $record['id'], 'created' => false]);
         }
@@ -2457,7 +2467,7 @@ try {
         $db->beginTransaction();
         try {
             $db->prepare('INSERT INTO files (id, organization_id, vault_id, canonical_path, file_name, part_number, storage_relative_path, current_revision, content_hash, size_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)')->execute([$fileId, $principal['organizationId'], $vaultId, $canonicalPath, $fileName, $partNumber, $storageRelativePath, $contentHash, $sizeBytes]);
-            $db->prepare('INSERT INTO file_revisions (id, file_id, revision_number, content_hash, storage_relative_path, size_bytes, checked_in_by, comment) VALUES (?, ?, 1, ?, ?, ?, ?, ?)')->execute([Runtime::uuid(), $fileId, $contentHash, $storageRelativePath, $sizeBytes, $principal['userId'], 'Initial vault import']);
+            $db->prepare('INSERT INTO file_revisions (id, file_id, revision_number, content_hash, storage_relative_path, size_bytes, checked_in_by, comment, part_number) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?)')->execute([Runtime::uuid(), $fileId, $contentHash, $storageRelativePath, $sizeBytes, $principal['userId'], 'Initial vault import', $partNumber]);
             Runtime::emitEvent($db, $principal['organizationId'], 'file.imported', $fileId, ['userId' => $principal['userId'], 'vaultId' => $vaultId]);
             $db->commit();
         } catch (Throwable $error) {
