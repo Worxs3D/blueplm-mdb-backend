@@ -168,9 +168,10 @@ reuse it only for retries of that same acquisition. An exact retry returns the
 same active lease token and current expiry; changing the file or path with that
 ID returns `409 IDEMPOTENCY_KEY_REUSED`. A different request ID cannot replace
 an active lease (`409 CHECKED_OUT`). The server exposes the
-`checkoutRequestIdempotency` health capability only when migration
-`036_checkout_request_idempotency.sql` is applied and its request journal is
-present. If request-ID locking is busy, the server returns retryable
+`checkoutRequestIdempotency` health capability only when migrations
+`036_checkout_request_idempotency.sql` and
+`039_checkout_request_retention_indexes.sql` are applied and the request
+journal is present. If request-ID locking is busy, the server returns retryable
 `503 CHECKOUT_RECOVERY_BUSY`; when the durable journal or lock service is
 unavailable it returns `503 CHECKOUT_RECOVERY_UNAVAILABLE`. Retries must retain
 the original request ID. Cancellation, check-in, and replacement by a legacy
@@ -184,6 +185,55 @@ checkout uses a request ID, so reuse the same ID when retrying that checkout.
 Legacy checkout and deletion have no request-ID idempotency; inspect the current
 lease/account state before retrying when the response may have been lost after
 the operation completed.
+
+The checkout acquisition journal retains terminal request records for 30 days
+by default, measured from terminal `updated_at`; configure
+`BLUEPLM_CHECKOUT_REQUEST_TTL_DAYS` from 1 to 3650 to change this window.
+Active requests are never pruned because their encrypted token is required to
+recover a still-live lease, including a lease renewed after the request was
+created. Quotas count every active request plus terminal requests still inside
+the retention window: 200 per file, 1000 per global user ID across all
+organizations, and 10000 per organization by default. Configure these
+independently with `BLUEPLM_CHECKOUT_REQUEST_MAX_PER_FILE`,
+`BLUEPLM_CHECKOUT_REQUEST_MAX_PER_USER`, and
+`BLUEPLM_CHECKOUT_REQUEST_MAX_PER_ORGANIZATION`; all values must be positive
+integers. Invalid retention settings fail closed with
+`503 CHECKOUT_RECOVERY_UNAVAILABLE` before checkout journal locking or mutation. An exact active
+retry is resolved before quota checks and continues to recover the same token
+at quota. A new acquisition rejected at any quota returns
+`429 CHECKOUT_REQUEST_QUOTA_EXCEEDED` before file, lease, or journal mutation;
+the error message identifies the exhausted scope (`file`, `user`, or
+`organization`).
+
+TTL applies only after a request becomes terminal. Before quota checks, each
+durable acquisition performs bounded maintenance over up to 500 candidate
+expired leases in the caller's global-user or current-organization scope.
+Candidates are rechecked under stable file-row locks; the current
+checkout token and expiry must still prove that the lease is expired or no
+longer owns the file. A concurrently renewed live lease keeps its active
+receipt and encrypted replay token. A missing or replaced checkout can only
+terminalize a due receipt; a different current checkout is never deleted. This
+maintenance commits separately from the new acquisition, so quota rejection
+creates no new lease or journal record, though it may clean up already-expired
+state. Terminal TTL starts when this safe transition is confirmed: a stale
+active receipt remains quota-counted until the sweep discovers it, then remains
+counted for the configured terminal-retention window. Terminal cleanup
+separately deletes up to 500 expired terminal rows on an accepted acquisition,
+plus at most one additional expired row for that request ID. Active rows are
+never deleted based on journal age. Once a terminal row has expired and been
+pruned, reusing
+its request ID can start a new acquisition; exact idempotent replay is no longer
+guaranteed after that point. To recover from quota pressure, an administrator
+can raise the corresponding checkout limit in service configuration or wait
+for terminal requests to reach retention expiry; exact live replays remain
+available at quota. Do not manually delete checkout journal rows because that
+can destroy recovery for a live lease. Checkout request-ID recovery now
+requires both `036_checkout_request_idempotency.sql` and
+`039_checkout_request_retention_indexes.sql`; until both are applied, the
+health capability is withheld and durable acquisition fails closed. Terminal
+timestamps are written explicitly in UTC, so their TTL basis is independent of
+the MariaDB session time zone. The legacy `created_at` timestamp is not used as
+the retention clock.
 
 ## Tests
 
@@ -216,6 +266,28 @@ $env:BLUEPLM_CHECKIN_REQUEST_MAX_PER_USER = '5'
 $env:BLUEPLM_CHECKIN_REQUEST_MAX_PER_ORGANIZATION = '5'
 docker compose -p $env:COMPOSE_PROJECT_NAME -f docker-compose.test.yml up --build -d
 node test/checkin-retention.mjs
+docker compose -p $env:COMPOSE_PROJECT_NAME -f docker-compose.test.yml down -v
+```
+
+Checkout retention has its own isolated test stack and independent limits. The
+test verifies terminal expiry/reuse, preservation and replay of aged active
+leases, the per-file/user/organization caps, exact replay at quota, concurrent
+cross-organization acquisitions by one global user, UTC terminal timestamps
+under a non-UTC database session, and a renewal/cleanup race. Choose a fresh
+project name and confirm the port is free before running; never use the shared
+default project or a production database.
+
+```powershell
+$env:COMPOSE_PROJECT_NAME = 'blueplm-checkout-retention-local'
+$env:BLUEPLM_PHP_TEST_PORT = '18124'
+$env:BLUEPLM_PHP_TEST_SERVER = 'http://127.0.0.1:18124'
+$env:BLUEPLM_CHECKOUT_REQUEST_TTL_DAYS = '1'
+$env:BLUEPLM_CHECKOUT_REQUEST_MAX_PER_FILE = '2'
+$env:BLUEPLM_CHECKOUT_REQUEST_MAX_PER_USER = '5'
+$env:BLUEPLM_CHECKOUT_REQUEST_MAX_PER_ORGANIZATION = '6'
+docker compose -p $env:COMPOSE_PROJECT_NAME -f docker-compose.test.yml up --build -d
+docker compose -p $env:COMPOSE_PROJECT_NAME -f docker-compose.test.yml exec -T api php test/checkout-retention-config.php
+node test/checkout-retention.mjs
 docker compose -p $env:COMPOSE_PROJECT_NAME -f docker-compose.test.yml down -v
 ```
 

@@ -123,6 +123,17 @@ final class Runtime
         ];
     }
 
+    /** @param array<string, string> $env @return array{ttlDays:int, perFile:int, perUser:int, perOrganization:int} */
+    public static function checkoutRequestRetention(array $env): array
+    {
+        return [
+            'ttlDays' => self::positiveIntegerSetting($env, 'BLUEPLM_CHECKOUT_REQUEST_TTL_DAYS', 30),
+            'perFile' => self::positiveIntegerSetting($env, 'BLUEPLM_CHECKOUT_REQUEST_MAX_PER_FILE', 200),
+            'perUser' => self::positiveIntegerSetting($env, 'BLUEPLM_CHECKOUT_REQUEST_MAX_PER_USER', 1000),
+            'perOrganization' => self::positiveIntegerSetting($env, 'BLUEPLM_CHECKOUT_REQUEST_MAX_PER_ORGANIZATION', 10000),
+        ];
+    }
+
     /** @param array<string, string> $env */
     private static function positiveIntegerSetting(array $env, string $key, int $default): int
     {
@@ -132,8 +143,9 @@ final class Runtime
             throw new \RuntimeException($key . ' must be a positive integer.');
         }
         $parsed = filter_var($value, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1, 'max_range' => PHP_INT_MAX]]);
-        if (!is_int($parsed) || ($key === 'BLUEPLM_CHECKIN_REQUEST_TTL_DAYS' && $parsed > 3650)) {
-            $range = $key === 'BLUEPLM_CHECKIN_REQUEST_TTL_DAYS' ? 'between 1 and 3650' : 'a positive integer';
+        $isRetentionTtl = str_ends_with($key, '_REQUEST_TTL_DAYS');
+        if (!is_int($parsed) || ($isRetentionTtl && $parsed > 3650)) {
+            $range = $isRetentionTtl ? 'between 1 and 3650' : 'a positive integer';
             throw new \RuntimeException($key . ' must be ' . $range . '.');
         }
         return $parsed;

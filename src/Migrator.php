@@ -41,6 +41,9 @@ final class Migrator
                 } elseif ($migration === '038_checkin_request_retention_indexes.sql') {
                     self::ensureCheckinRequestRetentionIndexes($db);
                     $db->exec($sql);
+                } elseif ($migration === '039_checkout_request_retention_indexes.sql') {
+                    self::ensureCheckoutRequestRetentionIndexes($db);
+                    $db->exec($sql);
                 } else {
                     $db->exec($sql);
                 }
@@ -113,6 +116,25 @@ final class Migrator
         foreach ($indexes as [$name, $columns]) {
             $query->execute(['file_checkin_requests', $name]);
             if (!$query->fetchColumn()) $db->exec("ALTER TABLE file_checkin_requests ADD INDEX `{$name}` ({$columns})");
+        }
+    }
+
+    private static function ensureCheckoutRequestRetentionIndexes(PDO $db): void
+    {
+        $indexes = [
+            ['idx_checkout_request_user_retention', 'user_id, status, updated_at'],
+            ['idx_checkout_request_org_retention', 'organization_id, status, updated_at'],
+            ['idx_checkout_request_file_retention', 'file_id, status, updated_at'],
+            ['idx_checkout_request_terminal_retention', 'updated_at, status'],
+            ['idx_checkout_request_active_expiry', 'status, expires_at, file_id'],
+        ];
+        $query = $db->prepare(
+            'SELECT 1 FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ? LIMIT 1'
+        );
+        foreach ($indexes as [$name, $columns]) {
+            $query->execute(['checkout_acquisition_requests', $name]);
+            if (!$query->fetchColumn()) $db->exec("ALTER TABLE checkout_acquisition_requests ADD INDEX `{$name}` ({$columns})");
         }
     }
 

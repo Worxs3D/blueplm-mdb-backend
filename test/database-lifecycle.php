@@ -42,6 +42,7 @@ DatabaseLifecycle::reset($db, 'DELETE ALL DATABASE DATA');
 $applied = Migrator::apply($db, $migrations);
 if (!in_array('036_checkout_request_idempotency.sql', $applied, true)
     || !in_array('038_checkin_request_retention_indexes.sql', $applied, true)
+    || !in_array('039_checkout_request_retention_indexes.sql', $applied, true)
     || !in_array('037_checkout_user_index.sql', $applied, true)
     || !FileCheckout::supportsRequestIds($db)) {
     throw new RuntimeException('Expected the checkout request-id recovery migration to apply to an existing schema.');
@@ -71,6 +72,7 @@ if ($legacy['state'] !== 'legacy') throw new RuntimeException('Expected a legacy
 $legacyApplied = Migrator::apply($db, $migrations);
 if (!in_array('036_checkout_request_idempotency.sql', $legacyApplied, true)
     || !in_array('038_checkin_request_retention_indexes.sql', $legacyApplied, true)
+    || !in_array('039_checkout_request_retention_indexes.sql', $legacyApplied, true)
     || !in_array('037_checkout_user_index.sql', $legacyApplied, true)
     || !FileCheckout::supportsRequestIds($db)) {
     throw new RuntimeException('Expected the checkout request-id migration to apply during legacy adoption.');
@@ -91,6 +93,21 @@ $retentionIndexes->execute([
 ]);
 if ((int)$retentionIndexes->fetchColumn() !== 3) {
     throw new RuntimeException('Expected indexed global user, organization, and expiry receipt lookups.');
+}
+$checkoutRetentionIndexes = $db->prepare(
+    'SELECT COUNT(DISTINCT INDEX_NAME) FROM information_schema.STATISTICS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME IN (?, ?, ?, ?, ?)'
+);
+$checkoutRetentionIndexes->execute([
+    'checkout_acquisition_requests',
+    'idx_checkout_request_user_retention',
+    'idx_checkout_request_org_retention',
+    'idx_checkout_request_file_retention',
+    'idx_checkout_request_terminal_retention',
+    'idx_checkout_request_active_expiry',
+]);
+if ((int)$checkoutRetentionIndexes->fetchColumn() !== 5) {
+    throw new RuntimeException('Expected indexed global user, organization, file, terminal, and active-expiry checkout request lookups.');
 }
 $adopted = DatabaseLifecycle::inspect($db, $migrations);
 if ($adopted['state'] !== 'managed' || $adopted['pendingMigrations'] !== 0) {

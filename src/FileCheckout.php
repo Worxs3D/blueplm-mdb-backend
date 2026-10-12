@@ -83,6 +83,94 @@ final class FileCheckout
         return (int)$query->fetchColumn() === 1 ? $lockName : null;
     }
 
+    public static function acquireOrganizationCheckoutLock(PDO $db, string $organizationId): ?string
+    {
+        $database = $db->query('SELECT DATABASE()')->fetchColumn();
+        if (!is_string($database) || $database === '') throw new \RuntimeException('Database name is unavailable for checkout quota locking.');
+        $lockName = 'blueplm:' . substr(hash('sha256', implode("\0", [$database, 'checkout-quota', strtolower($organizationId)])), 0, 56);
+        $query = $db->prepare('SELECT GET_LOCK(?, 5)');
+        $query->execute([$lockName]);
+        return (int)$query->fetchColumn() === 1 ? $lockName : null;
+    }
+
+    /**
+     * Terminalize a bounded set of expired checkout state in this user's and
+     * organization scope. Candidate expiry is only a hint: file then checkout
+     * rows are locked and the live lease is revalidated before any mutation.
+     */
+    public static function terminalizeExpiredRequests(PDO $db, string $userId, string $organizationId, int $limit = 500): void
+    {
+        if ($limit < 2 || $limit > 500) throw new \InvalidArgumentException('Expired checkout sweep limit is outside its bound.');
+        // Split the bounded budget across two index-backed streams so either
+        // an expired lease or an orphaned due journal can trigger cleanup.
+        $leaseLimit = intdiv($limit, 2);
+        $requestLimit = $limit - $leaseLimit;
+        $checkoutCandidates = $db->prepare(
+            "SELECT c.file_id FROM checkouts c JOIN files f ON f.id = c.file_id
+             WHERE c.expires_at <= UTC_TIMESTAMP(3)
+               AND (c.user_id = ? OR f.organization_id = ?)
+             ORDER BY c.expires_at, c.file_id LIMIT {$leaseLimit}"
+        );
+        $checkoutCandidates->execute([$userId, $organizationId]);
+        $requestCandidates = $db->prepare(
+            "SELECT r.file_id FROM checkout_acquisition_requests r
+             WHERE r.status = 'active' AND r.expires_at <= UTC_TIMESTAMP(3)
+               AND (r.user_id = ? OR r.organization_id = ?)
+             ORDER BY r.expires_at, r.file_id LIMIT {$requestLimit}"
+        );
+        $requestCandidates->execute([$userId, $organizationId]);
+        $fileIds = array_values(array_unique([
+            ...array_column($checkoutCandidates->fetchAll(PDO::FETCH_ASSOC), 'file_id'),
+            ...array_column($requestCandidates->fetchAll(PDO::FETCH_ASSOC), 'file_id'),
+        ]));
+        sort($fileIds, SORT_STRING);
+        if ($fileIds === []) return;
+
+        try {
+            $db->beginTransaction();
+            $fileQuery = $db->prepare('SELECT id, organization_id FROM files WHERE id = ? FOR UPDATE');
+            $checkoutQuery = $db->prepare('SELECT user_id, token_hash, expires_at FROM checkouts WHERE file_id = ? FOR UPDATE');
+            $expiredRequestsQuery = $db->prepare("SELECT token_hash FROM checkout_acquisition_requests WHERE file_id = ? AND status = 'active' AND expires_at <= UTC_TIMESTAMP(3) AND (user_id = ? OR organization_id = ?) FOR UPDATE");
+            $deleteExpiredCheckout = $db->prepare('DELETE FROM checkouts WHERE file_id = ? AND token_hash = ? AND expires_at <= UTC_TIMESTAMP(3)');
+            $now = $db->query('SELECT UTC_TIMESTAMP(3)')->fetchColumn();
+            foreach ($fileIds as $fileId) {
+                $fileQuery->execute([$fileId]);
+                $file = $fileQuery->fetch(PDO::FETCH_ASSOC) ?: null;
+                if ($file === null) continue;
+
+                // All checkout writers use file -> checkout -> journal order.
+                $checkoutQuery->execute([$fileId]);
+                $checkout = $checkoutQuery->fetch(PDO::FETCH_ASSOC) ?: null;
+                $expiredRequestsQuery->execute([$fileId, $userId, $organizationId]);
+                $expiredRequests = $expiredRequestsQuery->fetchAll(PDO::FETCH_COLUMN);
+
+                $checkoutInScope = $checkout !== null
+                    && ($checkout['user_id'] === $userId || $file['organization_id'] === $organizationId);
+                if ($checkoutInScope && $checkout['expires_at'] <= $now) {
+                    self::markTerminalByHash($db, $fileId, $checkout['token_hash'], 'expired');
+                    $deleteExpiredCheckout->execute([$fileId, $checkout['token_hash']]);
+                    $checkout = null;
+                }
+
+                foreach ($expiredRequests as $tokenHash) {
+                    // A concurrent renew updates checkout and journal in one
+                    // transaction. If that exact token still owns a live lease,
+                    // preserve its encrypted replay receipt even if the stale
+                    // candidate snapshot suggested expiry.
+                    if ($checkout !== null && hash_equals($checkout['token_hash'], $tokenHash)
+                        && $checkout['expires_at'] > $now) {
+                        continue;
+                    }
+                    self::markTerminalByHash($db, $fileId, $tokenHash, 'expired');
+                }
+            }
+            $db->commit();
+        } catch (Throwable $error) {
+            if ($db->inTransaction()) $db->rollBack();
+            throw new CheckoutLeaseFailure(503, 'CHECKOUT_RECOVERY_UNAVAILABLE', 'Expired checkout cleanup is temporarily unavailable.');
+        }
+    }
+
     public static function acquireUserCheckinLock(PDO $db, string $userId): ?string
     {
         $database = $db->query('SELECT DATABASE()')->fetchColumn();
@@ -97,23 +185,40 @@ final class FileCheckout
     public static function acquireWithRequestId(PDO $db, array $env, array $principal, string $fileId, string $vaultId, string $clientWorkingPath, string $requestId): array
     {
         $requestId = strtolower($requestId);
-        if (!self::supportsRequestIds($db)) throw new CheckoutLeaseFailure(503, 'CHECKOUT_RECOVERY_UNAVAILABLE', 'This server has not enabled durable checkout recovery.');
         try {
-            $lifecycleLock = self::acquireUserLifecycleLock($db, $principal['userId']);
-        } catch (Throwable) {
-            throw new CheckoutLeaseFailure(503, 'CHECKOUT_BUSY', 'Checkout is temporarily busy; retry the same requestId.');
+            $retention = Runtime::checkoutRequestRetention($env);
+        } catch (\RuntimeException) {
+            throw new CheckoutLeaseFailure(503, 'CHECKOUT_RECOVERY_UNAVAILABLE', 'Durable checkout retention is temporarily unavailable.');
         }
-        if ($lifecycleLock === null) throw new CheckoutLeaseFailure(503, 'CHECKOUT_BUSY', 'Checkout is temporarily busy; retry the same requestId.');
-        $operationFailure = null;
+        if (!self::supportsRequestIds($db)) throw new CheckoutLeaseFailure(503, 'CHECKOUT_RECOVERY_UNAVAILABLE', 'This server has not enabled durable checkout recovery.');
         $requestLock = null;
         try {
+            $requestLock = self::acquireRequestIdLock($db, 'checkout', $principal['organizationId'], $requestId);
+        } catch (Throwable) {
+            throw new CheckoutLeaseFailure(503, 'CHECKOUT_RECOVERY_UNAVAILABLE', 'Durable checkout recovery is temporarily unavailable.');
+        }
+        if ($requestLock === null) throw new CheckoutLeaseFailure(503, 'CHECKOUT_RECOVERY_BUSY', 'Durable checkout recovery is busy; retry the same requestId.');
+        $lifecycleLock = null;
+        $organizationQuotaLock = null;
+        $operationFailure = null;
+        try {
+            try {
+                $lifecycleLock = self::acquireUserLifecycleLock($db, $principal['userId']);
+            } catch (Throwable) {
+                throw new CheckoutLeaseFailure(503, 'CHECKOUT_BUSY', 'Checkout is temporarily busy; retry the same requestId.');
+            }
+            if ($lifecycleLock === null) throw new CheckoutLeaseFailure(503, 'CHECKOUT_BUSY', 'Checkout is temporarily busy; retry the same requestId.');
             self::assertCheckoutPrincipalActive($db, $principal);
             try {
-                $requestLock = self::acquireRequestIdLock($db, 'checkout', $principal['organizationId'], $requestId);
+                $organizationQuotaLock = self::acquireOrganizationCheckoutLock($db, $principal['organizationId']);
             } catch (Throwable) {
-                throw new CheckoutLeaseFailure(503, 'CHECKOUT_RECOVERY_UNAVAILABLE', 'Durable checkout recovery is temporarily unavailable.');
+                throw new CheckoutLeaseFailure(503, 'CHECKOUT_RECOVERY_UNAVAILABLE', 'Checkout request quota enforcement is temporarily unavailable.');
             }
-            if ($requestLock === null) throw new CheckoutLeaseFailure(503, 'CHECKOUT_RECOVERY_BUSY', 'Durable checkout recovery is busy; retry the same requestId.');
+            if ($organizationQuotaLock === null) throw new CheckoutLeaseFailure(503, 'CHECKOUT_RECOVERY_BUSY', 'Checkout request quota enforcement is busy; retry the same requestId.');
+            // This is a separate maintenance transaction: only already-expired
+            // leases can be terminalized, before the acquisition transaction
+            // and its quota checks begin.
+            self::terminalizeExpiredRequests($db, $principal['userId'], $principal['organizationId']);
             $fingerprint = hash('sha256', json_encode([
                 'fileId' => $fileId,
                 'vaultId' => $vaultId,
@@ -126,10 +231,14 @@ final class FileCheckout
             $file = $fileLock->fetch();
             if (!$file || $file['vault_id'] !== $vaultId) throw new CheckoutLeaseFailure(404, 'NOT_FOUND', 'File not found.');
 
-            $requestQuery = $db->prepare('SELECT user_id, file_id, vault_id, client_working_path, request_fingerprint, token_hash, token_ciphertext, expires_at, status FROM checkout_acquisition_requests WHERE organization_id = ? AND request_id = ?');
+            $cutoff = 'DATE_SUB(UTC_TIMESTAMP(3), INTERVAL ' . $retention['ttlDays'] . ' DAY)';
+            $requestQuery = $db->prepare('SELECT user_id, file_id, vault_id, client_working_path, request_fingerprint, token_hash, token_ciphertext, expires_at, status, updated_at FROM checkout_acquisition_requests WHERE organization_id = ? AND request_id = ?');
             $requestQuery->execute([$principal['organizationId'], $requestId]);
             $request = $requestQuery->fetch();
-            if ($request) {
+            $expiredRequestId = $request
+                && $request['status'] !== 'active'
+                && $request['updated_at'] <= $db->query('SELECT ' . $cutoff)->fetchColumn();
+            if ($request && !$expiredRequestId) {
                 if ($request['user_id'] !== $principal['userId']) throw new CheckoutLeaseFailure(404, 'NOT_FOUND', 'File not found.');
                 $sameRequest = $request['file_id'] === $fileId
                     && $request['vault_id'] === $vaultId
@@ -182,6 +291,29 @@ final class FileCheckout
             if ($lease && (int)$lease['lease_active'] === 1) {
                 throw new CheckoutLeaseFailure(409, 'CHECKED_OUT', 'File is checked out by another client.');
             }
+
+            $activeOrRetainedTerminal = "(status = 'active' OR (status <> 'active' AND updated_at > {$cutoff}))";
+            $counts = [
+                ['SELECT COUNT(*) FROM checkout_acquisition_requests WHERE file_id = ? AND ' . $activeOrRetainedTerminal, [$fileId], $retention['perFile'], 'file'],
+                ['SELECT COUNT(*) FROM checkout_acquisition_requests WHERE user_id = ? AND ' . $activeOrRetainedTerminal, [$principal['userId']], $retention['perUser'], 'user'],
+                ['SELECT COUNT(*) FROM checkout_acquisition_requests WHERE organization_id = ? AND ' . $activeOrRetainedTerminal, [$principal['organizationId']], $retention['perOrganization'], 'organization'],
+            ];
+            foreach ($counts as [$sql, $parameters, $limit, $scope]) {
+                $countQuery = $db->prepare($sql);
+                $countQuery->execute($parameters);
+                if ((int)$countQuery->fetchColumn() >= $limit) {
+                    throw new CheckoutLeaseFailure(429, 'CHECKOUT_REQUEST_QUOTA_EXCEEDED', 'The ' . $scope . ' checkout request limit has been reached; retry after terminal requests expire.');
+                }
+            }
+
+            // Retain active requests regardless of row age: they hold recovery
+            // tokens for live leases. Only terminal rows past their retention
+            // window are eligible for bounded cleanup, after quota acceptance.
+            $db->exec("DELETE FROM checkout_acquisition_requests WHERE status <> 'active' AND updated_at <= {$cutoff} ORDER BY updated_at ASC LIMIT 500");
+            if ($expiredRequestId) {
+                $deleteExpiredRequest = $db->prepare('DELETE FROM checkout_acquisition_requests WHERE organization_id = ? AND request_id = ? AND status <> \'active\' AND updated_at <= ' . $cutoff);
+                $deleteExpiredRequest->execute([$principal['organizationId'], $requestId]);
+            }
             if ($lease) {
                 self::markTerminalByHash($db, $fileId, $lease['token_hash'], 'expired');
                 $db->prepare('DELETE FROM checkouts WHERE file_id = ?')->execute([$fileId]);
@@ -205,15 +337,13 @@ final class FileCheckout
             throw $error;
         } finally {
             $releaseFailed = false;
-            try {
-                if ($requestLock !== null && !self::releaseRequestIdLock($db, $requestLock)) $releaseFailed = true;
-            } catch (Throwable) {
-                $releaseFailed = true;
-            }
-            try {
-                if (!self::releaseUserLifecycleLock($db, $lifecycleLock)) $releaseFailed = true;
-            } catch (Throwable) {
-                $releaseFailed = true;
+            foreach ([$organizationQuotaLock, $lifecycleLock, $requestLock] as $lock) {
+                if ($lock === null) continue;
+                try {
+                    if (!self::releaseRequestIdLock($db, $lock)) $releaseFailed = true;
+                } catch (Throwable) {
+                    $releaseFailed = true;
+                }
             }
             if ($releaseFailed && $operationFailure === null) throw new CheckoutLeaseFailure(503, 'CHECKOUT_RECOVERY_UNAVAILABLE', 'The checkout result should be retried with the same requestId.');
         }
@@ -280,9 +410,9 @@ final class FileCheckout
     public static function supportsRequestIds(PDO $db): bool
     {
         try {
-            $query = $db->prepare('SELECT 1 FROM schema_migrations m JOIN information_schema.TABLES t ON t.TABLE_SCHEMA = DATABASE() AND t.TABLE_NAME = \'checkout_acquisition_requests\' WHERE m.migration = ? LIMIT 1');
-            $query->execute(['036_checkout_request_idempotency.sql']);
-            return (bool)$query->fetchColumn();
+            $query = $db->prepare('SELECT COUNT(DISTINCT m.migration) FROM schema_migrations m JOIN information_schema.TABLES t ON t.TABLE_SCHEMA = DATABASE() AND t.TABLE_NAME = \'checkout_acquisition_requests\' WHERE m.migration IN (?, ?)');
+            $query->execute(['036_checkout_request_idempotency.sql', '039_checkout_request_retention_indexes.sql']);
+            return (int)$query->fetchColumn() === 2;
         } catch (Throwable) {
             return false;
         }
