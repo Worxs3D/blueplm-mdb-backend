@@ -105,28 +105,28 @@ final class FileCheckout
         // an expired lease or an orphaned due journal can trigger cleanup.
         $leaseLimit = intdiv($limit, 2);
         $requestLimit = $limit - $leaseLimit;
-        $checkoutCandidates = $db->prepare(
-            "SELECT c.file_id FROM checkouts c JOIN files f ON f.id = c.file_id
-             WHERE c.expires_at <= UTC_TIMESTAMP(3)
-               AND (c.user_id = ? OR f.organization_id = ?)
-             ORDER BY c.expires_at, c.file_id LIMIT {$leaseLimit}"
-        );
-        $checkoutCandidates->execute([$userId, $organizationId]);
-        $requestCandidates = $db->prepare(
-            "SELECT r.file_id FROM checkout_acquisition_requests r
-             WHERE r.status = 'active' AND r.expires_at <= UTC_TIMESTAMP(3)
-               AND (r.user_id = ? OR r.organization_id = ?)
-             ORDER BY r.expires_at, r.file_id LIMIT {$requestLimit}"
-        );
-        $requestCandidates->execute([$userId, $organizationId]);
-        $fileIds = array_values(array_unique([
-            ...array_column($checkoutCandidates->fetchAll(PDO::FETCH_ASSOC), 'file_id'),
-            ...array_column($requestCandidates->fetchAll(PDO::FETCH_ASSOC), 'file_id'),
-        ]));
-        sort($fileIds, SORT_STRING);
-        if ($fileIds === []) return;
-
         try {
+            $checkoutCandidates = $db->prepare(
+                "SELECT c.file_id FROM checkouts c JOIN files f ON f.id = c.file_id
+                 WHERE c.expires_at <= UTC_TIMESTAMP(3)
+                   AND (c.user_id = ? OR f.organization_id = ?)
+                 ORDER BY c.expires_at, c.file_id LIMIT {$leaseLimit}"
+            );
+            $checkoutCandidates->execute([$userId, $organizationId]);
+            $requestCandidates = $db->prepare(
+                "SELECT r.file_id FROM checkout_acquisition_requests r
+                 WHERE r.status = 'active' AND r.expires_at <= UTC_TIMESTAMP(3)
+                   AND (r.user_id = ? OR r.organization_id = ?)
+                 ORDER BY r.expires_at, r.file_id LIMIT {$requestLimit}"
+            );
+            $requestCandidates->execute([$userId, $organizationId]);
+            $fileIds = array_values(array_unique([
+                ...array_column($checkoutCandidates->fetchAll(PDO::FETCH_ASSOC), 'file_id'),
+                ...array_column($requestCandidates->fetchAll(PDO::FETCH_ASSOC), 'file_id'),
+            ]));
+            sort($fileIds, SORT_STRING);
+            if ($fileIds === []) return;
+
             $db->beginTransaction();
             $fileQuery = $db->prepare('SELECT id, organization_id FROM files WHERE id = ? FOR UPDATE');
             $checkoutQuery = $db->prepare('SELECT user_id, token_hash, expires_at FROM checkouts WHERE file_id = ? FOR UPDATE');

@@ -6,6 +6,7 @@ require_once __DIR__ . '/../src/FileCheckin.php';
 
 use BluePlm\FileCheckout;
 use BluePlm\FileCheckin;
+use BluePlm\CheckoutLeaseFailure;
 
 final class ReleaseFaultStatement extends PDOStatement
 {
@@ -79,6 +80,64 @@ final class CheckinReleaseFaultPDO extends PDO
     }
 }
 
+final class CandidateScanFaultStatement extends PDOStatement
+{
+    public function __construct(
+        private readonly int $ordinal,
+        private readonly string $faultStage,
+        private readonly int $faultOrdinal,
+    ) {
+    }
+
+    public function execute(?array $params = null): bool
+    {
+        if ($this->faultStage === 'execute' && $this->ordinal === $this->faultOrdinal) {
+            throw new PDOException('Injected expired checkout candidate execute failure.');
+        }
+        return true;
+    }
+
+    public function fetchAll(int $mode = PDO::FETCH_DEFAULT, mixed ...$args): array
+    {
+        if ($this->faultStage === 'fetch' && $this->ordinal === $this->faultOrdinal) {
+            throw new PDOException('Injected expired checkout candidate fetch failure.');
+        }
+        return [];
+    }
+}
+
+final class CandidateScanFaultPDO extends PDO
+{
+    private int $candidateStatementOrdinal = 0;
+
+    public function __construct(
+        private readonly string $faultStage,
+        private readonly int $faultOrdinal,
+    ) {
+    }
+
+    public function prepare(string $query, array $options = []): PDOStatement|false
+    {
+        if (str_starts_with($query, 'SELECT c.file_id FROM checkouts')) {
+            $ordinal = 1;
+        } elseif (str_starts_with($query, 'SELECT r.file_id FROM checkout_acquisition_requests')) {
+            $ordinal = 2;
+        } else {
+            throw new RuntimeException('Unexpected statement in expired checkout candidate fault test.');
+        }
+        $this->candidateStatementOrdinal++;
+        if ($this->faultStage === 'prepare' && $ordinal === $this->faultOrdinal) {
+            throw new PDOException('Injected expired checkout candidate prepare failure.');
+        }
+        return new CandidateScanFaultStatement($ordinal, $this->faultStage, $this->faultOrdinal);
+    }
+
+    public function inTransaction(): bool
+    {
+        return false;
+    }
+}
+
 FileCheckout::finishUserLifecycleLock(new ReleaseFaultPDO(1, false), 'test-lock', true, null);
 FileCheckout::finishUserLifecycleLock(new ReleaseFaultPDO(0, false), 'test-lock', true, null);
 FileCheckout::finishUserLifecycleLock(new ReleaseFaultPDO(0, true), 'test-lock', true, null);
@@ -116,4 +175,35 @@ if ($releasedAll !== false || $checkinReleaseFault->attempted !== ['organization
     throw new RuntimeException('Check-in lock cleanup must attempt every lock in reverse order after a release failure.');
 }
 
-echo "Lifecycle release success, committed checkout/delete outcome, rollback-error identity, and cleanup-only failure passed.\n";
+foreach (['prepare', 'execute', 'fetch'] as $faultStage) {
+    foreach ([1, 2] as $faultOrdinal) {
+        $mapped = null;
+        try {
+            FileCheckout::terminalizeExpiredRequests(
+                new CandidateScanFaultPDO($faultStage, $faultOrdinal),
+                '00000000-0000-4000-8000-000000000001',
+                '00000000-0000-4000-8000-000000000002',
+            );
+        } catch (CheckoutLeaseFailure $error) {
+            $mapped = $error;
+        }
+        if ($mapped?->status !== 503 || $mapped->errorCode !== 'CHECKOUT_RECOVERY_UNAVAILABLE') {
+            throw new RuntimeException("Expired checkout candidate {$faultStage} failure {$faultOrdinal} must map to CHECKOUT_RECOVERY_UNAVAILABLE.");
+        }
+    }
+}
+
+$invalidSweepLimitRejected = false;
+try {
+    FileCheckout::terminalizeExpiredRequests(
+        new CandidateScanFaultPDO('prepare', 1),
+        '00000000-0000-4000-8000-000000000001',
+        '00000000-0000-4000-8000-000000000002',
+        1,
+    );
+} catch (InvalidArgumentException) {
+    $invalidSweepLimitRejected = true;
+}
+if (!$invalidSweepLimitRejected) throw new RuntimeException('Invalid sweep limits must remain an InvalidArgumentException outside the recovery mapping.');
+
+echo "Lifecycle lock release, checkout candidate scan failure mapping, and bounded-argument validation passed.\n";

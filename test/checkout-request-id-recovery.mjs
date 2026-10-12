@@ -884,6 +884,43 @@ assert.equal(queryTestDatabase(`SELECT COUNT(*) FROM checkouts WHERE file_id = '
 assert.equal(queryTestDatabase(`SELECT status, token_ciphertext IS NOT NULL FROM checkout_acquisition_requests WHERE organization_id = '${foreignOrgId}' AND request_id = '${failedRemovalForeignRequestId}';`), 'active\t1')
 assert.equal(queryTestDatabase(`SELECT COUNT(*) FROM organization_memberships WHERE organization_id = '${foreignOrgId}' AND user_id = '${failedRemovalUser.id}';`), '1')
 
+// The bounded maintenance candidate scans are part of checkout recovery's
+// availability contract: scan failures must become a retryable 503 before any
+// lease, request-ledger, or event mutation.
+const candidateScanFailurePath = `candidate-scan-failure-${randomUUID()}.sldprt`
+const candidateScanFailureFile = await request('/files/import', {
+  method: 'POST',
+  body: JSON.stringify({
+    vaultId: vault.id,
+    canonicalPath: candidateScanFailurePath,
+    fileName: candidateScanFailurePath,
+    storageRelativePath: candidateScanFailurePath,
+  }),
+}, token)
+const candidateScanFailureRequestId = randomUUID()
+const candidateScanFailureSnapshot = () => queryTestDatabase([
+  `SELECT CONCAT('file|', current_revision, '|', storage_relative_path) FROM files WHERE id = '${candidateScanFailureFile.id}';`,
+  `SELECT CONCAT('revisions|', COUNT(*)) FROM file_revisions WHERE file_id = '${candidateScanFailureFile.id}';`,
+  `SELECT CONCAT('leases|', COUNT(*)) FROM checkouts WHERE file_id = '${candidateScanFailureFile.id}';`,
+  `SELECT CONCAT('requests|', COUNT(*)) FROM checkout_acquisition_requests WHERE file_id = '${candidateScanFailureFile.id}';`,
+  `SELECT CONCAT('events|', COUNT(*)) FROM events WHERE aggregate_id = '${candidateScanFailureFile.id}';`,
+].join(' '))
+const candidateScanFailureBefore = candidateScanFailureSnapshot()
+const hiddenCheckoutsTable = `checkouts_fault_${randomUUID().replaceAll('-', '')}`
+queryTestDatabaseAsRoot(`RENAME TABLE checkouts TO \`${hiddenCheckoutsTable}\`;`)
+let candidateScanFailureResponse
+try {
+  candidateScanFailureResponse = await requestStatus(`/files/${candidateScanFailureFile.id}/checkout`, {
+    method: 'POST',
+    body: JSON.stringify({ clientWorkingPath: workspace, requestId: candidateScanFailureRequestId }),
+  }, token)
+} finally {
+  queryTestDatabaseAsRoot(`RENAME TABLE \`${hiddenCheckoutsTable}\` TO checkouts;`)
+}
+assert.equal(candidateScanFailureResponse.status, 503)
+assert.equal(candidateScanFailureResponse.body.error, 'CHECKOUT_RECOVERY_UNAVAILABLE')
+assert.equal(candidateScanFailureSnapshot(), candidateScanFailureBefore)
+
 // An exact missing-table 1146 remains compatible with legacy clients that do
 // not send request IDs; both direct ledger updates may be a no-op on old schema.
 const legacyCompatibilityFile = await request('/files/import', {
