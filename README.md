@@ -102,7 +102,14 @@ custom properties.
 The success response includes `fileId`, `revision`, `mode`,
 `contentChanged`, `metadataChanged`, `replayed`, and the persisted `file`
 snapshot. An exact replay returns that original result with `replayed: true`.
-Reusing a request ID with a different payload returns `409 IDEMPOTENCY_KEY_REUSED`;
+Reusing a persisted request ID with a different payload returns `409 IDEMPOTENCY_KEY_REUSED`;
+a request rejected before its durable result is written can be corrected and retried
+with that ID. Check-in validates the final merged custom-properties object against
+a 200,000-byte encoded JSON limit before changing files, revisions, leases, or the
+request journal. Over-limit requests fail with `400 INVALID_REQUEST` and preserve
+the lease and stored properties; legacy over-limit properties require an explicit
+bounded replacement. Exact retries of an already committed request replay its
+stored result before evaluating the current properties budget.
 a missing, expired, consumed, or mismatched checkout lease returns
 `409 INVALID_CHECKOUT`. Calls using the legacy body without
 `mode` remain accepted as content check-ins when `storageRelativePath` is

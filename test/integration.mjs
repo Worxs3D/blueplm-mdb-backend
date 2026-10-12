@@ -6,6 +6,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { runCheckoutRequestIdRecoveryTests } from './checkout-request-id-recovery.mjs'
 import { runCheckinReviewRegressionTests } from './checkin-review-regressions.mjs'
+import {
+  runCheckinDamagedJournalReplayTests,
+  runCheckinMergedCustomPropertiesBudgetTests,
+  runCheckinReplayShapeTest,
+} from './checkin-merged-custom-properties-budget.mjs'
 
 const server = process.env.BLUEPLM_PHP_TEST_SERVER ?? 'http://127.0.0.1:18080'
 const installationToken = 'integration-installation-token-must-be-at-least-32-chars'
@@ -1478,6 +1483,9 @@ const sameHashReplay = await request(`/files/${imported.id}/checkin`, {
 assert.equal(sameHashReplay.replayed, true)
 assert.equal(sameHashReplay.revision, 4)
 
+await runCheckinReplayShapeTest({ request, token, vault, workspace })
+await runCheckinDamagedJournalReplayTests({ request, requestStatus, token, vault, workspace })
+await runCheckinMergedCustomPropertiesBudgetTests({ request, requestStatus, token, vault, workspace })
 await runCheckoutRequestIdRecoveryTests({
   request, requestStatus,
   duplicatePart, imported, workspace, token, updatedMemberLogin, vault, foreignOrgId, foreignUser, sameHashRequest,

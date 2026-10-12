@@ -22,6 +22,7 @@ final class FileCheckinFailure extends \RuntimeException
 
 final class FileCheckin
 {
+    private const MAX_CUSTOM_PROPERTIES_BYTES = 200000;
     private const MAX_STORAGE_RELATIVE_PATH_BYTES = 2048;
     private const PENDING_METADATA_KEYS = ['part_number', 'description', 'revision', 'config_tabs', 'config_descriptions'];
 
@@ -73,7 +74,7 @@ final class FileCheckin
             }
         }
         $committedProperties = $body['committedCustomProperties'] ?? null;
-        if ($committedProperties !== null && (!self::isObject($committedProperties) || strlen(json_encode((object)$committedProperties, JSON_THROW_ON_ERROR)) > 200000)) throw new FileCheckinFailure(400, 'INVALID_REQUEST', 'committedCustomProperties must be a bounded object or null.');
+        if ($committedProperties !== null && (!self::isObject($committedProperties) || strlen(json_encode((object)$committedProperties, JSON_THROW_ON_ERROR)) > self::MAX_CUSTOM_PROPERTIES_BYTES)) throw new FileCheckinFailure(400, 'INVALID_REQUEST', 'committedCustomProperties must be a bounded object or null.');
         if (array_key_exists('comment', $body) && $body['comment'] !== null && !is_string($body['comment'])) throw new FileCheckinFailure(400, 'INVALID_REQUEST', 'comment must be a string or null.');
         $comment = is_string($body['comment'] ?? null) ? substr($body['comment'], 0, 4000) : null;
         $partNumberPresent = array_key_exists('partNumber', $body) || (is_array($pending) && array_key_exists('part_number', $pending));
@@ -112,7 +113,16 @@ final class FileCheckin
                 $prior->execute([$principal['organizationId'], $requestId]); $existing = $prior->fetch();
                 if ($existing) {
                     if ($existing['file_id'] !== $fileId || $existing['user_id'] !== $principal['userId'] || !hash_equals($existing['request_fingerprint'], $fingerprint)) throw new FileCheckinFailure(409, 'IDEMPOTENCY_KEY_REUSED', 'requestId was already used with a different check-in request.');
-                    $db->commit(); $response = json_decode($existing['response'], true, 512, JSON_THROW_ON_ERROR); $response['replayed'] = true; return $response;
+                    try {
+                        $storedResponse = json_decode($existing['response'], false, 512, JSON_THROW_ON_ERROR);
+                    } catch (\JsonException) {
+                        throw new FileCheckinFailure(503, 'CHECKIN_RECOVERY_UNAVAILABLE', 'The stored check-in result is unavailable; retry the same requestId.');
+                    }
+                    if (!$storedResponse instanceof \stdClass) throw new FileCheckinFailure(503, 'CHECKIN_RECOVERY_UNAVAILABLE', 'The stored check-in result is unavailable; retry the same requestId.');
+                    $response = (array)$storedResponse;
+                    $response['replayed'] = true;
+                    $db->commit();
+                    return $response;
                 }
             }
 
@@ -132,6 +142,7 @@ final class FileCheckin
                 }
             }
             $propertiesJson = $currentProperties === [] && $file['custom_properties'] === null && $committedProperties === null && !is_array($pending) ? null : json_encode((object)$currentProperties, JSON_THROW_ON_ERROR);
+            if ($propertiesJson !== null && strlen($propertiesJson) > self::MAX_CUSTOM_PROPERTIES_BYTES) throw new FileCheckinFailure(400, 'INVALID_REQUEST', 'Merged custom properties exceed the supported size.');
             $description = is_array($pending) && array_key_exists('description', $pending) ? $pending['description'] : $file['description'];
             $revisionLabel = is_array($pending) && array_key_exists('revision', $pending) ? $pending['revision'] : $file['revision_label'];
             $nextRevision = (int)$file['current_revision'];
