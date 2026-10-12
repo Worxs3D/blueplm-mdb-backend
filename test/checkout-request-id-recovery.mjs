@@ -3,6 +3,8 @@ import { execFileSync, spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { performance } from 'node:perf_hooks'
 
+const SECOND_ORG_MEMBERSHIP_AGE_DAYS = 1
+
 function queryTestDatabase(sql) {
   return execFileSync('docker', [
     'compose', '-f', 'docker-compose.test.yml', 'exec', '-T', 'mariadb',
@@ -554,13 +556,18 @@ await request(`/files/${removalFile.id}/checkout`, {
 }, removalLogin.token)
 const secondOrgRemovalFileId = randomUUID()
 const secondOrgRemovalRequestId = randomUUID()
-const secondOrgRemovalLeaseHash = 'e'.repeat(64)
 queryTestDatabase(`
-  INSERT INTO organization_memberships (organization_id, user_id, role) VALUES ('${foreignOrgId}', '${removalUser.id}', 'member');
+  INSERT INTO organization_memberships (organization_id, user_id, role, created_at) VALUES ('${foreignOrgId}', '${removalUser.id}', 'member', DATE_SUB(UTC_TIMESTAMP(3), INTERVAL ${SECOND_ORG_MEMBERSHIP_AGE_DAYS} DAY));
+  INSERT INTO vault_access (vault_id, user_id, granted_by) VALUES ('${foreignLeaseVaultId}', '${removalUser.id}', '${foreignUser.id}');
   INSERT INTO files (id, organization_id, vault_id, canonical_path, file_name, storage_relative_path) VALUES ('${secondOrgRemovalFileId}', '${foreignOrgId}', '${foreignLeaseVaultId}', 'foreign/same-user.sldprt', 'same-user.sldprt', 'foreign/same-user.sldprt');
-  INSERT INTO checkouts (file_id, user_id, token_hash, client_working_path, expires_at) VALUES ('${secondOrgRemovalFileId}', '${removalUser.id}', '${secondOrgRemovalLeaseHash}', 'C:/foreign-workspace', DATE_ADD(UTC_TIMESTAMP(3), INTERVAL 1 HOUR));
-  INSERT INTO checkout_acquisition_requests (organization_id, request_id, user_id, file_id, vault_id, client_working_path, request_fingerprint, token_hash, token_ciphertext, expires_at, status) VALUES ('${foreignOrgId}', '${secondOrgRemovalRequestId}', '${removalUser.id}', '${secondOrgRemovalFileId}', '${foreignLeaseVaultId}', 'C:/foreign-workspace', '${'b'.repeat(64)}', '${secondOrgRemovalLeaseHash}', 'same-user-foreign-org-ciphertext', DATE_ADD(UTC_TIMESTAMP(3), INTERVAL 1 HOUR), 'active');
 `)
+const removalForeignLogin = await request('/auth/login', {
+  method: 'POST', body: JSON.stringify({ email: 'lease-removal@example.test', password: 'Lease removal password 123!' }),
+})
+assert.equal((await request('/organizations/current', {}, removalForeignLogin.token)).organization.id, foreignOrgId)
+const secondOrgRemovalLease = await request(`/files/${secondOrgRemovalFileId}/checkout`, {
+  method: 'POST', body: JSON.stringify({ clientWorkingPath: workspace, requestId: secondOrgRemovalRequestId }),
+}, removalForeignLogin.token)
 const removalLockHolder = spawnCheckoutCancelLockHolder(removalFile.id, testOrganizationId)
 await waitForOutput(removalLockHolder, 'READY')
 const removalAdditionalFile = await request('/files/import', {
@@ -599,8 +606,13 @@ assert.deepEqual(checkoutRequestState(removalRequestId), { status: 'cancelled', 
 assert.equal(queryTestDatabase(`SELECT COUNT(*) FROM checkouts WHERE file_id = '${removalFile.id}';`), '0')
 assert.deepEqual(checkoutRequestState(removalAdditionalRequestId), { status: 'cancelled', tokenPurged: true })
 assert.equal(queryTestDatabase(`SELECT COUNT(*) FROM checkouts WHERE file_id = '${removalAdditionalFile.id}';`), '0')
-assert.equal(queryTestDatabase(`SELECT status, token_ciphertext IS NOT NULL FROM checkout_acquisition_requests WHERE organization_id = '${foreignOrgId}' AND request_id = '${secondOrgRemovalRequestId}';`), 'active\t1')
-assert.equal(queryTestDatabase(`SELECT COUNT(*) FROM checkouts WHERE file_id = '${secondOrgRemovalFileId}' AND user_id = '${removalUser.id}';`), '1')
+assert.equal((await requestStatus('/organizations/current', {}, removalForeignLogin.token)).status, 200)
+assert.equal(queryTestDatabase(`SELECT disabled_at IS NOT NULL FROM users WHERE id = '${removalUser.id}';`), '0')
+assert.equal((await requestStatus(`/files/${secondOrgRemovalFileId}/checkout/cancel`, {
+  method: 'POST', body: JSON.stringify({ checkoutToken: secondOrgRemovalLease.checkoutToken }),
+}, removalForeignLogin.token)).status, 204)
+assert.equal(queryTestDatabase(`SELECT status, token_ciphertext IS NULL FROM checkout_acquisition_requests WHERE organization_id = '${foreignOrgId}' AND request_id = '${secondOrgRemovalRequestId}';`), 'cancelled\t1')
+assert.equal(queryTestDatabase(`SELECT COUNT(*) FROM checkouts WHERE file_id = '${secondOrgRemovalFileId}' AND user_id = '${removalUser.id}';`), '0')
 assert.equal(queryTestDatabase(`SELECT status, token_ciphertext IS NOT NULL FROM checkout_acquisition_requests WHERE organization_id = '${foreignOrgId}' AND request_id = '${foreignLeaseRequestId}';`), 'active\t1')
 assert.equal(queryTestDatabase(`SELECT COUNT(*) FROM checkouts WHERE file_id = '${foreignLeaseFileId}' AND user_id = '${foreignUser.id}';`), '1')
 
@@ -759,6 +771,7 @@ const retriedBusyUserRemoval = await requestStatus(`/users/${busyLifecycleUser.i
 assert.equal(retriedBusyUserRemoval.status, 204)
 assert.deepEqual(checkoutRequestState(busyLifecycleRequestId), { status: 'cancelled', tokenPurged: true })
 assert.equal(queryTestDatabase(`SELECT COUNT(*) FROM checkouts WHERE file_id IN ('${busyLifecycleDurableFile.id}', '${busyLifecycleLegacyFile.id}');`), '0')
+assert.equal(queryTestDatabase(`SELECT disabled_at IS NOT NULL FROM users WHERE id = '${busyLifecycleUser.id}';`), '1')
 
 const selfRemovalUser = await request('/users', {
   method: 'POST', body: JSON.stringify({ email: 'self-removal@example.test', displayName: 'Self Removal', password: 'Self removal password 123!' }),
@@ -866,7 +879,7 @@ assert.equal(queryTestDatabase(`SELECT COUNT(*) FROM checkouts WHERE file_id = '
 assert.deepEqual(checkoutRequestState(failedRemovalRequestId), { status: 'cancelled', tokenPurged: true })
 assert.equal(queryTestDatabase(`SELECT COUNT(*) FROM organization_memberships WHERE organization_id = '${testOrganizationId}' AND user_id = '${failedRemovalUser.id}';`), '0')
 assert.equal(queryTestDatabase(`SELECT COUNT(*) FROM sessions WHERE user_id = '${failedRemovalUser.id}';`), '0')
-assert.equal(queryTestDatabase(`SELECT disabled_at IS NOT NULL FROM users WHERE id = '${failedRemovalUser.id}';`), '1')
+assert.equal(queryTestDatabase(`SELECT disabled_at IS NOT NULL FROM users WHERE id = '${failedRemovalUser.id}';`), '0')
 assert.equal(queryTestDatabase(`SELECT COUNT(*) FROM checkouts WHERE file_id = '${failedRemovalForeignFileId}' AND user_id = '${failedRemovalUser.id}';`), '1')
 assert.equal(queryTestDatabase(`SELECT status, token_ciphertext IS NOT NULL FROM checkout_acquisition_requests WHERE organization_id = '${foreignOrgId}' AND request_id = '${failedRemovalForeignRequestId}';`), 'active\t1')
 assert.equal(queryTestDatabase(`SELECT COUNT(*) FROM organization_memberships WHERE organization_id = '${foreignOrgId}' AND user_id = '${failedRemovalUser.id}';`), '1')

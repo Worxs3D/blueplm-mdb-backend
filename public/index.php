@@ -1232,7 +1232,7 @@ try {
             foreach ($terminalizedFileIds as $fileId) $deleteCheckout->execute([$fileId, $targetId]);
             $db->prepare('DELETE FROM sessions WHERE user_id = ? AND organization_id = ?')->execute([$targetId, $principal['organizationId']]);
             $db->prepare('DELETE FROM organization_memberships WHERE user_id = ? AND organization_id = ?')->execute([$targetId, $principal['organizationId']]);
-            $db->prepare('UPDATE users SET disabled_at = UTC_TIMESTAMP(3) WHERE id = ?')->execute([$targetId]);
+            $db->prepare('UPDATE users SET disabled_at = UTC_TIMESTAMP(3) WHERE id = ? AND NOT EXISTS (SELECT 1 FROM organization_memberships WHERE user_id = ?)')->execute([$targetId, $targetId]);
             Runtime::emitEvent($db, $principal['organizationId'], 'user.removed', $targetId, ['userId' => $targetId, 'removedBy' => $principal['userId']]);
             $db->commit();
             $committed = true;
