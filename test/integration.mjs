@@ -7,6 +7,10 @@ import { join } from 'node:path'
 import { runCheckoutRequestIdRecoveryTests } from './checkout-request-id-recovery.mjs'
 import { runCheckinReviewRegressionTests } from './checkin-review-regressions.mjs'
 import {
+  assertColorSwatchesReadOnly,
+  runColorSwatchesIntegration,
+} from './color-swatches-integration.mjs'
+import {
   runCheckinDamagedJournalReplayTests,
   runCheckinMergedCustomPropertiesBudgetTests,
   runCheckinReplayShapeTest,
@@ -116,6 +120,10 @@ async function waitForHealth() {
 }
 
 await waitForHealth()
+execFileSync('docker', [
+  'compose', '-f', 'docker-compose.test.yml', 'exec', '-T', 'api',
+  'php', 'tests/color-swatches-route-contract.php',
+], { cwd: process.cwd(), stdio: 'pipe' })
 execFileSync(
   'docker',
   ['compose', '-f', 'docker-compose.test.yml', 'exec', '-T', 'api', 'php', 'test/env-parser.php'],
@@ -155,6 +163,10 @@ const installed = await request('/installer/commit', {
 })
 assert.equal(typeof installed.token, 'string')
 assert.equal(installed.bootstrapped, true)
+execFileSync('docker', [
+  'compose', '-f', 'docker-compose.test.yml', 'exec', '-T', 'api',
+  'php', 'test/color-swatches-migration.php',
+], { cwd: process.cwd(), stdio: 'pipe' })
 const rejectedMaintenance = await requestStatus('/admin/migrate', {
   method: 'POST',
   body: JSON.stringify({ maintenanceToken: 'wrong-maintenance-token' }),
@@ -407,6 +419,15 @@ assert.equal((await requestStatus(`/suppliers/${foreignSupplier.supplier.id}`, {
 assert.equal((await requestStatus(`/suppliers/${foreignSupplier.supplier.id}`, { method: 'DELETE' }, token)).status, 404)
 const foreignAfterIsolationCheck = await request('/suppliers', {}, foreignLogin.token)
 assert.equal(foreignAfterIsolationCheck.suppliers.some((entry) => entry.id === foreignSupplier.supplier.id && entry.name === 'Foreign Supplier'), true)
+
+// Viewer/guest swatch reads run later, after their accounts and sessions exist.
+const colorSwatchFixture = await runColorSwatchesIntegration({
+  request,
+  requestStatus,
+  ownerToken: token,
+  memberToken: updatedMemberLogin.token,
+  foreignAdminToken: foreignLogin.token,
+})
 
 // Workflow roles are separate organization data. Account roles must not create
 // or imply workflow-role assignments, and only organization administrators may
@@ -973,6 +994,16 @@ for (const readOnlyToken of [viewerLogin.token, guestLogin.token]) {
   assert.equal(deniedWrite.status, 403)
   assert.equal((await deniedWrite.json()).error, 'READ_ONLY_ROLE')
 }
+await assertColorSwatchesReadOnly({
+  request,
+  requestStatus,
+  readOnlyUsers: [
+    { token: viewerLogin.token, userId: viewer.id, role: 'viewer' },
+    { token: guestLogin.token, userId: guest.id, role: 'guest' },
+  ],
+  organizationSwatchId: colorSwatchFixture.organizationSwatchId,
+  ownerPersonalSwatchId: colorSwatchFixture.ownerPersonalSwatchId,
+})
 
 for (const removedPortal of ['/setup/', '/admin/']) {
   const response = await fetch(`${server}${removedPortal}`)

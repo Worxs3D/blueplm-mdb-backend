@@ -1,0 +1,25 @@
+services:
+  mariadb:
+    labels:
+      com.blueplm.test.source: mdb-color-swatches-php
+      com.blueplm.test.project: ${COMPOSE_PROJECT_NAME:?Set a unique COMPOSE_PROJECT_NAME}
+    volumes:
+      - swatches-mariadb-data:/var/lib/mysql
+
+  api:
+    labels:
+      com.blueplm.test.source: mdb-color-swatches-php
+      com.blueplm.test.project: ${COMPOSE_PROJECT_NAME:?Set a unique COMPOSE_PROJECT_NAME}
+    ports: !override
+      - 127.0.0.1:${BLUEPLM_PHP_TEST_PORT:-18080}:80
+
+volumes:
+  swatches-mariadb-data:
+    name: ${COMPOSE_PROJECT_NAME:?Set a unique COMPOSE_PROJECT_NAME}-mdb-color-swatches-mariadb-data
+
+networks:
+  default:
+    name: ${COMPOSE_PROJECT_NAME:?Set a unique COMPOSE_PROJECT_NAME}_default
+    ipam:
+      config:
+        - subnet: ${BLUEPLM_PHP_TEST_SUBNET:?Set a verified unused test subnet}
