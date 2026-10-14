@@ -112,6 +112,45 @@ final class Runtime
         return gmdate('Y-m-d H:i:s.v', time() + $minutes * 60);
     }
 
+    /** @param array<string, string> $env @return array{ttlDays:int, perFile:int, perUser:int, perOrganization:int} */
+    public static function checkinRequestRetention(array $env): array
+    {
+        return [
+            'ttlDays' => self::positiveIntegerSetting($env, 'BLUEPLM_CHECKIN_REQUEST_TTL_DAYS', 30),
+            'perFile' => self::positiveIntegerSetting($env, 'BLUEPLM_CHECKIN_REQUEST_MAX_PER_FILE', 200),
+            'perUser' => self::positiveIntegerSetting($env, 'BLUEPLM_CHECKIN_REQUEST_MAX_PER_USER', 1000),
+            'perOrganization' => self::positiveIntegerSetting($env, 'BLUEPLM_CHECKIN_REQUEST_MAX_PER_ORGANIZATION', 10000),
+        ];
+    }
+
+    /** @param array<string, string> $env @return array{ttlDays:int, perFile:int, perUser:int, perOrganization:int} */
+    public static function checkoutRequestRetention(array $env): array
+    {
+        return [
+            'ttlDays' => self::positiveIntegerSetting($env, 'BLUEPLM_CHECKOUT_REQUEST_TTL_DAYS', 30),
+            'perFile' => self::positiveIntegerSetting($env, 'BLUEPLM_CHECKOUT_REQUEST_MAX_PER_FILE', 200),
+            'perUser' => self::positiveIntegerSetting($env, 'BLUEPLM_CHECKOUT_REQUEST_MAX_PER_USER', 1000),
+            'perOrganization' => self::positiveIntegerSetting($env, 'BLUEPLM_CHECKOUT_REQUEST_MAX_PER_ORGANIZATION', 10000),
+        ];
+    }
+
+    /** @param array<string, string> $env */
+    private static function positiveIntegerSetting(array $env, string $key, int $default): int
+    {
+        if (!array_key_exists($key, $env)) return $default;
+        $value = $env[$key];
+        if (!is_string($value) || !preg_match('/^[1-9][0-9]*$/', $value)) {
+            throw new \RuntimeException($key . ' must be a positive integer.');
+        }
+        $parsed = filter_var($value, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1, 'max_range' => PHP_INT_MAX]]);
+        $isRetentionTtl = str_ends_with($key, '_REQUEST_TTL_DAYS');
+        if (!is_int($parsed) || ($isRetentionTtl && $parsed > 3650)) {
+            $range = $isRetentionTtl ? 'between 1 and 3650' : 'a positive integer';
+            throw new \RuntimeException($key . ' must be ' . $range . '.');
+        }
+        return $parsed;
+    }
+
     /** @param array<string, mixed> $principal */
     public static function requireVault(PDO $db, array $principal, string $vaultId): array
     {
@@ -143,7 +182,9 @@ final class Runtime
         }
         if (!is_file($path)) return $values;
         $section = '';
-        foreach (file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [] as $line) {
+        $lines = file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [];
+        $escapedEnvironment = in_array('BLUEPLM_ENV_FORMAT=2', array_map('trim', $lines), true);
+        foreach ($lines as $line) {
             $line = trim($line);
             if ($line === '' || str_starts_with($line, '#')) continue;
             if (preg_match('/^\[([^\]]+)]$/', $line, $matches)) {
@@ -153,7 +194,7 @@ final class Runtime
             if (!str_contains($line, '=')) continue;
             [$key, $value] = explode('=', $line, 2);
             $key = trim($key);
-            $value = trim($value, " \t\n\r\0\x0B\"");
+            $value = self::parseEnvironmentValue($value, $escapedEnvironment);
             // The shared project configuration predates the MDB adapter
             // and keeps database values in an INI-like [Mariadb] section.
             // Map only that local section; explicit MARIADB_* variables always
@@ -173,18 +214,55 @@ final class Runtime
         return $values;
     }
 
+    private static function parseEnvironmentValue(string $value, bool $escapedEnvironment): string
+    {
+        $value = trim($value);
+        if (!$escapedEnvironment) return trim($value, " \t\n\r\0\x0B\"");
+        if (strlen($value) < 2 || $value[0] !== '"' || $value[strlen($value) - 1] !== '"') {
+            return trim($value, " \t\n\r\0\x0B\"");
+        }
+
+        $quoted = substr($value, 1, -1);
+        $decoded = '';
+        $length = strlen($quoted);
+        for ($index = 0; $index < $length; $index++) {
+            $character = $quoted[$index];
+            if ($character !== '\\' || $index + 1 >= $length) {
+                $decoded .= $character;
+                continue;
+            }
+
+            $escaped = $quoted[++$index];
+            $decoded .= match ($escaped) {
+                '\\' => '\\',
+                '"' => '"',
+                '$' => '$',
+                'n' => "\n",
+                'r' => "\r",
+                default => '\\' . $escaped,
+            };
+        }
+        return $decoded;
+    }
+
     /** @param array<string, string> $env */
-    public static function database(array $env): PDO
+    public static function database(array $env, ?int $connectionTimeoutSeconds = null): PDO
     {
         foreach (['MARIADB_HOST', 'MARIADB_DATABASE', 'MARIADB_USER', 'MARIADB_PASSWORD'] as $key) {
             if (!isset($env[$key]) || $env[$key] === '') throw new \RuntimeException("Missing {$key}.");
         }
         $port = $env['MARIADB_PORT'] ?? '3306';
+        $options = [
+            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+            PDO::ATTR_EMULATE_PREPARES => false,
+        ];
+        if ($connectionTimeoutSeconds !== null) $options[PDO::ATTR_TIMEOUT] = max(1, $connectionTimeoutSeconds);
         return new PDO(
             "mysql:host={$env['MARIADB_HOST']};port={$port};dbname={$env['MARIADB_DATABASE']};charset=utf8mb4",
             $env['MARIADB_USER'],
             $env['MARIADB_PASSWORD'],
-            [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC, PDO::ATTR_EMULATE_PREPARES => false],
+            $options,
         );
     }
 

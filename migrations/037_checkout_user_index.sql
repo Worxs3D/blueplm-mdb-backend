@@ -1,0 +1,2 @@
+-- Migrator ensures a leading checkouts.user_id index without duplicating the
+-- index InnoDB may already have created for the existing user foreign key.

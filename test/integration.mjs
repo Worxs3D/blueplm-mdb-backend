@@ -4,6 +4,13 @@ import { createHmac, generateKeyPairSync, randomUUID, sign } from 'node:crypto'
 import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { runCheckoutRequestIdRecoveryTests } from './checkout-request-id-recovery.mjs'
+import { runCheckinReviewRegressionTests } from './checkin-review-regressions.mjs'
+import {
+  runCheckinDamagedJournalReplayTests,
+  runCheckinMergedCustomPropertiesBudgetTests,
+  runCheckinReplayShapeTest,
+} from './checkin-merged-custom-properties-budget.mjs'
 
 const server = process.env.BLUEPLM_PHP_TEST_SERVER ?? 'http://127.0.0.1:18080'
 const installationToken = 'integration-installation-token-must-be-at-least-32-chars'
@@ -109,6 +116,21 @@ async function waitForHealth() {
 }
 
 await waitForHealth()
+execFileSync(
+  'docker',
+  ['compose', '-f', 'docker-compose.test.yml', 'exec', '-T', 'api', 'php', 'test/env-parser.php'],
+  { cwd: process.cwd(), stdio: 'pipe' },
+)
+execFileSync(
+  'docker',
+  ['compose', '-f', 'docker-compose.test.yml', 'exec', '-T', 'api', 'php', 'test/checkin-retention-config.php'],
+  { cwd: process.cwd(), stdio: 'pipe' },
+)
+execFileSync(
+  'docker',
+  ['compose', '-f', 'docker-compose.test.yml', 'exec', '-T', 'api', 'php', 'test/checkout-lifecycle-lock-release.php'],
+  { cwd: process.cwd(), stdio: 'pipe' },
+)
 const corsResponse = await fetch(`${server}/health`, { headers: { Origin: 'null' } })
 assert.equal(corsResponse.headers.get('access-control-allow-origin'), 'null')
 const deniedInstall = await fetch(`${server}/installer/commit`, {
@@ -972,6 +994,7 @@ const migrated = await request('/installer/commit', {
   body: JSON.stringify({ installationToken, action: 'migrate' }),
 })
 assert.equal(migrated.bootstrapped, false)
+assert.ok((await request('/health')).capabilities.includes('checkoutRequestIdempotency'))
 const usersAfterMigration = await request('/users', {}, token)
 assert.ok(usersAfterMigration.users.some((user) => user.email === 'renamed.member@example.test'))
 const imported = await request(
@@ -1221,5 +1244,262 @@ assert.equal(
   (await request('/organizations/current/serialization/exists?serial=PN-00043', {}, token)).exists,
   true,
 )
+
+// Check-in mode, metadata and lease consumption share one transaction. The
+// durable request ID makes a successful retry replay its original response.
+const duplicatePart = await request('/files/import', {
+  method: 'POST',
+  body: JSON.stringify({
+    vaultId: vault.id,
+    canonicalPath: 'duplicate-part.sldprt',
+    storageRelativePath: 'duplicate-part.sldprt',
+    fileName: 'duplicate-part.sldprt',
+    partNumber: 'PN-DUPLICATE-CHECKIN',
+    contentHash: 'b'.repeat(64),
+    sizeBytes: 1,
+  }),
+}, token)
+const retryCheckout = await request(`/files/${imported.id}/checkout`, {
+  method: 'POST', body: JSON.stringify({ clientWorkingPath: workspace }),
+}, token)
+const explicitContentFields = {
+  mode: 'content',
+  requestId: randomUUID(),
+  canonicalPath: 'parts/hash-size-validation.sldprt',
+  fileName: 'hash-size-validation.sldprt',
+  checkoutToken: retryCheckout.checkoutToken,
+  storageRelativePath: 'immutable/hash-size-validation.sldprt',
+}
+for (const incompletePayload of [
+  { ...explicitContentFields, requestId: randomUUID(), sizeBytes: 0 },
+  { ...explicitContentFields, requestId: randomUUID(), contentHash: null, sizeBytes: 0 },
+  { ...explicitContentFields, requestId: randomUUID(), contentHash: 'a'.repeat(64) },
+  { ...explicitContentFields, requestId: randomUUID(), contentHash: 'a'.repeat(64), sizeBytes: null },
+]) {
+  const invalidContentResponse = await requestStatus(`/files/${imported.id}/checkin`, {
+    method: 'POST', body: JSON.stringify(incompletePayload),
+  }, token)
+  assert.equal(invalidContentResponse.status, 400)
+  assert.equal(invalidContentResponse.body.error, 'INVALID_REQUEST')
+}
+for (const invalidPath of ['../escape.sldprt', '/absolute.sldprt', 'parts\\windows.sldprt']) {
+  const invalidPathResponse = await requestStatus(`/files/${imported.id}/checkin`, {
+    method: 'POST',
+    body: JSON.stringify({
+      mode: 'content',
+      requestId: randomUUID(),
+      canonicalPath: invalidPath,
+      fileName: 'escape.sldprt',
+      checkoutToken: retryCheckout.checkoutToken,
+      storageRelativePath: 'immutable/invalid.sldprt',
+    }),
+  }, token)
+  assert.equal(invalidPathResponse.status, 400)
+  assert.equal(invalidPathResponse.body.error, 'INVALID_REQUEST')
+}
+const invalidFileNameResponse = await requestStatus(`/files/${imported.id}/checkin`, {
+  method: 'POST',
+  body: JSON.stringify({
+    mode: 'metadata-only',
+    requestId: randomUUID(),
+    canonicalPath: 'parts/actual-name.sldprt',
+    fileName: 'different-name.sldprt',
+    checkoutToken: retryCheckout.checkoutToken,
+  }),
+}, token)
+assert.equal(invalidFileNameResponse.status, 400)
+const missingPathResponse = await requestStatus(`/files/${imported.id}/checkin`, {
+  method: 'POST',
+  body: JSON.stringify({
+    mode: 'metadata-only',
+    requestId: randomUUID(),
+    checkoutToken: retryCheckout.checkoutToken,
+  }),
+}, token)
+assert.equal(missingPathResponse.status, 400)
+const failedAtomicCheckin = await requestStatus(`/files/${imported.id}/checkin`, {
+  method: 'POST',
+  body: JSON.stringify({
+    mode: 'content',
+    requestId: randomUUID(),
+    canonicalPath: 'drawings/drawing.txt',
+    fileName: 'drawing.txt',
+    checkoutToken: retryCheckout.checkoutToken,
+    storageRelativePath: 'drawing-revision-3.sldprt',
+    contentHash: 'c'.repeat(64),
+    sizeBytes: 7,
+    pendingMetadata: { part_number: 'PN-DUPLICATE-CHECKIN', description: 'must roll back' },
+  }),
+}, token)
+assert.equal(failedAtomicCheckin.status, 409)
+assert.equal(failedAtomicCheckin.body.error, 'PART_NUMBER_EXISTS')
+const fileAfterRollback = (await request(`/vaults/${vault.id}/files`, {}, token)).files.find(file => file.id === imported.id)
+assert.equal(fileAfterRollback.currentRevision, 2)
+assert.equal(fileAfterRollback.partNumber, 'PN-00043')
+assert.equal(fileAfterRollback.description, null)
+
+const duplicatePathCheckin = await requestStatus(`/files/${imported.id}/checkin`, {
+  method: 'POST',
+  body: JSON.stringify({
+    mode: 'content',
+    requestId: randomUUID(),
+    canonicalPath: 'duplicate-part.sldprt',
+    fileName: 'duplicate-part.sldprt',
+    checkoutToken: retryCheckout.checkoutToken,
+    storageRelativePath: 'immutable/revision-3.sldprt',
+    contentHash: 'c'.repeat(64),
+    sizeBytes: 7,
+  }),
+}, token)
+assert.equal(duplicatePathCheckin.status, 409)
+assert.equal(duplicatePathCheckin.body.error, 'PATH_EXISTS')
+const fileAfterPathRollback = (await request(`/vaults/${vault.id}/files`, {}, token)).files.find(file => file.id === imported.id)
+assert.equal(fileAfterPathRollback.currentRevision, 2)
+assert.equal(fileAfterPathRollback.canonicalPath, 'drawing.txt')
+
+const contentRequest = {
+  mode: 'content',
+  requestId: randomUUID(),
+  canonicalPath: 'drawings/drawing-renamed.sldprt',
+  fileName: 'drawing-renamed.sldprt',
+  checkoutToken: retryCheckout.checkoutToken,
+  storageRelativePath: 'immutable/revision-3.sldprt',
+  contentHash: 'c'.repeat(64),
+  sizeBytes: 7,
+  comment: 'content and datacard commit atomically',
+  pendingMetadata: { part_number: 'PN-00044', description: 'New description', revision: 'B' },
+  committedCustomProperties: { category: 'mechanical', _config_tabs: { A: 'old', B: 'kept' } },
+}
+const contentResult = await request(`/files/${imported.id}/checkin`, {
+  method: 'POST', body: JSON.stringify(contentRequest),
+}, token)
+assert.deepEqual(
+  { mode: contentResult.mode, revision: contentResult.revision, contentChanged: contentResult.contentChanged, replayed: contentResult.replayed },
+  { mode: 'content', revision: 3, contentChanged: true, replayed: false },
+)
+assert.equal(contentResult.file.canonical_path, 'drawings/drawing-renamed.sldprt')
+assert.equal(contentResult.file.file_name, 'drawing-renamed.sldprt')
+assert.equal(contentResult.file.storage_relative_path, 'immutable/revision-3.sldprt')
+const contentReplay = await request(`/files/${imported.id.toUpperCase()}/checkin`, {
+  method: 'POST', body: JSON.stringify({ ...contentRequest, requestId: contentRequest.requestId.toUpperCase() }),
+}, token)
+assert.equal(contentReplay.replayed, true)
+assert.equal(contentReplay.revision, 3)
+assert.equal(contentReplay.file.canonical_path, contentResult.file.canonical_path)
+assert.equal(contentReplay.file.file_name, contentResult.file.file_name)
+assert.equal(contentReplay.file.storage_relative_path, contentResult.file.storage_relative_path)
+const conflictingReplay = await requestStatus(`/files/${imported.id}/checkin`, {
+  method: 'POST', body: JSON.stringify({ ...contentRequest, comment: 'changed payload' }),
+}, token)
+assert.equal(conflictingReplay.status, 409)
+assert.equal(conflictingReplay.body.error, 'IDEMPOTENCY_KEY_REUSED')
+assert.equal((await request(`/vaults/${vault.id}/files`, {}, token)).files.find(file => file.id === imported.id).currentRevision, 3)
+const committedRevision = (await request(`/files/${imported.id}/revisions`, {}, token)).revisions[0]
+assert.equal(committedRevision.revisionNumber, 3)
+assert.equal(committedRevision.partNumber, 'PN-00044')
+assert.deepEqual(committedRevision.customProperties, contentRequest.committedCustomProperties)
+
+const metadataCheckout = await request(`/files/${imported.id}/checkout`, {
+  method: 'POST', body: JSON.stringify({ clientWorkingPath: workspace }),
+}, token)
+const metadataRequest = {
+  mode: 'metadata-only',
+  requestId: randomUUID(),
+  canonicalPath: 'released/drawing-final.sldprt',
+  fileName: 'drawing-final.sldprt',
+  checkoutToken: metadataCheckout.checkoutToken,
+  comment: 'metadata-only update',
+  pendingMetadata: {
+    part_number: 'PN-00045',
+    description: 'Metadata without a new binary revision',
+    revision: 'C',
+    config_tabs: { A: 'new' },
+    config_descriptions: { A: 'Updated configuration' },
+  },
+  committedCustomProperties: {
+    category: 'mechanical',
+    _config_tabs: { A: 'old', B: 'kept' },
+    _config_descriptions: { A: 'Old configuration', B: 'Preserve me' },
+  },
+}
+const metadataResult = await request(`/files/${imported.id}/checkin`, {
+  method: 'POST', body: JSON.stringify(metadataRequest),
+}, token)
+assert.deepEqual(
+  { mode: metadataResult.mode, revision: metadataResult.revision, contentChanged: metadataResult.contentChanged, replayed: metadataResult.replayed },
+  { mode: 'metadata-only', revision: 3, contentChanged: false, replayed: false },
+)
+assert.equal((await request(`/vaults/${vault.id}/files`, {}, token)).files.find(file => file.id === imported.id).currentRevision, 3)
+assert.equal((await request(`/files/${imported.id}/revisions`, {}, token)).revisions.length, 3)
+const metadataReplay = await request(`/files/${imported.id}/checkin`, {
+  method: 'POST', body: JSON.stringify(metadataRequest),
+}, token)
+assert.equal(metadataReplay.replayed, true)
+assert.equal(metadataReplay.revision, 3)
+assert.equal(metadataResult.file.canonical_path, 'released/drawing-final.sldprt')
+assert.equal(metadataResult.file.file_name, 'drawing-final.sldprt')
+assert.equal(metadataReplay.file.canonical_path, metadataResult.file.canonical_path)
+assert.equal(metadataReplay.file.file_name, metadataResult.file.file_name)
+const originalContentReplay = await request(`/files/${imported.id}/checkin`, {
+  method: 'POST', body: JSON.stringify(contentRequest),
+}, token)
+assert.equal(originalContentReplay.replayed, true)
+assert.equal(originalContentReplay.file.canonical_path, 'drawings/drawing-renamed.sldprt')
+assert.equal(originalContentReplay.file.file_name, 'drawing-renamed.sldprt')
+const updatedFile = (await request(`/vaults/${vault.id}/files`, {}, token)).files.find(file => file.id === imported.id)
+assert.equal(updatedFile.canonicalPath, 'released/drawing-final.sldprt')
+assert.equal(updatedFile.fileName, 'drawing-final.sldprt')
+assert.equal(updatedFile.partNumber, 'PN-00045')
+assert.equal(updatedFile.description, 'Metadata without a new binary revision')
+assert.equal(updatedFile.revision, 'C')
+assert.deepEqual(updatedFile.customProperties, {
+  category: 'mechanical',
+  _config_tabs: { A: 'new', B: 'kept' },
+  _config_descriptions: { A: 'Updated configuration', B: 'Preserve me' },
+})
+const staleLease = await requestStatus(`/files/${imported.id}/checkin`, {
+  method: 'POST',
+  body: JSON.stringify({ ...metadataRequest, requestId: randomUUID() }),
+}, token)
+assert.equal(staleLease.status, 409)
+assert.equal(staleLease.body.error, 'INVALID_CHECKOUT')
+
+// Explicit content check-in always creates a revision, including when the
+// source restores bytes whose hash matches the preceding revision.
+const rollbackCheckout = await request(`/files/${imported.id}/checkout`, {
+  method: 'POST', body: JSON.stringify({ clientWorkingPath: workspace }),
+}, token)
+const sameHashRequest = {
+  mode: 'content',
+  requestId: randomUUID(),
+  canonicalPath: 'released/drawing-final.sldprt',
+  fileName: 'drawing-final.sldprt',
+  checkoutToken: rollbackCheckout.checkoutToken,
+  storageRelativePath: 'immutable/revision-4-rollback.sldprt',
+  contentHash: contentRequest.contentHash,
+  sizeBytes: contentRequest.sizeBytes,
+  comment: 'Restored bytes with matching hash still create a revision',
+}
+const sameHashRollback = await request(`/files/${imported.id}/checkin`, {
+  method: 'POST',
+  body: JSON.stringify(sameHashRequest),
+}, token)
+assert.equal(sameHashRollback.revision, 4)
+assert.equal(sameHashRollback.file.content_hash, contentRequest.contentHash)
+assert.equal((await request(`/files/${imported.id}/revisions`, {}, token)).revisions.length, 4)
+const sameHashReplay = await request(`/files/${imported.id}/checkin`, {
+  method: 'POST', body: JSON.stringify(sameHashRequest),
+}, token)
+assert.equal(sameHashReplay.replayed, true)
+assert.equal(sameHashReplay.revision, 4)
+
+await runCheckinReplayShapeTest({ request, token, vault, workspace })
+await runCheckinDamagedJournalReplayTests({ request, requestStatus, token, vault, workspace })
+await runCheckinMergedCustomPropertiesBudgetTests({ request, requestStatus, token, vault, workspace })
+await runCheckoutRequestIdRecoveryTests({
+  request, requestStatus,
+  duplicatePart, imported, workspace, token, updatedMemberLogin, vault, foreignOrgId, foreignUser, sameHashRequest,
+})
+await runCheckinReviewRegressionTests({ request, requestStatus, imported, vault, workspace, token })
 
 console.log('PHP API, installer lifecycle, MariaDB, and network vault integration passed.')

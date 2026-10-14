@@ -1,0 +1,22 @@
+CREATE TABLE IF NOT EXISTS checkout_acquisition_requests (
+  organization_id CHAR(36) NOT NULL,
+  request_id CHAR(36) NOT NULL,
+  user_id CHAR(36) NOT NULL,
+  file_id CHAR(36) NOT NULL,
+  vault_id CHAR(36) NOT NULL,
+  client_working_path VARCHAR(2048) NOT NULL,
+  request_fingerprint CHAR(64) NOT NULL,
+  token_hash CHAR(64) NOT NULL,
+  token_ciphertext TEXT NULL,
+  expires_at DATETIME(3) NOT NULL,
+  status ENUM('active', 'cancelled', 'consumed', 'expired') NOT NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (organization_id, request_id),
+  KEY idx_checkout_request_file_status (file_id, status, expires_at),
+  KEY idx_checkout_request_token (file_id, token_hash),
+  CONSTRAINT fk_checkout_request_org FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE,
+  CONSTRAINT fk_checkout_request_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  CONSTRAINT fk_checkout_request_file FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
+  CONSTRAINT fk_checkout_request_vault FOREIGN KEY (vault_id) REFERENCES vaults(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

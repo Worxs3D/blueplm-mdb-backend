@@ -2,6 +2,8 @@
 declare(strict_types=1);
 
 require dirname(__DIR__) . '/src/Runtime.php';
+require dirname(__DIR__) . '/src/FileCheckin.php';
+require_once dirname(__DIR__) . '/src/FileCheckout.php';
 require dirname(__DIR__) . '/src/Migrator.php';
 require dirname(__DIR__) . '/src/FileReferences.php';
 require dirname(__DIR__) . '/src/Totp.php';
@@ -10,6 +12,8 @@ require dirname(__DIR__) . '/src/DatabaseLifecycle.php';
 require dirname(__DIR__) . '/src/BundleManifest.php';
 
 use BluePlm\Migrator;
+use BluePlm\FileCheckout;
+use BluePlm\CheckoutLeaseFailure;
 use BluePlm\FileReferences;
 use BluePlm\Installation;
 use BluePlm\Runtime;
@@ -338,17 +342,26 @@ if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'OPTIONS') Runtime::respond(204);
 
 try {
     $manifest = BundleManifest::read($root);
-    if ($path === '/health') Runtime::respond(200, [
-        'ok' => true,
-        'runtime' => 'php',
-        'supabase' => false,
-        'apiVersion' => BLUEPLM_API_VERSION,
-        'capabilities' => ['backup'],
-        'bundleVersion' => $manifest['version'] ?? null,
-        'bundleReleaseVersion' => $manifest['releaseVersion'] ?? null,
-        'bundleDigest' => $manifest['digest'] ?? null,
-        'bundleFileCount' => $manifest['fileCount'] ?? null,
-    ]);
+    if ($path === '/health') {
+        $capabilities = ['backup'];
+        try {
+            if (FileCheckout::supportsRequestIds(Runtime::database($env, 3))) $capabilities[] = 'checkoutRequestIdempotency';
+        } catch (Throwable) {
+            // Health remains available during database outages, but never
+            // advertises a migration-backed capability without proof.
+        }
+        Runtime::respond(200, [
+            'ok' => true,
+            'runtime' => 'php',
+            'supabase' => false,
+            'apiVersion' => BLUEPLM_API_VERSION,
+            'capabilities' => $capabilities,
+            'bundleVersion' => $manifest['version'] ?? null,
+            'bundleReleaseVersion' => $manifest['releaseVersion'] ?? null,
+            'bundleDigest' => $manifest['digest'] ?? null,
+            'bundleFileCount' => $manifest['fileCount'] ?? null,
+        ]);
+    }
     $db = Runtime::database($env);
 
     // Shared hosting commonly has no SSH access. Schema updates therefore use
@@ -1200,21 +1213,33 @@ try {
     }
     if ($method === 'DELETE' && preg_match('#^/users/([0-9a-f-]{36})$#i', $path, $matches)) {
         if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
-        $targetId = $matches[1];
+        $targetId = strtolower($matches[1]);
         if ($targetId === $principal['userId']) Runtime::respond(400, ['error' => 'SELF_DELETE', 'message' => 'Use the account deletion flow for your own account.']);
         $target = $db->prepare('SELECT m.role FROM organization_memberships m JOIN users u ON u.id = m.user_id WHERE m.organization_id = ? AND m.user_id = ? AND u.disabled_at IS NULL');
         $target->execute([$principal['organizationId'], $targetId]); $targetRow = $target->fetch();
         if (!$targetRow) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'User not found.']);
         if ($targetRow['role'] === 'owner') { $owners = $db->prepare("SELECT COUNT(*) FROM organization_memberships WHERE organization_id = ? AND role = 'owner'"); $owners->execute([$principal['organizationId']]); if ((int)$owners->fetchColumn() <= 1) Runtime::respond(409, ['error' => 'LAST_OWNER', 'message' => 'The last organization owner cannot be removed.']); }
-        $db->beginTransaction();
+        try { $lifecycleLock = FileCheckout::acquireUserLifecycleLock($db, $targetId); }
+        catch (Throwable) { Runtime::respond(503, ['error' => 'CHECKOUT_BUSY', 'message' => 'User checkout cleanup is temporarily busy; retry the removal.']); }
+        if ($lifecycleLock === null) Runtime::respond(503, ['error' => 'CHECKOUT_BUSY', 'message' => 'User checkout cleanup is temporarily busy; retry the removal.']);
+        $operationFailure = null;
+        $committed = false;
         try {
-            $db->prepare('DELETE FROM checkouts WHERE user_id = ?')->execute([$targetId]);
+            $db->beginTransaction();
+            $terminalizedFileIds = FileCheckout::markUserCheckoutsTerminal($db, $targetId, $principal['organizationId']);
+            $deleteCheckout = $db->prepare('DELETE FROM checkouts WHERE file_id = ? AND user_id = ?');
+            // Delete only rows still owned by this user; a newer foreign owner's lease is preserved.
+            foreach ($terminalizedFileIds as $fileId) $deleteCheckout->execute([$fileId, $targetId]);
             $db->prepare('DELETE FROM sessions WHERE user_id = ? AND organization_id = ?')->execute([$targetId, $principal['organizationId']]);
             $db->prepare('DELETE FROM organization_memberships WHERE user_id = ? AND organization_id = ?')->execute([$targetId, $principal['organizationId']]);
-            $db->prepare('UPDATE users SET disabled_at = UTC_TIMESTAMP(3) WHERE id = ?')->execute([$targetId]);
+            $db->prepare('UPDATE users SET disabled_at = UTC_TIMESTAMP(3) WHERE id = ? AND NOT EXISTS (SELECT 1 FROM organization_memberships WHERE user_id = ?)')->execute([$targetId, $targetId]);
             Runtime::emitEvent($db, $principal['organizationId'], 'user.removed', $targetId, ['userId' => $targetId, 'removedBy' => $principal['userId']]);
             $db->commit();
-        } catch (Throwable $error) { if ($db->inTransaction()) $db->rollBack(); throw $error; }
+            $committed = true;
+        } catch (Throwable $error) { if ($db->inTransaction()) $db->rollBack(); $operationFailure = $error; throw $error; }
+        finally { FileCheckout::finishUserLifecycleLock($db, $lifecycleLock, $committed, $operationFailure); }
+        // A release failure after commit must not make callers retry the deletion as if it rolled back.
+        // Runtime::respond exits this request; Runtime::database uses non-persistent PDO, so request shutdown closes it.
         Runtime::respond(204);
     }
     if ($method === 'GET' && $path === '/workflow-roles') {
@@ -1690,7 +1715,16 @@ try {
     }
     if ($method === 'DELETE' && $path === '/account') {
         if ($principal['role'] === 'owner') { $owners = $db->prepare("SELECT 1 FROM organization_memberships WHERE organization_id = ? AND role = 'owner' AND user_id <> ? LIMIT 1"); $owners->execute([$principal['organizationId'], $principal['userId']]); if (!$owners->fetch()) Runtime::respond(409, ['error' => 'LAST_OWNER', 'message' => 'Transfer organization ownership before deleting the last owner account.']); }
-        $db->beginTransaction(); try { $db->prepare('DELETE FROM checkouts WHERE user_id = ?')->execute([$principal['userId']]); $db->prepare('DELETE FROM sessions WHERE user_id = ?')->execute([$principal['userId']]); $db->prepare('DELETE FROM organization_memberships WHERE user_id = ? AND organization_id = ?')->execute([$principal['userId'], $principal['organizationId']]); $db->prepare('UPDATE users SET disabled_at = UTC_TIMESTAMP(3) WHERE id = ?')->execute([$principal['userId']]); Runtime::emitEvent($db, $principal['organizationId'], 'account.deleted', $principal['userId'], ['userId' => $principal['userId']]); $db->commit(); } catch (Throwable $error) { if ($db->inTransaction()) $db->rollBack(); throw $error; } Runtime::respond(204);
+        try { $lifecycleLock = FileCheckout::acquireUserLifecycleLock($db, $principal['userId']); }
+        catch (Throwable) { Runtime::respond(503, ['error' => 'CHECKOUT_BUSY', 'message' => 'Account checkout cleanup is temporarily busy; retry deletion.']); }
+        if ($lifecycleLock === null) Runtime::respond(503, ['error' => 'CHECKOUT_BUSY', 'message' => 'Account checkout cleanup is temporarily busy; retry deletion.']);
+        $operationFailure = null;
+        $committed = false;
+        try { $db->beginTransaction(); $terminalizedFileIds = FileCheckout::markUserCheckoutsTerminal($db, $principal['userId']); $deleteCheckout = $db->prepare('DELETE FROM checkouts WHERE file_id = ? AND user_id = ?'); foreach ($terminalizedFileIds as $fileId) $deleteCheckout->execute([$fileId, $principal['userId']]); $db->prepare('DELETE FROM sessions WHERE user_id = ?')->execute([$principal['userId']]); $db->prepare('DELETE FROM organization_memberships WHERE user_id = ? AND organization_id = ?')->execute([$principal['userId'], $principal['organizationId']]); $db->prepare('UPDATE users SET disabled_at = UTC_TIMESTAMP(3) WHERE id = ?')->execute([$principal['userId']]); Runtime::emitEvent($db, $principal['organizationId'], 'account.deleted', $principal['userId'], ['userId' => $principal['userId']]); $db->commit(); $committed = true; }
+        catch (Throwable $error) { if ($db->inTransaction()) $db->rollBack(); $operationFailure = $error; throw $error; }
+        finally { FileCheckout::finishUserLifecycleLock($db, $lifecycleLock, $committed, $operationFailure); }
+        // Keep the committed outcome authoritative; the non-persistent connection closes at request shutdown.
+        Runtime::respond(204);
     }
     if ($method === 'POST' && $path === '/recovery-codes') {
         if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']); $body = Runtime::jsonBody(); $days = is_int($body['expiresInDays'] ?? null) ? $body['expiresInDays'] : 90; if ($days < 1 || $days > 3650) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'expiresInDays must be between 1 and 3650.']); $description = is_string($body['description'] ?? null) ? substr($body['description'], 0, 1024) : null;
@@ -2373,14 +2407,17 @@ try {
     if ($method === 'GET' && preg_match('#^/vaults/([0-9a-f-]{36})/files$#i', $path, $matches)) {
         Runtime::requireVault($db, $principal, $matches[1]);
         $query = $db->prepare(
-            'SELECT f.id, f.canonical_path AS canonicalPath, f.file_name AS fileName, f.part_number AS partNumber, f.storage_relative_path AS storageRelativePath,
+            'SELECT f.id, f.canonical_path AS canonicalPath, f.file_name AS fileName, f.part_number AS partNumber, f.description, f.revision_label AS revision, f.custom_properties AS customProperties, f.storage_relative_path AS storageRelativePath,
                     f.current_revision AS currentRevision, f.state, f.content_hash AS contentHash, f.size_bytes AS sizeBytes,
                     f.created_at AS createdAt, f.updated_at AS updatedAt, c.user_id AS checkedOutByUserId, u.display_name AS checkedOutBy, c.expires_at AS checkoutExpiresAt
              FROM files f LEFT JOIN checkouts c ON c.file_id = f.id AND c.expires_at > UTC_TIMESTAMP(3)
              LEFT JOIN users u ON u.id = c.user_id WHERE f.vault_id = ? AND f.organization_id = ? AND f.deleted_at IS NULL ORDER BY f.canonical_path'
         );
         $query->execute([$matches[1], $principal['organizationId']]);
-        Runtime::respond(200, ['files' => $query->fetchAll()]);
+        $files = $query->fetchAll();
+        foreach ($files as &$listedFile) $listedFile['customProperties'] = $listedFile['customProperties'] === null ? null : json_decode($listedFile['customProperties'], false, 512, JSON_THROW_ON_ERROR);
+        unset($listedFile);
+        Runtime::respond(200, ['files' => $files]);
     }
     if ($method === 'POST' && $path === '/files/import') {
         $body = Runtime::jsonBody();
@@ -2389,9 +2426,9 @@ try {
         }
         $vaultId = $body['vaultId'];
         Runtime::requireVault($db, $principal, $vaultId);
-        $canonicalPath = ltrim(str_replace('\\', '/', trim($body['canonicalPath'])), '/');
-        $storageRelativePath = ltrim(str_replace('\\', '/', trim($body['storageRelativePath'])), '/');
-        if ($canonicalPath === '' || $storageRelativePath === '' || str_contains($canonicalPath, '../') || str_contains($storageRelativePath, '../')) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'File paths must be normalized vault-relative paths.']);
+        $canonicalPath = \BluePlm\VaultRelativePath::normalize($body['canonicalPath']);
+        $storageRelativePath = \BluePlm\VaultRelativePath::normalize($body['storageRelativePath']);
+        if ($canonicalPath === null || $storageRelativePath === null) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'File paths must be normalized vault-relative paths.']);
         $fileName = is_string($body['fileName'] ?? null) && trim($body['fileName']) !== '' ? trim($body['fileName']) : basename($canonicalPath);
         $partNumber = is_string($body['partNumber'] ?? null) && trim($body['partNumber']) !== '' ? trim($body['partNumber']) : null;
         if ($partNumber !== null && strlen($partNumber) > 512) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'partNumber is too long.']);
@@ -2401,18 +2438,28 @@ try {
         $existing->execute([$vaultId, $canonicalPath]);
         $record = $existing->fetch();
         if ($record) {
-            try {
-                // A rescan after upgrading from a schema without part_number is
-                // the authoritative backfill path for existing vault contents.
-                if ($partNumber !== null && $record['part_number'] !== $partNumber) {
-                    $db->prepare('UPDATE files SET part_number = ? WHERE id = ? AND organization_id = ?')
-                        ->execute([$partNumber, $record['id'], $principal['organizationId']]);
+            if ($partNumber !== null) {
+                $db->beginTransaction();
+                try {
+                    // A rescan after upgrading from a schema without part_number is
+                    // the authoritative backfill path for existing vault contents.
+                    if ($record['part_number'] !== $partNumber) {
+                        $db->prepare('UPDATE files SET part_number = ? WHERE id = ? AND organization_id = ?')
+                            ->execute([$partNumber, $record['id'], $principal['organizationId']]);
+                    }
+                    $db->prepare('UPDATE file_revisions SET part_number = ? WHERE file_id = ? AND revision_number = 1 AND part_number IS NULL')
+                        ->execute([$partNumber, $record['id']]);
+                    $db->commit();
+                } catch (PDOException $error) {
+                    if ($db->inTransaction()) $db->rollBack();
+                    if ($error->getCode() === '23000' && str_contains($error->getMessage(), 'uq_files_org_part_number')) {
+                        Runtime::respond(409, ['error' => 'PART_NUMBER_EXISTS', 'message' => 'This part number is already assigned to another file.']);
+                    }
+                    throw $error;
+                } catch (Throwable $error) {
+                    if ($db->inTransaction()) $db->rollBack();
+                    throw $error;
                 }
-            } catch (PDOException $error) {
-                if ($error->getCode() === '23000' && str_contains($error->getMessage(), 'uq_files_org_part_number')) {
-                    Runtime::respond(409, ['error' => 'PART_NUMBER_EXISTS', 'message' => 'This part number is already assigned to another file.']);
-                }
-                throw $error;
             }
             Runtime::respond(200, ['id' => $record['id'], 'created' => false]);
         }
@@ -2420,7 +2467,7 @@ try {
         $db->beginTransaction();
         try {
             $db->prepare('INSERT INTO files (id, organization_id, vault_id, canonical_path, file_name, part_number, storage_relative_path, current_revision, content_hash, size_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)')->execute([$fileId, $principal['organizationId'], $vaultId, $canonicalPath, $fileName, $partNumber, $storageRelativePath, $contentHash, $sizeBytes]);
-            $db->prepare('INSERT INTO file_revisions (id, file_id, revision_number, content_hash, storage_relative_path, size_bytes, checked_in_by, comment) VALUES (?, ?, 1, ?, ?, ?, ?, ?)')->execute([Runtime::uuid(), $fileId, $contentHash, $storageRelativePath, $sizeBytes, $principal['userId'], 'Initial vault import']);
+            $db->prepare('INSERT INTO file_revisions (id, file_id, revision_number, content_hash, storage_relative_path, size_bytes, checked_in_by, comment, part_number) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?)')->execute([Runtime::uuid(), $fileId, $contentHash, $storageRelativePath, $sizeBytes, $principal['userId'], 'Initial vault import', $partNumber]);
             Runtime::emitEvent($db, $principal['organizationId'], 'file.imported', $fileId, ['userId' => $principal['userId'], 'vaultId' => $vaultId]);
             $db->commit();
         } catch (Throwable $error) {
@@ -2438,8 +2485,12 @@ try {
         $file = $db->prepare('SELECT vault_id FROM files WHERE id = ? AND organization_id = ? AND deleted_at IS NULL'); $file->execute([$fileId, $principal['organizationId']]); $row = $file->fetch();
         if (!$row) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'File not found.']);
         Runtime::requireVault($db, $principal, $row['vault_id']);
-        $query = $db->prepare('SELECT id, revision_number AS revisionNumber, content_hash AS contentHash, storage_relative_path AS storageRelativePath, size_bytes AS sizeBytes, comment, created_at AS createdAt, checked_in_by AS checkedInBy FROM file_revisions WHERE file_id = ? ORDER BY revision_number DESC');
-        $query->execute([$fileId]); Runtime::respond(200, ['revisions' => $query->fetchAll()]);
+        $query = $db->prepare('SELECT id, revision_number AS revisionNumber, content_hash AS contentHash, storage_relative_path AS storageRelativePath, size_bytes AS sizeBytes, comment, part_number AS partNumber, description, revision_label AS revision, custom_properties AS customProperties, created_at AS createdAt, checked_in_by AS checkedInBy FROM file_revisions WHERE file_id = ? ORDER BY revision_number DESC');
+        $query->execute([$fileId]);
+        $revisions = $query->fetchAll();
+        foreach ($revisions as &$revisionRow) $revisionRow['customProperties'] = $revisionRow['customProperties'] === null ? null : json_decode($revisionRow['customProperties'], false, 512, JSON_THROW_ON_ERROR);
+        unset($revisionRow);
+        Runtime::respond(200, ['revisions' => $revisions]);
     }
     if ($method === 'POST' && preg_match('#^/files/([0-9a-f-]{36})/rollback-target$#i', $path, $matches)) {
         $body = Runtime::jsonBody(); $targetVersion = $body['targetVersion'] ?? null; if (!is_int($targetVersion) || $targetVersion < 1) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'targetVersion must be a positive integer.']); $comment = is_string($body['comment'] ?? null) ? substr($body['comment'], 0, 4096) : null;
@@ -2558,63 +2609,61 @@ try {
     }
     if ($method === 'POST' && preg_match('#^/files/([0-9a-f-]{36})/checkout$#i', $path, $matches)) {
         $body = Runtime::jsonBody();
-        if (!is_string($body['clientWorkingPath'] ?? null) || trim($body['clientWorkingPath']) === '') Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'clientWorkingPath is required.']);
-        $fileId = $matches[1]; Runtime::requireVault($db, $principal, (function () use ($db, $fileId, $principal) { $q = $db->prepare('SELECT vault_id FROM files WHERE id = ? AND organization_id = ? AND deleted_at IS NULL'); $q->execute([$fileId, $principal['organizationId']]); $row = $q->fetch(); if (!$row) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'File not found.']); return $row['vault_id']; })());
-        $token = rtrim(strtr(base64_encode(random_bytes(48)), '+/', '-_'), '=');
-        $expiresAt = Runtime::checkoutExpiry($env);
-        $db->beginTransaction();
+        if (!is_string($body['clientWorkingPath'] ?? null) || trim($body['clientWorkingPath']) === '' || strlen($body['clientWorkingPath']) > 2048) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'clientWorkingPath is required and must not exceed 2048 bytes.']);
+        $requestId = $body['requestId'] ?? null;
+        if ($requestId !== null && (!is_string($requestId) || !preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i', $requestId))) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'requestId must be a UUID.']);
+        if (is_string($requestId)) $requestId = strtolower($requestId);
+        $fileId = strtolower($matches[1]);
+        $fileQuery = $db->prepare('SELECT vault_id FROM files WHERE id = ? AND organization_id = ? AND deleted_at IS NULL');
+        $fileQuery->execute([$fileId, $principal['organizationId']]);
+        $file = $fileQuery->fetch();
+        if (!$file) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'File not found.']);
+        Runtime::requireVault($db, $principal, $file['vault_id']);
+        if (is_string($requestId)) {
+            try {
+                Runtime::respond(200, FileCheckout::acquireWithRequestId($db, $env, $principal, $fileId, $file['vault_id'], $body['clientWorkingPath'], $requestId));
+            } catch (CheckoutLeaseFailure $error) {
+                Runtime::respond($error->status, ['error' => $error->errorCode, 'message' => $error->getMessage()]);
+            }
+        }
+        try { $lifecycleLock = FileCheckout::acquireUserLifecycleLock($db, $principal['userId']); }
+        catch (Throwable) { Runtime::respond(503, ['error' => 'CHECKOUT_BUSY', 'message' => 'Checkout is temporarily busy; retry the request.']); }
+        if ($lifecycleLock === null) Runtime::respond(503, ['error' => 'CHECKOUT_BUSY', 'message' => 'Checkout is temporarily busy; retry the request.']);
+        $operationFailure = null;
+        $checkoutResult = null;
+        $committed = false;
         try {
-            $lock = $db->prepare('SELECT user_id FROM checkouts WHERE file_id = ? AND expires_at > UTC_TIMESTAMP(3) FOR UPDATE'); $lock->execute([$fileId]);
-            if ($lock->fetch()) { $db->rollBack(); Runtime::respond(409, ['error' => 'CHECKED_OUT', 'message' => 'File is checked out by another client.']); }
+            FileCheckout::assertCheckoutPrincipalActive($db, $principal);
+            $token = rtrim(strtr(base64_encode(random_bytes(48)), '+/', '-_'), '=');
+            $expiresAt = Runtime::checkoutExpiry($env);
+            $db->beginTransaction();
+            $fileLock = $db->prepare('SELECT id FROM files WHERE id = ? AND organization_id = ? AND deleted_at IS NULL FOR UPDATE'); $fileLock->execute([$fileId, $principal['organizationId']]);
+            if (!$fileLock->fetch()) throw new CheckoutLeaseFailure(404, 'NOT_FOUND', 'File not found.');
+            $lock = $db->prepare('SELECT user_id, token_hash, (expires_at > UTC_TIMESTAMP(3)) AS lease_active FROM checkouts WHERE file_id = ?'); $lock->execute([$fileId]);
+            $priorLease = $lock->fetch();
+            if ($priorLease && (int)$priorLease['lease_active'] === 1) throw new CheckoutLeaseFailure(409, 'CHECKED_OUT', 'File is checked out by another client.');
+            if ($priorLease) FileCheckout::markTerminalByHash($db, $fileId, $priorLease['token_hash'], 'expired');
             $db->prepare('DELETE FROM checkouts WHERE file_id = ?')->execute([$fileId]);
             $db->prepare('INSERT INTO checkouts (file_id, user_id, token_hash, client_working_path, expires_at) VALUES (?, ?, ?, ?, ?)')->execute([$fileId, $principal['userId'], Runtime::tokenHash($token, $env), $body['clientWorkingPath'], $expiresAt]);
             Runtime::emitEvent($db, $principal['organizationId'], 'file.checked_out', $fileId, ['userId' => $principal['userId'], 'expiresAt' => str_replace(' ', 'T', $expiresAt) . 'Z']);
             $db->commit();
-        } catch (Throwable $error) { if ($db->inTransaction()) $db->rollBack(); throw $error; }
-        Runtime::respond(200, ['checkoutToken' => $token, 'expiresAt' => str_replace(' ', 'T', $expiresAt) . 'Z']);
+            $committed = true;
+            $checkoutResult = ['checkoutToken' => $token, 'expiresAt' => str_replace(' ', 'T', $expiresAt) . 'Z'];
+        } catch (Throwable $error) { if ($db->inTransaction()) $db->rollBack(); $operationFailure = $error; }
+        finally { FileCheckout::finishUserLifecycleLock($db, $lifecycleLock, $committed, $operationFailure); }
+        if ($operationFailure instanceof CheckoutLeaseFailure) Runtime::respond($operationFailure->status, ['error' => $operationFailure->errorCode, 'message' => $operationFailure->getMessage()]);
+        if ($operationFailure !== null) throw $operationFailure;
+        Runtime::respond(200, $checkoutResult);
     }
     if ($method === 'POST' && preg_match('#^/files/([0-9a-f-]{36})/checkin$#i', $path, $matches)) {
-        $body = Runtime::jsonBody(); $fileId = $matches[1];
-        if (!is_string($body['checkoutToken'] ?? null) || !is_string($body['storageRelativePath'] ?? null) || trim($body['storageRelativePath']) === '') Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'checkoutToken and storageRelativePath are required.']);
-        $db->beginTransaction();
         try {
-            $file = $db->prepare('SELECT * FROM files WHERE id = ? AND organization_id = ? AND deleted_at IS NULL FOR UPDATE'); $file->execute([$fileId, $principal['organizationId']]); $row = $file->fetch();
-            if (!$row) { $db->rollBack(); Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'File not found.']); }
-            Runtime::requireVault($db, $principal, $row['vault_id']);
-            $lock = $db->prepare('SELECT token_hash, user_id FROM checkouts WHERE file_id = ? AND expires_at > UTC_TIMESTAMP(3) FOR UPDATE'); $lock->execute([$fileId]); $checkout = $lock->fetch();
-            if (!$checkout || $checkout['user_id'] !== $principal['userId'] || !hash_equals($checkout['token_hash'], Runtime::tokenHash($body['checkoutToken'], $env))) { $db->rollBack(); Runtime::respond(409, ['error' => 'INVALID_CHECKOUT', 'message' => 'A valid checkout from this client is required.']); }
-            $revision = (int)$row['current_revision'] + 1;
-            $relativePath = ltrim(str_replace('\\', '/', trim($body['storageRelativePath'])), '/');
-            if ($relativePath === '' || str_contains($relativePath, '../')) { $db->rollBack(); Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'storageRelativePath must be a normalized vault-relative path.']); }
-            $hash = is_string($body['contentHash'] ?? null) && preg_match('/^[a-f0-9]{64}$/i', $body['contentHash']) ? $body['contentHash'] : null;
-            $size = is_int($body['sizeBytes'] ?? null) && $body['sizeBytes'] >= 0 ? $body['sizeBytes'] : null;
-            $comment = is_string($body['comment'] ?? null) ? substr($body['comment'], 0, 4000) : null;
-            $partNumberProvided = array_key_exists('partNumber', $body);
-            $partNumber = null;
-            if ($partNumberProvided) {
-                if ($body['partNumber'] !== null && !is_string($body['partNumber'])) { $db->rollBack(); Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'partNumber must be a string or null.']); }
-                $partNumber = is_string($body['partNumber']) && trim($body['partNumber']) !== '' ? trim($body['partNumber']) : null;
-                if ($partNumber !== null && strlen($partNumber) > 512) { $db->rollBack(); Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'partNumber is too long.']); }
-            }
-            if ($partNumberProvided) {
-                $db->prepare('UPDATE files SET current_revision = ?, storage_relative_path = ?, content_hash = ?, size_bytes = ?, part_number = ? WHERE id = ?')->execute([$revision, $relativePath, $hash, $size, $partNumber, $fileId]);
-            } else {
-                $db->prepare('UPDATE files SET current_revision = ?, storage_relative_path = ?, content_hash = ?, size_bytes = ? WHERE id = ?')->execute([$revision, $relativePath, $hash, $size, $fileId]);
-            }
-            $revisionId = Runtime::uuid();
-            $db->prepare('INSERT INTO file_revisions (id, file_id, revision_number, content_hash, storage_relative_path, size_bytes, checked_in_by, comment) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')->execute([$revisionId, $fileId, $revision, $hash, $relativePath, $size, $principal['userId'], $comment]);
-            $db->prepare('INSERT INTO inspection_characteristic_versions (id, file_revision_id, organization_id, sort_order, balloon_number, char_id, zone, char_type, sub_type, nominal_value, unit, plus_tolerance, minus_tolerance, upper_limit, lower_limit, classification, inspection_method, operation, aql, sample_size, supplier_inspection_rate, internal_inspection_rate, reference, comments) SELECT UUID(), ?, organization_id, sort_order, balloon_number, char_id, zone, char_type, sub_type, nominal_value, unit, plus_tolerance, minus_tolerance, upper_limit, lower_limit, classification, inspection_method, operation, aql, sample_size, supplier_inspection_rate, internal_inspection_rate, reference, comments FROM inspection_characteristics WHERE file_id = ?')->execute([$revisionId, $fileId]);
-            Runtime::emitEvent($db, $principal['organizationId'], 'file.checked_in', $fileId, ['revision' => $revision, 'userId' => $principal['userId']]);
-            $db->prepare('DELETE FROM checkouts WHERE file_id = ?')->execute([$fileId]); $db->commit();
-        } catch (Throwable $error) {
-            if ($db->inTransaction()) $db->rollBack();
-            if ($error instanceof PDOException && $error->getCode() === '23000' && str_contains($error->getMessage(), 'uq_files_org_part_number')) Runtime::respond(409, ['error' => 'PART_NUMBER_EXISTS', 'message' => 'This part number is already assigned to another file.']);
-            throw $error;
+            Runtime::respond(200, \BluePlm\FileCheckin::execute($db, $env, $principal, strtolower($matches[1]), Runtime::jsonBody()));
+        } catch (\BluePlm\FileCheckinFailure $error) {
+            Runtime::respond($error->status, ['error' => $error->errorCode, 'message' => $error->getMessage()]);
         }
-        Runtime::respond(200, ['fileId' => $fileId, 'revision' => $revision]);
     }
     if ($method === 'POST' && preg_match('#^/files/([0-9a-f-]{36})/checkout/renew$#i', $path, $matches)) {
-        $body = Runtime::jsonBody(); $fileId = $matches[1];
+        $body = Runtime::jsonBody(); $fileId = strtolower($matches[1]);
         if (!is_string($body['checkoutToken'] ?? null) || strlen($body['checkoutToken']) < 20) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'checkoutToken is required.']);
         $expiresAt = Runtime::checkoutExpiry($env);
         $db->beginTransaction();
@@ -2623,17 +2672,32 @@ try {
             if (!$row) { $db->rollBack(); Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'File not found.']); }
             Runtime::requireVault($db, $principal, $row['vault_id']);
             $lock = $db->prepare('SELECT token_hash, user_id FROM checkouts WHERE file_id = ? AND expires_at > UTC_TIMESTAMP(3) FOR UPDATE'); $lock->execute([$fileId]); $checkout = $lock->fetch();
-            if (!$checkout || $checkout['user_id'] !== $principal['userId'] || !hash_equals($checkout['token_hash'], Runtime::tokenHash($body['checkoutToken'], $env))) { $db->rollBack(); Runtime::respond(409, ['error' => 'INVALID_CHECKOUT', 'message' => 'A current checkout from this client is required.']); }
-            $db->prepare('UPDATE checkouts SET expires_at = ? WHERE file_id = ?')->execute([$expiresAt, $fileId]); $db->commit();
+            $tokenHash = Runtime::tokenHash($body['checkoutToken'], $env);
+            if (!$checkout || $checkout['user_id'] !== $principal['userId'] || !hash_equals($checkout['token_hash'], $tokenHash)) { $db->rollBack(); Runtime::respond(409, ['error' => 'INVALID_CHECKOUT', 'message' => 'A current checkout from this client is required.']); }
+            $db->prepare('UPDATE checkouts SET expires_at = ? WHERE file_id = ?')->execute([$expiresAt, $fileId]);
+            FileCheckout::markRenewed($db, $fileId, $tokenHash, $expiresAt);
+            $db->commit();
         } catch (Throwable $error) { if ($db->inTransaction()) $db->rollBack(); throw $error; }
         Runtime::respond(200, ['expiresAt' => str_replace(' ', 'T', $expiresAt) . 'Z']);
     }
     if ($method === 'POST' && preg_match('#^/files/([0-9a-f-]{36})/checkout/cancel$#i', $path, $matches)) {
-        $body = Runtime::jsonBody(); $fileId = $matches[1];
+        $body = Runtime::jsonBody(); $fileId = strtolower($matches[1]);
         if (!is_string($body['checkoutToken'] ?? null)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'checkoutToken is required.']);
-        $lock = $db->prepare('SELECT c.token_hash, c.user_id, f.vault_id FROM checkouts c JOIN files f ON f.id = c.file_id WHERE c.file_id = ? AND f.organization_id = ?'); $lock->execute([$fileId, $principal['organizationId']]); $checkout = $lock->fetch();
-        if (!$checkout || $checkout['user_id'] !== $principal['userId'] || !hash_equals($checkout['token_hash'], Runtime::tokenHash($body['checkoutToken'], $env))) Runtime::respond(409, ['error' => 'INVALID_CHECKOUT', 'message' => 'A valid checkout from this client is required.']);
-        Runtime::requireVault($db, $principal, $checkout['vault_id']); $db->prepare('DELETE FROM checkouts WHERE file_id = ?')->execute([$fileId]); Runtime::emitEvent($db, $principal['organizationId'], 'file.checkout_cancelled', $fileId, ['userId' => $principal['userId']]); Runtime::respond(204);
+        $db->beginTransaction();
+        try {
+            $fileQuery = $db->prepare('SELECT vault_id FROM files WHERE id = ? AND organization_id = ? AND deleted_at IS NULL FOR UPDATE');
+            $fileQuery->execute([$fileId, $principal['organizationId']]); $file = $fileQuery->fetch();
+            if (!$file) { $db->rollBack(); Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'File not found.']); }
+            Runtime::requireVault($db, $principal, $file['vault_id']);
+            $lock = $db->prepare('SELECT token_hash, user_id FROM checkouts WHERE file_id = ? FOR UPDATE'); $lock->execute([$fileId]); $checkout = $lock->fetch();
+            $tokenHash = Runtime::tokenHash($body['checkoutToken'], $env);
+            if (!$checkout || $checkout['user_id'] !== $principal['userId'] || !hash_equals($checkout['token_hash'], $tokenHash)) { $db->rollBack(); Runtime::respond(409, ['error' => 'INVALID_CHECKOUT', 'message' => 'A valid checkout from this client is required.']); }
+            FileCheckout::markTerminalByHash($db, $fileId, $tokenHash, 'cancelled');
+            $db->prepare('DELETE FROM checkouts WHERE file_id = ?')->execute([$fileId]);
+            Runtime::emitEvent($db, $principal['organizationId'], 'file.checkout_cancelled', $fileId, ['userId' => $principal['userId']]);
+            $db->commit();
+        } catch (Throwable $error) { if ($db->inTransaction()) $db->rollBack(); throw $error; }
+        Runtime::respond(204);
     }
     if ($method === 'PATCH' && preg_match('#^/files/([0-9a-f-]{36})/path$#i', $path, $matches)) {
         $body = Runtime::jsonBody(); $fileId = $matches[1];

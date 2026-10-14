@@ -35,9 +35,19 @@ final class Migrator
             try {
                 if ($migration === '029_module_defaults.sql') {
                     self::ensureModuleDefaultsColumns($db);
+                } elseif ($migration === '035_checkin_metadata_idempotency.sql') {
+                    self::ensureCheckinMetadataColumns($db);
+                    $db->exec($sql);
+                } elseif ($migration === '038_checkin_request_retention_indexes.sql') {
+                    self::ensureCheckinRequestRetentionIndexes($db);
+                    $db->exec($sql);
+                } elseif ($migration === '039_checkout_request_retention_indexes.sql') {
+                    self::ensureCheckoutRequestRetentionIndexes($db);
+                    $db->exec($sql);
                 } else {
                     $db->exec($sql);
                 }
+                if ($migration === '037_checkout_user_index.sql') self::ensureCheckoutUserIndex($db);
                 if ($migration === '015_eco_metadata.sql') self::ensureEcoMetadataConstraints($db);
                 if ($migration === '024_file_part_numbers.sql') self::ensureFilePartNumberConstraint($db);
                 if ($migration === '032_backup_machine_proof.sql') self::ensureBackupMachineProofColumn($db);
@@ -79,6 +89,55 @@ final class Migrator
         }
     }
 
+    private static function ensureCheckoutUserIndex(PDO $db): void
+    {
+        $query = $db->prepare(
+            'SELECT 1 FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ? AND SEQ_IN_INDEX = 1
+             LIMIT 1'
+        );
+        $query->execute(['checkouts', 'user_id']);
+        if (!$query->fetchColumn()) {
+            $db->exec('ALTER TABLE checkouts ADD INDEX idx_checkout_user_id (user_id)');
+        }
+    }
+
+    private static function ensureCheckinRequestRetentionIndexes(PDO $db): void
+    {
+        $indexes = [
+            ['idx_file_checkin_requests_user_scope', 'user_id, created_at'],
+            ['idx_file_checkin_requests_org_scope', 'organization_id, created_at'],
+            ['idx_file_checkin_requests_created', 'created_at'],
+        ];
+        $query = $db->prepare(
+            'SELECT 1 FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ? LIMIT 1'
+        );
+        foreach ($indexes as [$name, $columns]) {
+            $query->execute(['file_checkin_requests', $name]);
+            if (!$query->fetchColumn()) $db->exec("ALTER TABLE file_checkin_requests ADD INDEX `{$name}` ({$columns})");
+        }
+    }
+
+    private static function ensureCheckoutRequestRetentionIndexes(PDO $db): void
+    {
+        $indexes = [
+            ['idx_checkout_request_user_retention', 'user_id, status, updated_at'],
+            ['idx_checkout_request_org_retention', 'organization_id, status, updated_at'],
+            ['idx_checkout_request_file_retention', 'file_id, status, updated_at'],
+            ['idx_checkout_request_terminal_retention', 'updated_at, status'],
+            ['idx_checkout_request_active_expiry', 'status, expires_at, file_id'],
+        ];
+        $query = $db->prepare(
+            'SELECT 1 FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ? LIMIT 1'
+        );
+        foreach ($indexes as [$name, $columns]) {
+            $query->execute(['checkout_acquisition_requests', $name]);
+            if (!$query->fetchColumn()) $db->exec("ALTER TABLE checkout_acquisition_requests ADD INDEX `{$name}` ({$columns})");
+        }
+    }
+
     /** MariaDB versions supported by the product do not all support ADD COLUMN
      * IF NOT EXISTS. The migration ledger makes this metadata check idempotent. */
     private static function ensureBackupMachineProofColumn(PDO $db): void
@@ -90,6 +149,33 @@ final class Migrator
         $query->execute(['backup_config', 'designated_machine_proof_hash']);
         if (!$query->fetchColumn()) {
             $db->exec('ALTER TABLE backup_config ADD COLUMN designated_machine_proof_hash CHAR(64) NULL AFTER designated_machine_last_seen');
+        }
+    }
+
+    private static function ensureCheckinMetadataColumns(PDO $db): void
+    {
+        $columns = [
+            'files' => [
+                'description' => 'TEXT NULL',
+                'revision_label' => 'VARCHAR(512) NULL',
+                'custom_properties' => 'JSON NULL',
+            ],
+            'file_revisions' => [
+                'part_number' => 'VARCHAR(512) NULL',
+                'description' => 'TEXT NULL',
+                'revision_label' => 'VARCHAR(512) NULL',
+                'custom_properties' => 'JSON NULL',
+            ],
+        ];
+        $exists = $db->prepare(
+            'SELECT 1 FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?'
+        );
+        foreach ($columns as $table => $definitions) {
+            foreach ($definitions as $column => $definition) {
+                $exists->execute([$table, $column]);
+                if (!$exists->fetchColumn()) $db->exec("ALTER TABLE `{$table}` ADD COLUMN `{$column}` {$definition}");
+            }
         }
     }
 
