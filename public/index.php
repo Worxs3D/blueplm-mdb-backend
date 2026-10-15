@@ -10,6 +10,7 @@ require dirname(__DIR__) . '/src/Totp.php';
 require dirname(__DIR__) . '/src/Installation.php';
 require dirname(__DIR__) . '/src/DatabaseLifecycle.php';
 require dirname(__DIR__) . '/src/BundleManifest.php';
+require dirname(__DIR__) . '/src/ColorSwatches.php';
 
 use BluePlm\Migrator;
 use BluePlm\FileCheckout;
@@ -20,6 +21,7 @@ use BluePlm\Runtime;
 use BluePlm\DatabaseLifecycle;
 use BluePlm\Totp;
 use BluePlm\BundleManifest;
+use BluePlm\ColorSwatches;
 
 const BLUEPLM_API_VERSION = 2;
 
@@ -847,6 +849,7 @@ try {
             || str_starts_with($path, '/account/totp');
         if (!$personalWrite) Runtime::respond(403, ['error' => 'READ_ONLY_ROLE', 'message' => 'Viewer and guest accounts are read-only.']);
     }
+    ColorSwatches::dispatch($db, $principal, $method, $path);
 
     // Workflow runtime endpoints are deliberately scoped through the file's
     // organization and vault before any transition row is exposed.  The

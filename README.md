@@ -235,11 +235,59 @@ timestamps are written explicitly in UTC, so their TTL basis is independent of
 the MariaDB session time zone. The legacy `created_at` timestamp is not used as
 the retention clock.
 
+## Color swatch contract
+
+All color swatch routes require an authenticated organization session. `GET
+/color-swatches` returns `{ "swatches": [...] }`, ordered by creation time and
+ID. It includes organization swatches and only the current user's personal
+swatches. Each item has exactly `id`, `color`, `isOrg`, and `createdAt`.
+
+`POST /color-swatches` accepts `{ "color": "#RRGGBB", "isOrg": boolean }`
+and returns `201` with the created item. Color spelling and case are preserved;
+duplicate colors are allowed. Personal entries belong to the authenticated
+user. Organization entries can be created only by an Owner or Administrator.
+Invalid colors or non-boolean scope values return `400`; an unauthorized
+organization write returns `403`.
+
+`DELETE /color-swatches/{id}` returns an empty `204` response. Users can delete
+their own personal entries; only Owners and Administrators can delete
+organization entries. A missing entry, another user's personal entry, or an
+entry from another organization returns `404`, keeping tenant and personal
+ownership boundaries opaque. Requests without a valid session return `401`.
+Viewer and Guest roles can read their organization and personal swatch view,
+but the API's read-only role guard rejects all swatch writes with `403`.
+Migration `040_color_swatches.sql` adds this storage to existing databases
+without modifying existing organization or membership records.
+
 ## Tests
 
 The integration test covers installer authorization, new installation,
 database-state detection, in-place migration, login, user and team management,
 network vault operations, and the removal of browser setup/admin pages.
+
+The color swatch integration and migration-upgrade cases use a separately named
+Compose project and MariaDB volume. The API binds to loopback. Docker Compose
+2.24.4 or later is required for the port override. Pick a unique project name
+and unused host port, set `BLUEPLM_PHP_TEST_SUBNET` to a verified unused
+private CIDR, and set the project name, port, and server URL for the full test
+run. The integration runner inherits the project name for its `docker compose
+exec` calls. Leave the test resources available for inspection:
+
+```powershell
+$env:COMPOSE_PROJECT_NAME = 'mdb-color-swatches-php-local'
+$env:BLUEPLM_PHP_TEST_PORT = '18462'
+$env:BLUEPLM_PHP_TEST_SERVER = 'http://127.0.0.1:18462'
+$env:BLUEPLM_PHP_TEST_SUBNET = '<verified unused private CIDR>'
+docker compose -p $env:COMPOSE_PROJECT_NAME -f docker-compose.test.yml -f docker-compose.swatches-test.yml config
+docker compose -p $env:COMPOSE_PROJECT_NAME -f docker-compose.test.yml -f docker-compose.swatches-test.yml up --build -d
+node test/integration.mjs
+Remove-Item Env:COMPOSE_PROJECT_NAME, Env:BLUEPLM_PHP_TEST_PORT, Env:BLUEPLM_PHP_TEST_SERVER, Env:BLUEPLM_PHP_TEST_SUBNET -ErrorAction SilentlyContinue
+```
+
+The environment cleanup above affects the PowerShell session only. Leave the
+swatch test containers and volume available for review; do not point tests at a
+production service or run a volume-removal or prune command while results are
+under review.
 
 ```powershell
 docker compose -f docker-compose.test.yml up --build -d
