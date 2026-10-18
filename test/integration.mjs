@@ -3,10 +3,11 @@ import { execFileSync } from 'node:child_process'
 import { createHmac, generateKeyPairSync, randomUUID, sign } from 'node:crypto'
 import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { runCheckoutRequestIdRecoveryTests } from './checkout-request-id-recovery.mjs'
 import { runCheckinReviewRegressionTests } from './checkin-review-regressions.mjs'
 import { runFileRevisionCommentIntegration } from './file-revision-comment-integration.mjs'
+import { runOrganizationLogoIntegration } from './organization-logo-integration.mjs'
 import {
   assertColorSwatchesReadOnly,
   runColorSwatchesIntegration,
@@ -20,6 +21,11 @@ import {
 const server = process.env.BLUEPLM_PHP_TEST_SERVER ?? 'http://127.0.0.1:18080'
 const installationToken = 'integration-installation-token-must-be-at-least-32-chars'
 const password = 'Integration password 123!'
+const expectedOwner = process.env.BLUEPLM_EXPECTED_ROOT
+assert.ok(expectedOwner, 'BLUEPLM_EXPECTED_ROOT must identify the approved PHP owner worktree')
+const actualOwner = execFileSync('git', ['rev-parse', '--show-toplevel'], { cwd: process.cwd(), encoding: 'utf8' }).trim()
+assert.equal(resolve(process.cwd()), resolve(expectedOwner), 'test process CWD must be the approved PHP owner')
+assert.equal(resolve(actualOwner), resolve(expectedOwner), 'Git top-level must be the approved PHP owner')
 
 function authenticatorCode(secret, timestamp = Date.now()) {
   const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'
@@ -173,6 +179,12 @@ const login = await request('/auth/login', {
   body: JSON.stringify({ email: 'owner@example.test', password }),
 })
 const token = login.token
+const ownerPrincipal = await request('/auth/me', {}, token)
+await runOrganizationLogoIntegration({
+  server,
+  ownerToken: token,
+  organizationId: ownerPrincipal.user.organizationId,
+})
 
 // Self-registration is opt-in. A request is stored without a membership or
 // role and only becomes usable after an administrator explicitly approves it.
