@@ -96,6 +96,11 @@ async function request(pathname, init = {}, token) {
   return { status: response.status, body, contentType: response.headers.get('content-type') }
 }
 
+function contributionsPath(userId, values = {}) {
+  const query = new URLSearchParams({ view: 'contributions', ...values })
+  return `/users/${userId}/profile/summary?${query.toString()}`
+}
+
 let lastHealthObservation = null
 async function waitForHealth() {
   const deadline = Date.now() + 30000
@@ -270,17 +275,108 @@ try {
 
   const ownerMemberSummary = await request(`/users/${memberId}/profile/summary`, {}, ownerToken)
   assert.equal(ownerMemberSummary.status, 200)
-  assert.equal(ownerMemberSummary.body.activity.totalCount, '6', 'An owner may inspect same-organization file and rejected-review events.')
+  assert.equal(ownerMemberSummary.body.activity.totalCount, expected.ownerViewMemberExpectedCount, 'An owner may inspect same-organization file and rejected-review events.')
   assert.deepEqual(ownerMemberSummary.body.ownEcos.map(eco => eco.ecoNumber), expected.ownerViewMemberExpectedEcoNumbers, 'An owner can see the target member’s creator ECOs and linked ECO metadata in both same-organization vaults.')
   assert.equal(ownerMemberSummary.body.ownEcos.some(eco => eco.ecoNumber === 'PROFILE-MEMBER-FOREIGN-LINKED'), false, 'Even an owner must not receive a linked ECO from a different organization.')
   assert.equal(ownerMemberSummary.body.activity.recent.some(item => item.targetLabel === expected.visibleFileName), true)
   assert.equal(ownerMemberSummary.body.activity.recent.some(item => item.targetLabel === expected.hiddenFileName), true, 'An owner may inspect both same-organization vaults.')
   const ownerViewRejected = ownerMemberSummary.body.activity.recent.filter(item => item.type === 'review.rejected').map(item => item.targetLabel).sort()
   assert.deepEqual(ownerViewRejected, [expected.hiddenFileName, expected.visibleFileName].sort(), 'An owner resolves both same-organization rejected-review file labels.')
+
+  const ownerContributionsResponse = await request(contributionsPath(userId, { day: expected.contributionDay, limit: '10' }), {}, ownerToken)
+  assert.equal(ownerContributionsResponse.status, 200)
+  const ownerContributions = ownerContributionsResponse.body
+  assert.deepEqual(Object.keys(ownerContributions).sort(), ['counts', 'dailyCounts', 'filter', 'recent', 'selectedDay', 'timeBasis', 'window'])
+  assert.equal(ownerContributions.timeBasis, 'database-local-unverified')
+  assert.equal(ownerContributions.filter, 'all')
+  assert.deepEqual(ownerContributions.counts, { all: '27', checkins: '9', checkouts: '7', creates: '7', reviews: '3', approvals: '1' })
+  assert.deepEqual(ownerContributions.dailyCounts, [{ day: expected.contributionDay, count: '27' }])
+  assert.equal(ownerContributions.recent.length, 20, 'The exact contribution counts must not be inferred from a separately capped recent list.')
+  assert.equal(ownerContributions.selectedDay.count, '27')
+  assert.equal(ownerContributions.selectedDay.rows.length, 10)
+  assert.equal(ownerContributions.selectedDay.hasMore, true)
+  assert.equal(typeof ownerContributions.selectedDay.nextCursor, 'string')
+  assert.equal(JSON.stringify(ownerContributions).includes('private-marker'), false)
+  assert.equal(JSON.stringify(ownerContributions).includes('@profile-summary.test'), false)
+  const cursorPayload = JSON.parse(Buffer.from(ownerContributions.selectedDay.nextCursor, 'base64url').toString('utf8'))
+  const malformedDateCursor = Buffer.from(JSON.stringify({ ...cursorPayload, createdAt: '2026-02-30 12:00:00.000000' })).toString('base64url')
+  const malformedCursorDate = await request(contributionsPath(userId, { day: expected.contributionDay, limit: '10', cursor: malformedDateCursor }), {}, ownerToken)
+  assert.equal(malformedCursorDate.status, 400, 'Malformed calendar dates in a re-encoded cursor are invalid requests, not server errors.')
+
+  const contributionIds = new Set(ownerContributions.selectedDay.rows.map(row => row.id))
+  const contributionActions = new Set(ownerContributions.selectedDay.rows.map(row => row.action))
+  let nextCursor = ownerContributions.selectedDay.nextCursor
+  let cursorPageCount = 1
+  while (nextCursor !== null) {
+    const page = await request(contributionsPath(userId, { day: expected.contributionDay, limit: '10', cursor: nextCursor }), {}, ownerToken)
+    assert.equal(page.status, 200)
+    cursorPageCount++
+    for (const row of page.body.selectedDay.rows) {
+      assert.equal(contributionIds.has(row.id), false, 'Stable (database time, source kind, row id) cursors must not repeat equal-time rows.')
+      contributionIds.add(row.id)
+      contributionActions.add(row.action)
+    }
+    nextCursor = page.body.selectedDay.nextCursor
+    assert.equal(page.body.selectedDay.hasMore, nextCursor !== null)
+  }
+  assert.equal(cursorPageCount, 3)
+  assert.equal(contributionIds.size, 27)
+  assert.equal(contributionActions.has('checkin'), true, 'The union retains file-event rows alongside stored review rows.')
+  assert.equal(contributionActions.has('review_requested'), true)
+  assert.equal(contributionActions.has('review_approved'), true)
+
+  const expectedFilterCounts = {
+    all: '27', checkins: '9', checkouts: '7', creates: '7', reviews: '3', approvals: '1',
+  }
+  for (const [filter, expectedCount] of Object.entries(expectedFilterCounts)) {
+    const filtered = await request(contributionsPath(userId, { filter, day: expected.contributionDay, limit: '100' }), {}, ownerToken)
+    assert.equal(filtered.status, 200)
+    assert.equal(filtered.body.counts[filter], expectedCount)
+    assert.equal(filtered.body.selectedDay.count, expectedCount)
+    assert.equal(filtered.body.selectedDay.rows.length, Number(expectedCount))
+    if (filter === 'approvals') assert.deepEqual(filtered.body.selectedDay.rows.map(row => row.action), ['review_approved'])
+    if (filter === 'reviews') assert.deepEqual(filtered.body.selectedDay.rows.map(row => row.action).sort(), ['review_approved', 'review_rejected', 'review_requested'])
+    if (filter === 'checkins') assert.ok(filtered.body.selectedDay.rows.every(row => row.action === 'checkin'))
+    if (filter === 'checkouts') assert.ok(filtered.body.selectedDay.rows.every(row => row.action === 'checkout'))
+    if (filter === 'creates') assert.ok(filtered.body.selectedDay.rows.every(row => row.action === 'create'))
+  }
+
+  const memberContributionsResponse = await request(contributionsPath(memberId, { day: expected.contributionDay, limit: '100' }), {}, memberToken)
+  assert.equal(memberContributionsResponse.status, 200)
+  assert.deepEqual(memberContributionsResponse.body.counts, { all: '7', checkins: '2', checkouts: '1', creates: '1', reviews: '3', approvals: '0' })
+  assert.equal(memberContributionsResponse.body.selectedDay.count, '7')
+  const memberReviewRows = memberContributionsResponse.body.selectedDay.rows.filter(row => row.action.startsWith('review_'))
+  assert.deepEqual(memberReviewRows.map(row => row.action).sort(), ['review_kicked_back', 'review_requested', 'review_requested'], 'A reviewer kickback remains distinct and one request is shown for the round rather than each assignee.')
+  assert.equal(memberContributionsResponse.body.selectedDay.rows.some(row => row.fileName === expected.hiddenFileName), false, 'An inaccessible vault must be excluded from both counts and selected-day rows.')
+  const ownerViewingMemberContributions = await request(contributionsPath(memberId, { day: expected.contributionDay, limit: '100' }), {}, ownerToken)
+  assert.equal(ownerViewingMemberContributions.status, 200)
+  assert.deepEqual(ownerViewingMemberContributions.body.counts, { all: '11', checkins: '3', checkouts: '2', creates: '1', reviews: '5', approvals: '1' })
+  assert.equal(ownerViewingMemberContributions.body.selectedDay.rows.some(row => row.fileName === expected.hiddenFileName), true, 'An owner may see matching contribution rows from both same-organization vaults.')
+  assert.equal(ownerViewingMemberContributions.body.selectedDay.rows.filter(row => row.action === 'review_requested').length, 3, 'One request is counted per review round rather than once per assigned reviewer.')
+
+  const noDay = await request(contributionsPath(userId), {}, ownerToken)
+  assert.equal(noDay.status, 200)
+  assert.equal(noDay.body.selectedDay, null)
+  for (const invalidPath of [
+    contributionsPath(userId, { filter: 'everything' }),
+    contributionsPath(userId, { day: '2026-02-30' }),
+    contributionsPath(userId, { limit: '101' }),
+    contributionsPath(userId, { limit: '10' }),
+    contributionsPath(userId, { day: expected.contributionDay, cursor: 'not-a-cursor' }),
+    contributionsPath(userId, { cursor: 'not-a-cursor' }),
+    `/users/${userId}/profile/summary?view=other`,
+  ]) {
+    const invalid = await request(invalidPath, {}, ownerToken)
+    assert.equal(invalid.status, 400)
+  }
   const forbiddenTarget = await request(`/users/${userId}/profile/summary`, {}, memberToken)
   assert.equal(forbiddenTarget.status, 403, 'A member cannot inspect another user profile.')
+  const forbiddenContributionTarget = await request(contributionsPath(userId), {}, memberToken)
+  assert.equal(forbiddenContributionTarget.status, 403, 'A member cannot inspect another user contribution view.')
   const foreignTarget = await request(`/users/${expected.foreignUserId}/profile/summary`, {}, ownerToken)
   assert.equal(foreignTarget.status, 404, 'A different-organization user is not distinguishable from a missing profile.')
+  const foreignContributionTarget = await request(contributionsPath(expected.foreignUserId), {}, ownerToken)
+  assert.equal(foreignContributionTarget.status, 404)
   const unauthenticated = await request(`/users/${userId}/profile/summary`)
   assert.equal(unauthenticated.status, 401)
 

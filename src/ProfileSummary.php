@@ -198,8 +198,8 @@ final class ProfileSummary
         Runtime::respond(200, $result);
     }
 
-    /** @return array{string, list<string>} */
-    private static function actorPredicate(string $targetId): array
+    /** Shared allowlisted actor scope for read-only profile views. @internal @return array{string, list<string>} */
+    public static function actorPredicate(string $targetId): array
     {
         $branches = [];
         $parameters = [];
@@ -212,7 +212,7 @@ final class ProfileSummary
         return [implode(' OR ', $branches), $parameters];
     }
 
-    /** @param array<string, mixed> $principal */
+    /** Shared file-vault read scope for read-only profile views. @internal @param array<string, mixed> $principal */
     private static function fileVisibilityPredicate(array $principal): string
     {
         $fileId = self::eventFileIdExpression();
@@ -223,7 +223,7 @@ final class ProfileSummary
     }
 
     /** @param array<string, mixed> $principal */
-    private static function fileAccessPredicate(array $principal): string
+    public static function fileAccessPredicate(array $principal): string
     {
         return in_array($principal['role'], ['owner', 'admin'], true)
             ? '1 = 1'
@@ -232,7 +232,8 @@ final class ProfileSummary
                 . ' WHERE tva.vault_id = f.vault_id AND tm.user_id = ?)';
     }
 
-    private static function eventFileIdExpression(): string
+    /** Shared event-to-file identity expression for profile read scopes. @internal */
+    public static function eventFileIdExpression(): string
     {
         return "CASE WHEN e.type = 'review.rejected' THEN JSON_UNQUOTE(JSON_EXTRACT(e.payload, '$.fileId')) ELSE e.aggregate_id END";
     }
@@ -245,7 +246,8 @@ final class ProfileSummary
         return false;
     }
 
-    private static function decimal(mixed $value): string
+    /** @internal */
+    public static function decimal(mixed $value): string
     {
         $decimal = (string)$value;
         if (!preg_match('/^(0|[1-9][0-9]*)$/', $decimal)) {
@@ -254,7 +256,8 @@ final class ProfileSummary
         return $decimal;
     }
 
-    private static function databaseDateTime(string $databaseDateTime): string
+    /** @internal */
+    public static function databaseDateTime(string $databaseDateTime): string
     {
         if (!preg_match('/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{6}$/', $databaseDateTime)) {
             throw new RuntimeException('Profile summary returned an invalid database-local DATETIME.');

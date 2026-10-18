@@ -126,6 +126,70 @@ function seedProfileSummary(PDO $db, string $organizationId, string $ownerId, st
             $insertEvent->execute([$organizationId, 'file.checked_in', $fileId, json_encode(['userId' => $actorId], JSON_THROW_ON_ERROR), fixtureTimestamp($today)]);
             if ($actorId === $ownerId) $ownerDays[$today->format('Y-m-d')] = ($ownerDays[$today->format('Y-m-d')] ?? 0) + 1;
         }
+        $ownerContributionTypes = ['file.checked_in', 'file.checked_out', 'file.imported'];
+        for ($index = 0; $index < 21; $index++) {
+            $type = $ownerContributionTypes[$index % count($ownerContributionTypes)];
+            $insertEvent->execute([$organizationId, $type, $visibleFileId, json_encode(['userId' => $ownerId], JSON_THROW_ON_ERROR), fixtureTimestamp($today)]);
+            $ownerDays[$today->format('Y-m-d')] = ($ownerDays[$today->format('Y-m-d')] ?? 0) + 1;
+        }
+        foreach ([['file.checked_in', $visibleFileId], ['file.checked_out', $visibleFileId], ['file.imported', $visibleFileId], ['file.checked_out', $hiddenFileId]] as [$type, $fileId]) {
+            $insertEvent->execute([$organizationId, $type, $fileId, json_encode(['userId' => $memberId], JSON_THROW_ON_ERROR), fixtureTimestamp($today)]);
+        }
+        $insertEvent->execute([
+            $organizationId,
+            'file.workflow_transition_executed',
+            $visibleFileId,
+            json_encode(['userId' => $ownerId, 'transitionId' => fixtureUuid()], JSON_THROW_ON_ERROR),
+            fixtureTimestamp($today),
+        ]);
+        $ownerDays[$today->format('Y-m-d')] = ($ownerDays[$today->format('Y-m-d')] ?? 0) + 1;
+
+        $workflowId = fixtureUuid();
+        $fromStateId = fixtureUuid();
+        $toStateId = fixtureUuid();
+        $transitionId = fixtureUuid();
+        $insertEvent->execute([
+            $organizationId,
+            'file.workflow_review_requested',
+            $visibleFileId,
+            json_encode(['fileId' => $visibleFileId, 'transitionId' => $transitionId, 'userId' => $memberId], JSON_THROW_ON_ERROR),
+            fixtureTimestamp($today),
+        ]);
+        $db->prepare('INSERT INTO workflow_templates (id, organization_id, name, created_by) VALUES (?, ?, ?, ?)')
+            ->execute([$workflowId, $organizationId, 'Profile contributions fixture workflow', $ownerId]);
+        $insertState = $db->prepare('INSERT INTO workflow_states (id, workflow_id, name) VALUES (?, ?, ?)');
+        $insertState->execute([$fromStateId, $workflowId, 'Fixture from state']);
+        $insertState->execute([$toStateId, $workflowId, 'Fixture to state']);
+        $db->prepare('INSERT INTO workflow_transitions (id, workflow_id, from_state_id, to_state_id, waypoints) VALUES (?, ?, ?, ?, ?)')
+            ->execute([$transitionId, $workflowId, $fromStateId, $toStateId, '[]']);
+        $gateIds = [];
+        $insertGate = $db->prepare('INSERT INTO workflow_gates (id, transition_id, name) VALUES (?, ?, ?)');
+        for ($index = 1; $index <= 4; $index++) {
+            $gateIds[$index] = fixtureUuid();
+            $insertGate->execute([$gateIds[$index], $transitionId, 'Profile fixture gate ' . $index]);
+        }
+        $reviewRows = [
+            [$visibleFileId, $gateIds[1], $memberId, $ownerId, 'approved', $ownerId],
+            [$visibleFileId, $gateIds[2], $memberId, $memberId, 'pending', null],
+            [$visibleFileId, $gateIds[1], $ownerId, $memberId, 'kicked_back', $memberId],
+            [$visibleFileId, $gateIds[3], $memberId, $ownerId, 'rejected', $ownerId],
+            [$hiddenFileId, $gateIds[4], $memberId, $memberId, 'approved', $memberId],
+        ];
+        $roundA = fixtureUuid();
+        $roundB = fixtureUuid();
+        $roundC = fixtureUuid();
+        $roundD = fixtureUuid();
+        $rounds = [$roundA, $roundA, $roundB, $roundC, $roundD];
+        $insertReview = $db->prepare('INSERT INTO pending_reviews
+            (id, organization_id, file_id, transition_id, gate_id, review_round_id, requested_by, assigned_to, status, requested_at, reviewed_at, reviewed_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+        foreach ($reviewRows as $index => [$fileId, $gateId, $requestedBy, $assignedTo, $status, $reviewedBy]) {
+            $reviewedAt = $reviewedBy === null ? null : fixtureTimestamp($today);
+            $insertReview->execute([
+                fixtureUuid(), $organizationId, $fileId, $transitionId, $gateId, $rounds[$index], $requestedBy,
+                $assignedTo, $status, fixtureTimestamp($today), $reviewedAt, $reviewedBy,
+            ]);
+        }
         $insertReviewRejected = static function (string $fileId, string $actorId) use ($insertEvent, $organizationId, $today, $ownerId, &$ownerDays): void {
             $insertEvent->execute([
                 $organizationId,
@@ -187,9 +251,11 @@ function seedProfileSummary(PDO $db, string $organizationId, string $ownerId, st
             'foreignUserId' => $foreignUserId,
             'databaseSessionTimeZone' => $clock['sessionTimeZone'],
             'leapDayPriorYear' => $clock['leapDayPriorYear'],
-            'ownerExpectedCount' => '515',
+            'ownerExpectedCount' => '537',
             'ownerDailyCounts' => array_map(static fn(string $day, int $count): array => ['day' => $day, 'count' => (string)$count], array_keys($ownerDays), array_values($ownerDays)),
-            'memberExpectedCount' => '4',
+            'memberExpectedCount' => '8',
+            'ownerViewMemberExpectedCount' => '11',
+            'contributionDay' => $today->format('Y-m-d'),
             'visibleFileName' => 'visible-profile-file.txt',
             'hiddenFileName' => 'hidden-profile-file.txt',
             'ecoNumbers' => array_merge(array_column($ecoIds, 'number'), array_slice($ownerAssociatedEcoNumbers, 0, 4)),
