@@ -479,6 +479,51 @@ try {
     'approved,approved',
   ].sort())
 
+  // A removed same-organization reviewer invalidates an active round only on
+  // explicit resubmission. The old terminal vote remains historical; no vote
+  // is copied into the newly selected, complete two-gate round.
+  const departedReviewer = createUser('departed-reviewer')
+  const orphaned = flow({ mode: 'all', rules: [{ type: 'user', user: departedReviewer }] })
+  const secondGate = randomUUID()
+  sql(`INSERT INTO workflow_gates(id,transition_id,name,approval_mode,required_approvals,is_blocking) VALUES('${secondGate}','${orphaned.transition}','Second gate','all',1,TRUE);
+       INSERT INTO workflow_gate_reviewers(id,gate_id,reviewer_type,user_id) VALUES('${randomUUID()}','${secondGate}','user','${quorumTwo.id}')`)
+  assert.equal((await start(orphaned)).result.requires_review, true)
+  const oldRows = rows(`SELECT id,gate_id,assigned_to,review_round_id,status FROM pending_reviews WHERE file_id='${orphaned.file}' ORDER BY gate_id`)
+  assert.equal(oldRows.length, 2)
+  const oldRoundId = oldRows[0][3]
+  assert.equal(oldRows.every(row => row[3] === oldRoundId && row[4] === 'pending'), true)
+  const oldGateTwoReview = (await mineFor(quorumTwo.token, orphaned.file)).find(review => review.gate_id === secondGate)
+  assert.ok(oldGateTwoReview)
+  assert.equal((await decision(oldGateTwoReview.review_id, quorumTwo.token, 'approved')).result.requires_review, true)
+  const oldTerminal = rows(`SELECT id,status,reviewed_by,review_round_id FROM pending_reviews WHERE id='${oldGateTwoReview.review_id}'`)[0]
+  const deleteReviewer = await fetch(`${server}/users/${departedReviewer.id}`, { method: 'DELETE', headers: { Accept: 'application/json', Authorization: `Bearer ${owner}` } })
+  assert.equal(deleteReviewer.status, 204)
+  assert.equal(rows(`SELECT COUNT(*) FROM organization_memberships WHERE organization_id='${org}' AND user_id='${departedReviewer.id}'`)[0][0], '0')
+
+  assert.equal((await start(orphaned)).result.requires_review, true)
+  assert.deepEqual(state(orphaned), [orphaned.from, String(orphaned.revision)])
+  assert.deepEqual(rows(`SELECT id,status,reviewed_by,review_round_id FROM pending_reviews WHERE id='${oldRows[0][0]}' OR id='${oldRows[1][0]}' ORDER BY id`), [
+    ...oldRows.map(row => [row[0], row[0] === oldGateTwoReview.review_id ? 'approved' : 'cancelled', row[0] === oldGateTwoReview.review_id ? quorumTwo.id : 'NULL', oldRoundId]).sort((left, right) => left[0].localeCompare(right[0])),
+  ])
+  assert.deepEqual(rows(`SELECT id,status,reviewed_by,review_round_id FROM pending_reviews WHERE id='${oldGateTwoReview.review_id}'`)[0], oldTerminal)
+  const freshRows = rows(`SELECT gate_id,assigned_to,review_round_id,status FROM pending_reviews WHERE file_id='${orphaned.file}' AND review_round_id <> '${oldRoundId}' ORDER BY gate_id`)
+  assert.equal(freshRows.length, 2)
+  const freshRoundId = freshRows[0][2]
+  assert.notEqual(freshRoundId, oldRoundId)
+  assert.equal(freshRows.every(row => row[2] === freshRoundId && row[3] === 'pending'), true)
+  assert.deepEqual(freshRows.map(row => [row[0], row[1]]), [[orphaned.gateId, user], [secondGate, quorumTwo.id]].sort((left, right) => left[0].localeCompare(right[0])))
+
+  // Repeated submit with no remaining orphan preserves the replacement round
+  // and its frozen reviewer set instead of silently recalculating membership.
+  await start(orphaned)
+  assert.deepEqual(rows(`SELECT gate_id,assigned_to,review_round_id,status FROM pending_reviews WHERE file_id='${orphaned.file}' AND review_round_id <> '${oldRoundId}' ORDER BY gate_id`), freshRows)
+  const freshGateOne = (await mineFor(owner, orphaned.file)).find(review => review.gate_id === orphaned.gateId)
+  const freshGateTwo = (await mineFor(quorumTwo.token, orphaned.file)).find(review => review.gate_id === secondGate)
+  assert.ok(freshGateOne && freshGateTwo)
+  assert.equal((await decision(freshGateOne.review_id, owner)).result.requires_review, true)
+  assert.equal((await decision(freshGateTwo.review_id, quorumTwo.token)).result.new_state_id, orphaned.to)
+  assert.equal(rows(`SELECT COUNT(*) FROM pending_reviews WHERE file_id='${orphaned.file}' AND review_round_id='${freshRoundId}' AND status='approved'`)[0][0], '2')
+
   // Ambiguous legacy partial quorums cannot approve from uncertain history,
   // but assigned reviewers can close the remaining pending task using the
   // existing reject/return actions. Terminal decisions and file history stay
@@ -582,8 +627,13 @@ try {
   await decision(staleReview.review_id, quorumOne.token, 'approved', 409)
   assert.deepEqual(state(stale), [stale.to, String(stale.revision)])
   assert.equal(statuses(stale), 'cancelled:1')
-  const duplicate = flow({ rules: [{ type: 'user', user: quorumOne }] }); await start(duplicate); await start(duplicate)
-  assert.equal(rows(`SELECT COUNT(*) FROM pending_reviews WHERE file_id='${duplicate.file}'`)[0][0], '1')
+  const duplicate = flow({ rules: [{ type: 'role', role: 'admin' }] }); await start(duplicate)
+  const duplicateBefore = rows(`SELECT assigned_to,review_round_id FROM pending_reviews WHERE file_id='${duplicate.file}' ORDER BY assigned_to`)
+  const duplicateRound = duplicateBefore[0][1]
+  createUser('late-admin')
+  await start(duplicate)
+  assert.deepEqual(rows(`SELECT assigned_to,review_round_id FROM pending_reviews WHERE file_id='${duplicate.file}' ORDER BY assigned_to`), duplicateBefore)
+  assert.equal(rows(`SELECT COUNT(*) FROM pending_reviews WHERE file_id='${duplicate.file}' AND review_round_id <> '${duplicateRound}'`)[0][0], '0')
 
   // E: another organization and an inaccessible same-org vault can neither list nor decide/execute reviews.
   const foreignOrg = randomUUID(), foreignUser = randomUUID(), foreignToken = `foreign-${randomUUID()}`

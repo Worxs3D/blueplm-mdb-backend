@@ -60,6 +60,23 @@ final class WorkflowReviewRounds
         }
     }
 
+    private static function hasOrphanedPendingReviewer(PDO $db, string $organizationId, string $fileId, string $transitionId, string $roundId): bool
+    {
+        $query = $db->prepare(
+            'SELECT 1
+             FROM pending_reviews pr
+             WHERE pr.organization_id = ? AND pr.file_id = ? AND pr.transition_id = ?
+               AND pr.review_round_id = ? AND pr.status = \'pending\'
+               AND NOT EXISTS (
+                   SELECT 1 FROM organization_memberships m
+                   WHERE m.organization_id = pr.organization_id AND m.user_id = pr.assigned_to
+               )
+             LIMIT 1'
+        );
+        $query->execute([$organizationId, $fileId, $transitionId, $roundId]);
+        return $query->fetchColumn() !== false;
+    }
+
     /** @param array<string, mixed> $principal @param array<int, string> $matches */
     public static function executeTransition(PDO $db, array $principal, array $matches): void
     {
@@ -116,7 +133,14 @@ final class WorkflowReviewRounds
                     $db->rollBack();
                     Runtime::respond(409, ['error' => 'REVIEW_ROUND_STATE_AMBIGUOUS', 'message' => 'The active review round requires administrator recovery.']);
                 }
-                if ($rounds === []) self::createReviews($db, $principal, $matches[1], $transitionRow['id'], $gates, Runtime::uuid());
+                if ($rounds === []) {
+                    self::createReviews($db, $principal, $matches[1], $transitionRow['id'], $gates, Runtime::uuid());
+                } elseif (self::hasOrphanedPendingReviewer($db, $principal['organizationId'], $matches[1], $transitionRow['id'], $rounds[0]['review_round_id'])) {
+                    $oldRoundId = (string)$rounds[0]['review_round_id'];
+                    $db->prepare("UPDATE pending_reviews SET status = 'cancelled' WHERE organization_id = ? AND file_id = ? AND transition_id = ? AND review_round_id = ? AND status = 'pending'")
+                        ->execute([$principal['organizationId'], $matches[1], $transitionRow['id'], $oldRoundId]);
+                    self::createReviews($db, $principal, $matches[1], $transitionRow['id'], $gates, Runtime::uuid());
+                }
                 Runtime::emitEvent($db, $principal['organizationId'], 'file.workflow_review_requested', $matches[1], [
                     'fileId' => $matches[1], 'transitionId' => $transitionRow['id'], 'userId' => $principal['userId'],
                 ]);
