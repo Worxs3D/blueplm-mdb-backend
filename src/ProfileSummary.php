@@ -81,9 +81,7 @@ final class ProfileSummary
             $where = 'e.organization_id = ? AND e.created_at >= ? AND e.created_at <= ? AND ('
                 . $actorPredicate . ') AND (' . $visibilityPredicate . ')';
             $parameters = [$principal['organizationId'], $window['fromDatabaseTime'], $window['untilDatabaseTime'], ...$actorParameters];
-            if (!in_array($principal['role'], ['owner', 'admin'], true)) {
-                array_push($parameters, $principal['userId'], $principal['userId']);
-            }
+            array_push($parameters, ...self::fileAccessParameters($principal));
 
             $countQuery = $db->prepare("SELECT CAST(COUNT(*) AS CHAR) FROM events e WHERE {$where}");
             $countQuery->execute($parameters);
@@ -152,9 +150,7 @@ final class ProfileSummary
                  ORDER BY e.created_at DESC, e.id DESC LIMIT 10"
             );
             $ecoParameters = [$principal['organizationId'], $targetId, $targetId];
-            if (!in_array($principal['role'], ['owner', 'admin'], true)) {
-                array_push($ecoParameters, $principal['userId'], $principal['userId']);
-            }
+            array_push($ecoParameters, ...self::fileAccessParameters($principal));
             $ecoQuery->execute($ecoParameters);
             $ownEcos = [];
             foreach ($ecoQuery->fetchAll() as $row) {
@@ -225,11 +221,21 @@ final class ProfileSummary
     /** @param array<string, mixed> $principal */
     public static function fileAccessPredicate(array $principal): string
     {
-        return in_array($principal['role'], ['owner', 'admin'], true)
-            ? '1 = 1'
-            : 'EXISTS (SELECT 1 FROM vault_access va WHERE va.vault_id = f.vault_id AND va.user_id = ?)'
-                . ' OR EXISTS (SELECT 1 FROM team_vault_access tva JOIN team_members tm ON tm.team_id = tva.team_id'
-                . ' WHERE tva.vault_id = f.vault_id AND tm.user_id = ?)';
+        if (in_array($principal['role'], ['owner', 'admin'], true)) return '1 = 1';
+        $directGrant = 'EXISTS (SELECT 1 FROM vault_access va WHERE va.vault_id = f.vault_id AND va.user_id = ?)';
+        if ($principal['role'] === 'guest') return $directGrant;
+        return $directGrant
+            . ' OR EXISTS (SELECT 1 FROM team_vault_access tva JOIN team_members tm ON tm.team_id = tva.team_id'
+            . ' WHERE tva.vault_id = f.vault_id AND tm.user_id = ?)';
+    }
+
+    /** @param array<string, mixed> $principal @return list<string> */
+    public static function fileAccessParameters(array $principal): array
+    {
+        if (in_array($principal['role'], ['owner', 'admin'], true)) return [];
+        return $principal['role'] === 'guest'
+            ? [$principal['userId']]
+            : [$principal['userId'], $principal['userId']];
     }
 
     /** Shared event-to-file identity expression for profile read scopes. @internal */

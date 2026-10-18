@@ -161,8 +161,8 @@ final class ProfileContributions
     {
         [$actorPredicate, $actorParameters] = ProfileSummary::actorPredicate($targetId);
         $access = ProfileSummary::fileAccessPredicate($principal);
-        $eventAccessParameters = self::fileAccessParameters($principal);
-        $reviewAccessParameters = self::fileAccessParameters($principal);
+        $eventAccessParameters = ProfileSummary::fileAccessParameters($principal);
+        $reviewAccessParameters = ProfileSummary::fileAccessParameters($principal);
         $eventFile = ProfileSummary::eventFileIdExpression();
         $sql = "event_rows AS (
                     SELECT CONVERT(CAST(e.sequence_id AS CHAR(20)) USING utf8mb4) COLLATE utf8mb4_unicode_ci AS rowId, 'event' AS sourceKind,
@@ -233,17 +233,9 @@ final class ProfileContributions
             $principal['organizationId'], $window['fromDatabaseTime'], $window['untilDatabaseTime'],
             ...$actorParameters, ...$eventAccessParameters,
             $principal['organizationId'], $targetId, $window['fromDatabaseTime'], $window['untilDatabaseTime'], ...$reviewAccessParameters,
-            $principal['organizationId'], $targetId, $window['fromDatabaseTime'], $window['untilDatabaseTime'], ...self::fileAccessParameters($principal),
+            $principal['organizationId'], $targetId, $window['fromDatabaseTime'], $window['untilDatabaseTime'], ...ProfileSummary::fileAccessParameters($principal),
         ];
         return [$sql, $parameters];
-    }
-
-    /** @param array<string, mixed> $principal @return list<string> */
-    private static function fileAccessParameters(array $principal): array
-    {
-        return in_array($principal['role'], ['owner', 'admin'], true)
-            ? []
-            : [$principal['userId'], $principal['userId']];
     }
 
     /** @param list<mixed> $parameters @return array{all:string,checkins:string,checkouts:string,creates:string,reviews:string,approvals:string} */

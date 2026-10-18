@@ -37,7 +37,22 @@ assert.equal(path.resolve(repoRoot), path.resolve(process.cwd()), 'Run from the 
 const scriptOwner = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 assert.equal(path.resolve(repoRoot), scriptOwner, 'The runner file must belong to the same PHP Git owner as the process CWD.')
 const evidencePath = path.resolve(options.evidence)
-assert.equal(path.relative(path.resolve(repoRoot), evidencePath).startsWith('..'), true, 'Evidence must stay outside the source checkout.')
+function isExternalEvidencePath(ownerPath, candidatePath) {
+  const relativePath = path.relative(path.resolve(ownerPath), path.resolve(candidatePath))
+  const sameVolumeParent = relativePath === '..' || relativePath.startsWith(`..${path.sep}`)
+  const otherLocalVolume = path.isAbsolute(relativePath) && !relativePath.startsWith('\\\\')
+  return sameVolumeParent || otherLocalVolume
+}
+const evidenceOutsideOwner = path.resolve(repoRoot, '..', 'profile-summary-evidence-neighbor')
+assert.equal(isExternalEvidencePath(repoRoot, repoRoot), false, 'The owner itself is not external evidence storage.')
+assert.equal(isExternalEvidencePath(repoRoot, path.join(repoRoot, 'ordinary-child')), false, 'A normal child directory stays inside the source checkout.')
+assert.equal(isExternalEvidencePath(repoRoot, path.join(repoRoot, '..evil')), false, 'A child name beginning with two dots is not a parent directory.')
+assert.equal(isExternalEvidencePath(repoRoot, evidenceOutsideOwner), true, 'A same-volume sibling is valid external evidence storage.')
+if (process.platform === 'win32') {
+  assert.equal(isExternalEvidencePath(repoRoot, 'C:\\profile-summary-external-evidence'), true, 'An absolute path on another local drive is valid external evidence storage.')
+  assert.equal(isExternalEvidencePath(repoRoot, '\\\\server\\share\\profile-summary-evidence'), false, 'UNC evidence storage is not enabled by this local test harness.')
+}
+assert.equal(isExternalEvidencePath(repoRoot, evidencePath), true, 'Evidence must stay outside the source checkout.')
 
 const compose = ['compose', '-p', options.project, '-f', 'docker-compose.test.yml', '-f', options.override]
 const runDocker = args => execFileSync(options.docker, args, {
@@ -224,13 +239,49 @@ try {
   assert.equal(typeof memberLogin.body?.token, 'string')
   const memberToken = memberLogin.body.token
 
-  const expected = fixture('seed', organizationId, userId, memberId)
+const guestEmail = `guest-${randomUUID()}@profile-summary.test`
+const guestPassword = 'Profile guest fixture password 789!'
+const createdGuest = await request('/users', {
+  method: 'POST',
+  body: JSON.stringify({ email: guestEmail, displayName: 'Profile Fixture Guest', password: guestPassword, role: 'guest' }),
+}, ownerToken)
+assert.equal(createdGuest.status, 201)
+const guestId = createdGuest.body.id
+const guestLogin = await request('/auth/login', {
+  method: 'POST',
+  body: JSON.stringify({ email: guestEmail, password: guestPassword }),
+})
+assert.equal(guestLogin.status, 200)
+assert.equal(typeof guestLogin.body?.token, 'string')
+const guestToken = guestLogin.body.token
+
+const expected = fixture('seed', organizationId, userId, memberId, guestId)
   assert.equal(expected.ownerId, userId)
   assert.equal(expected.memberId, memberId)
+assert.equal(expected.guestId, guestId)
   assert.equal(expected.databaseSessionTimeZone, '+02:00', 'The isolated MariaDB sessions must prove the non-UTC test basis.')
   assert.equal(expected.leapDayPriorYear, '2023-02-28 12:00:00.000000', 'The fixture must use MariaDB DATE_SUB month-end semantics for leap-day boundaries.')
 
   const summary = await request(`/users/${userId}/profile/summary`, {}, ownerToken)
+const profileTeam = await request('/teams', {
+  method: 'POST',
+  body: JSON.stringify({ name: 'Profile Summary Team', color: '#2563eb', icon: 'Users' }),
+}, ownerToken)
+assert.equal(profileTeam.status, 201)
+for (const teamUserId of [memberId, guestId]) {
+  const added = await request(`/teams/${profileTeam.body.id}/members`, {
+    method: 'POST',
+    body: JSON.stringify({ userId: teamUserId }),
+  }, ownerToken)
+  assert.ok(added.status === 200 || added.status === 201 || added.status === 204)
+}
+const teamVaultAccess = await request(`/teams/${profileTeam.body.id}/vault-access`, {
+  method: 'PUT',
+  body: JSON.stringify({ vaultIds: [expected.visibleVaultId] }),
+}, ownerToken)
+assert.equal(teamVaultAccess.status, 200)
+assert.equal((await request('/vaults', {}, guestToken)).body.vaults.some(vault => vault.id === expected.visibleVaultId), false, 'A guest must not inherit the team vault grant listed for ordinary members.')
+
   assert.equal(summary.status, 200, `Expected authenticated profile summary HTTP 200, got HTTP ${summary.status}${summary.body?.error ? ` (${summary.body.error})` : ''}.`)
   assert.deepEqual(Object.keys(summary.body).sort(), ['activity', 'deviceLastSeen', 'ownEcos', 'timeBasis', 'window'])
   assert.equal(summary.body.timeBasis, 'database-local-unverified')
@@ -272,6 +323,30 @@ try {
   const memberRejected = memberSummary.body.activity.recent.filter(item => item.type === 'review.rejected')
   assert.deepEqual(memberRejected.map(item => item.targetLabel), [expected.visibleFileName], 'Members see rejected-review events only for accessible vaults.')
   assert.equal(JSON.stringify(memberSummary.body).includes('private-marker'), false)
+
+const guestSummary = await request(`/users/${guestId}/profile/summary`, {}, guestToken)
+assert.equal(guestSummary.status, 200)
+assert.equal(guestSummary.body.activity.totalCount, '0', 'A guest cannot use team-only file access to reveal their own activity metadata.')
+assert.equal(guestSummary.body.activity.recent.some(item => item.targetLabel === expected.visibleFileName), false)
+assert.equal(guestSummary.body.ownEcos.some(eco => eco.ecoNumber === expected.guestLinkedEcoNumber), false, 'A guest cannot reveal linked ECO metadata through a team-only vault grant.')
+const guestContributions = await request(contributionsPath(guestId, { day: expected.contributionDay, limit: '100' }), {}, guestToken)
+assert.equal(guestContributions.status, 200)
+assert.equal(guestContributions.body.counts.all, '0', 'Team-only file events and review requests are excluded from guest contribution counts.')
+assert.equal(guestContributions.body.selectedDay.rows.some(row => row.fileName === expected.visibleFileName), false)
+
+const guestDirectGrant = await request(`/users/${guestId}/vault-access`, {
+  method: 'PUT',
+  body: JSON.stringify({ vaultIds: [expected.visibleVaultId] }),
+}, ownerToken)
+assert.equal(guestDirectGrant.status, 200)
+const guestDirectSummary = await request(`/users/${guestId}/profile/summary`, {}, guestToken)
+assert.equal(guestDirectSummary.status, 200)
+assert.equal(guestDirectSummary.body.activity.recent.some(item => item.targetLabel === expected.visibleFileName), true, 'An explicit guest vault grant preserves legitimate profile visibility.')
+assert.equal(guestDirectSummary.body.ownEcos.some(eco => eco.ecoNumber === expected.guestLinkedEcoNumber), true)
+const guestDirectContributions = await request(contributionsPath(guestId, { day: expected.contributionDay, limit: '100' }), {}, guestToken)
+assert.equal(guestDirectContributions.status, 200)
+assert.equal(guestDirectContributions.body.counts.all, '2', 'A direct guest grant allows the guest file event and review request rows.')
+assert.deepEqual(guestDirectContributions.body.selectedDay.rows.map(row => row.fileName).sort(), [expected.visibleFileName, expected.visibleFileName])
 
   const ownerMemberSummary = await request(`/users/${memberId}/profile/summary`, {}, ownerToken)
   assert.equal(ownerMemberSummary.status, 200)

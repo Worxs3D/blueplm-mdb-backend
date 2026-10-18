@@ -37,10 +37,11 @@ function fixtureDatabase(): PDO
     );
 }
 
-function seedProfileSummary(PDO $db, string $organizationId, string $ownerId, string $memberId): array
+function seedProfileSummary(PDO $db, string $organizationId, string $ownerId, string $memberId, string $guestId): array
 {
     $ownerId = strtolower($ownerId);
     $memberId = strtolower($memberId);
+    $guestId = strtolower($guestId);
     $db->beginTransaction();
     try {
         $db->prepare('DELETE FROM events WHERE organization_id = ?')->execute([$organizationId]);
@@ -49,8 +50,6 @@ function seedProfileSummary(PDO $db, string $organizationId, string $ownerId, st
         $hiddenVaultId = fixtureUuid();
         $db->prepare('INSERT INTO vaults (id, organization_id, name, network_root) VALUES (?, ?, ?, ?)')->execute([$visibleVaultId, $organizationId, 'Profile fixture visible vault', 'fixture-visible-root']);
         $db->prepare('INSERT INTO vaults (id, organization_id, name, network_root) VALUES (?, ?, ?, ?)')->execute([$hiddenVaultId, $organizationId, 'Profile fixture hidden vault', 'fixture-hidden-root']);
-        $db->prepare('INSERT INTO vault_access (vault_id, user_id, granted_by) VALUES (?, ?, ?)')->execute([$visibleVaultId, $memberId, $ownerId]);
-
         $visibleFileId = fixtureUuid();
         $hiddenFileId = fixtureUuid();
         $missingFileId = fixtureUuid();
@@ -126,6 +125,7 @@ function seedProfileSummary(PDO $db, string $organizationId, string $ownerId, st
             $insertEvent->execute([$organizationId, 'file.checked_in', $fileId, json_encode(['userId' => $actorId], JSON_THROW_ON_ERROR), fixtureTimestamp($today)]);
             if ($actorId === $ownerId) $ownerDays[$today->format('Y-m-d')] = ($ownerDays[$today->format('Y-m-d')] ?? 0) + 1;
         }
+        $insertEvent->execute([$organizationId, 'file.checked_in', $visibleFileId, json_encode(['userId' => $guestId], JSON_THROW_ON_ERROR), fixtureTimestamp($today)]);
         $ownerContributionTypes = ['file.checked_in', 'file.checked_out', 'file.imported'];
         for ($index = 0; $index < 21; $index++) {
             $type = $ownerContributionTypes[$index % count($ownerContributionTypes)];
@@ -174,12 +174,14 @@ function seedProfileSummary(PDO $db, string $organizationId, string $ownerId, st
             [$visibleFileId, $gateIds[1], $ownerId, $memberId, 'kicked_back', $memberId],
             [$visibleFileId, $gateIds[3], $memberId, $ownerId, 'rejected', $ownerId],
             [$hiddenFileId, $gateIds[4], $memberId, $memberId, 'approved', $memberId],
+            [$visibleFileId, $gateIds[4], $guestId, $ownerId, 'pending', null],
         ];
         $roundA = fixtureUuid();
         $roundB = fixtureUuid();
         $roundC = fixtureUuid();
         $roundD = fixtureUuid();
-        $rounds = [$roundA, $roundA, $roundB, $roundC, $roundD];
+        $roundE = fixtureUuid();
+        $rounds = [$roundA, $roundA, $roundB, $roundC, $roundD, $roundE];
         $insertReview = $db->prepare('INSERT INTO pending_reviews
             (id, organization_id, file_id, transition_id, gate_id, review_round_id, requested_by, assigned_to, status, requested_at, reviewed_at, reviewed_by)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
@@ -230,6 +232,9 @@ function seedProfileSummary(PDO $db, string $organizationId, string $ownerId, st
         $memberVisibleEcoId = fixtureUuid();
         $insertEco->execute([$memberVisibleEcoId, $organizationId, 'PROFILE-MEMBER-LINKED-VISIBLE', 'Member visible linked ECO', 'open', $ownerId, fixtureTimestamp($now->modify('-11 days'))]);
         $insertFileEco->execute([fixtureUuid(), $visibleFileId, $memberVisibleEcoId, $memberId]);
+        $guestLinkedEcoId = fixtureUuid();
+        $insertEco->execute([$guestLinkedEcoId, $organizationId, 'PROFILE-GUEST-LINKED', 'Guest linked ECO', 'open', $ownerId, fixtureTimestamp($now->modify('-13 days'))]);
+        $insertFileEco->execute([fixtureUuid(), $visibleFileId, $guestLinkedEcoId, $guestId]);
         $memberHiddenEcoId = fixtureUuid();
         $insertEco->execute([$memberHiddenEcoId, $organizationId, 'PROFILE-MEMBER-LINKED-HIDDEN', 'Member hidden linked ECO', 'open', $ownerId, fixtureTimestamp($now->modify('-12 days'))]);
         $insertFileEco->execute([fixtureUuid(), $hiddenFileId, $memberHiddenEcoId, $memberId]);
@@ -248,6 +253,7 @@ function seedProfileSummary(PDO $db, string $organizationId, string $ownerId, st
         return [
             'ownerId' => $ownerId,
             'memberId' => $memberId,
+            'guestId' => $guestId,
             'foreignUserId' => $foreignUserId,
             'databaseSessionTimeZone' => $clock['sessionTimeZone'],
             'leapDayPriorYear' => $clock['leapDayPriorYear'],
@@ -258,6 +264,8 @@ function seedProfileSummary(PDO $db, string $organizationId, string $ownerId, st
             'contributionDay' => $today->format('Y-m-d'),
             'visibleFileName' => 'visible-profile-file.txt',
             'hiddenFileName' => 'hidden-profile-file.txt',
+            'visibleVaultId' => $visibleVaultId,
+            'guestLinkedEcoNumber' => 'PROFILE-GUEST-LINKED',
             'ecoNumbers' => array_merge(array_column($ecoIds, 'number'), array_slice($ownerAssociatedEcoNumbers, 0, 4)),
             'memberEcoNumber' => 'PROFILE-MEMBER-1',
             'memberVisibleEcoNumber' => 'PROFILE-MEMBER-LINKED-VISIBLE',
@@ -274,7 +282,8 @@ function seedProfileSummary(PDO $db, string $organizationId, string $ownerId, st
 
 try {
     if (($argv[1] ?? null) !== 'seed' || !isset($argv[2], $argv[3])) throw new RuntimeException('Fixture arguments are invalid.');
-    $result = seedProfileSummary(fixtureDatabase(), $argv[2], $argv[3], $argv[4] ?? '');
+    if (!isset($argv[5])) throw new RuntimeException('Guest fixture argument is required.');
+    $result = seedProfileSummary(fixtureDatabase(), $argv[2], $argv[3], $argv[4] ?? '', $argv[5]);
     echo json_encode($result, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES), PHP_EOL;
 } catch (Throwable $error) {
     fwrite(STDERR, 'Profile summary fixture failed (' . get_class($error) . ').' . PHP_EOL);
