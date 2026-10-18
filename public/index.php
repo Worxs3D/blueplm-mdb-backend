@@ -16,6 +16,7 @@ require dirname(__DIR__) . '/src/ColorSwatches.php';
 require dirname(__DIR__) . '/src/UserAvatars.php';
 require dirname(__DIR__) . '/src/JobTitles.php';
 require dirname(__DIR__) . '/src/WorkflowReviewRounds.php';
+require dirname(__DIR__) . '/src/RFQReads.php';
 
 use BluePlm\Migrator;
 use BluePlm\FileCheckout;
@@ -31,6 +32,7 @@ use BluePlm\DatabaseLifecycle;
 use BluePlm\Totp;
 use BluePlm\BundleManifest;
 use BluePlm\ColorSwatches;
+use BluePlm\RFQReads;
 use BluePlm\JobTitles;
 use BluePlm\WorkflowReviewRounds;
 
@@ -815,6 +817,7 @@ try {
             || str_starts_with($path, '/account/totp');
         if (!$personalWrite) Runtime::respond(403, ['error' => 'READ_ONLY_ROLE', 'message' => 'Viewer and guest accounts are read-only.']);
     }
+    RFQReads::dispatch($db, $principal, $method, $path);
     ColorSwatches::dispatch($db, $principal, $method, $path);
     JobTitles::dispatch($db, $principal, $method, $path);
 
