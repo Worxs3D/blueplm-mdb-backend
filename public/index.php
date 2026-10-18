@@ -13,6 +13,8 @@ require dirname(__DIR__) . '/src/Installation.php';
 require dirname(__DIR__) . '/src/DatabaseLifecycle.php';
 require dirname(__DIR__) . '/src/BundleManifest.php';
 require dirname(__DIR__) . '/src/ColorSwatches.php';
+require dirname(__DIR__) . '/src/ProfileSummary.php';
+require dirname(__DIR__) . '/src/ProfileContributions.php';
 require dirname(__DIR__) . '/src/UserAvatars.php';
 require dirname(__DIR__) . '/src/JobTitles.php';
 require dirname(__DIR__) . '/src/WorkflowReviewRounds.php';
@@ -26,6 +28,7 @@ use BluePlm\CheckoutLeaseFailure;
 use BluePlm\FileRevisionComment;
 use BluePlm\FileRevisionCommentFailure;
 use BluePlm\FileReferences;
+use BluePlm\ProfileSummary;
 use BluePlm\FileRevisionHistory;
 use BluePlm\Installation;
 use BluePlm\Runtime;
@@ -33,6 +36,7 @@ use BluePlm\DatabaseLifecycle;
 use BluePlm\Totp;
 use BluePlm\BundleManifest;
 use BluePlm\ColorSwatches;
+use BluePlm\ProfileContributions;
 use BluePlm\RFQReads;
 use BluePlm\RFQWrites;
 use BluePlm\JobTitles;
@@ -945,6 +949,15 @@ try {
         $query = $db->prepare('SELECT u.id, u.email, u.display_name AS displayName, m.role, u.created_at AS createdAt FROM users u JOIN organization_memberships m ON m.user_id = u.id WHERE m.organization_id = ? AND u.disabled_at IS NULL ORDER BY u.display_name, u.email');
         $query->execute([$principal['organizationId']]);
         Runtime::respond(200, ['users' => $query->fetchAll()]);
+    }
+    if ($method === 'GET' && preg_match('#^/users/([0-9a-f-]{36})/profile/summary$#i', $path, $matches)) {
+        if (array_key_exists('view', $_GET)) {
+            if ($_GET['view'] !== 'contributions') Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'The profile summary view is invalid.']);
+            $contributionQuery = $_GET;
+            unset($contributionQuery['view']);
+            ProfileContributions::respond($db, $principal, strtolower($matches[1]), $contributionQuery);
+        }
+        ProfileSummary::respond($db, $principal, strtolower($matches[1]));
     }
     if ($method === 'GET' && preg_match('#^/users/([0-9a-f-]{36})/profile$#i', $path, $matches)) {
         $targetId = $matches[1];
