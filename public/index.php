@@ -12,6 +12,7 @@ require dirname(__DIR__) . '/src/DatabaseLifecycle.php';
 require dirname(__DIR__) . '/src/BundleManifest.php';
 require dirname(__DIR__) . '/src/ColorSwatches.php';
 require dirname(__DIR__) . '/src/RFQReads.php';
+require dirname(__DIR__) . '/src/RFQWrites.php';
 
 use BluePlm\Migrator;
 use BluePlm\FileCheckout;
@@ -24,6 +25,7 @@ use BluePlm\Totp;
 use BluePlm\BundleManifest;
 use BluePlm\ColorSwatches;
 use BluePlm\RFQReads;
+use BluePlm\RFQWrites;
 
 const BLUEPLM_API_VERSION = 2;
 
@@ -852,6 +854,7 @@ try {
         if (!$personalWrite) Runtime::respond(403, ['error' => 'READ_ONLY_ROLE', 'message' => 'Viewer and guest accounts are read-only.']);
     }
     RFQReads::dispatch($db, $principal, $method, $path);
+    RFQWrites::dispatch($db, $principal, $method, $path);
     ColorSwatches::dispatch($db, $principal, $method, $path);
 
     // Workflow runtime endpoints are deliberately scoped through the file's
