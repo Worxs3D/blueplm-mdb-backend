@@ -259,6 +259,46 @@ but the API's read-only role guard rejects all swatch writes with `403`.
 Migration `040_color_swatches.sql` adds this storage to existing databases
 without modifying existing organization or membership records.
 
+## Workflow review rounds
+
+Migration `041_workflow_review_rounds.sql` preserves existing review rows and
+decisions while assigning server-owned round identifiers. New submissions may
+start a new round after the preceding round reaches a terminal outcome; previous
+decisions remain historical and do not count toward the new round's quorum.
+The round identifier is internal workflow state, not a client-supplied
+authorization value or an addition to the existing review API response shape.
+
+Older rows do not record their original round boundaries. If legacy pending and
+terminal decisions for the same workflow scope cannot be separated safely, the
+server marks that legacy state ambiguous and fails closed with
+`409 REVIEW_ROUND_STATE_AMBIGUOUS` for approval rather than guessing which
+decisions belong together or changing historical rows. An already assigned
+reviewer may close an ambiguous pending task using the existing reject or
+return-for-changes decision, subject to the normal authorization, expiry, and
+stale-state checks. This does not approve the workflow, advance the file state,
+or alter prior terminal decisions. When the outstanding legacy tasks are
+closed, a new submission receives a fresh server-owned round; decisions from
+the ambiguous legacy bucket do not count toward its quorum. Do not delete or
+relabel historical decisions to force a retry. Ambiguous tasks that cannot be
+closed through those existing actions remain fail-closed for operator review;
+there is no separate administrator recovery endpoint or automatic
+reconstruction of their original rounds.
+
+Migration `041_workflow_review_rounds.sql` requires coordinated deployment of
+the PHP code and schema. Before upgrading an existing service, take and verify
+a restorable database backup, then enable a maintenance/write block outside
+the API. Allow already-running PHP requests to finish before replacing the
+server code. Deploy the matching PHP code and migration together while writes
+remain blocked; then verify the migration ledger/schema and run the health and
+workflow-review smoke checks. Re-enable writes only after those checks succeed.
+If a check fails, keep writes blocked and investigate before resuming service.
+The installer and `DatabaseLifecycle` inspect database state and apply pending
+migrations. The `/admin/migrate` endpoint also applies pending migrations when
+presented with the maintenance token. None of these mechanisms establishes an
+external write block or drains in-flight requests. This sequence is an
+operational requirement, not a verified zero-downtime or rolling-upgrade
+procedure, and no installer-specific maintenance gate has been verified.
+
 ## Tests
 
 The integration test covers installer authorization, new installation,

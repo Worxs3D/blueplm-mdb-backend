@@ -44,6 +44,8 @@ final class Migrator
                 } elseif ($migration === '039_checkout_request_retention_indexes.sql') {
                     self::ensureCheckoutRequestRetentionIndexes($db);
                     $db->exec($sql);
+                } elseif ($migration === '041_workflow_review_rounds.sql') {
+                    self::ensureWorkflowReviewRounds($db);
                 } else {
                     $db->exec($sql);
                 }
@@ -135,6 +137,76 @@ final class Migrator
         foreach ($indexes as [$name, $columns]) {
             $query->execute(['checkout_acquisition_requests', $name]);
             if (!$query->fetchColumn()) $db->exec("ALTER TABLE checkout_acquisition_requests ADD INDEX `{$name}` ({$columns})");
+        }
+    }
+
+    private static function ensureWorkflowReviewRounds(PDO $db): void
+    {
+        $columnExists = $db->prepare(
+            'SELECT 1 FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ? LIMIT 1'
+        );
+        foreach ([
+            'review_round_id' => 'CHAR(36) NULL',
+            'is_legacy_round' => 'TINYINT(1) NOT NULL DEFAULT 0',
+            'legacy_round_ambiguous' => 'TINYINT(1) NOT NULL DEFAULT 0',
+        ] as $column => $definition) {
+            $columnExists->execute(['pending_reviews', $column]);
+            if (!$columnExists->fetchColumn()) {
+                $db->exec("ALTER TABLE pending_reviews ADD COLUMN `{$column}` {$definition}");
+            }
+        }
+
+        // Old rows have no trustworthy submission boundary. Keep every row and
+        // group legacy records only into an explicitly ambiguous migration
+        // bucket for this file/transition; new submissions always get a fresh
+        // server-generated round id.
+        $db->exec('DROP TEMPORARY TABLE IF EXISTS workflow_review_round_backfill');
+        $db->exec(
+            "CREATE TEMPORARY TABLE workflow_review_round_backfill AS
+             SELECT file_id, transition_id, UUID() AS review_round_id,
+                    MAX(status = 'pending') AS had_pending,
+                    MAX(status <> 'pending') AS had_terminal
+             FROM pending_reviews WHERE review_round_id IS NULL
+             GROUP BY file_id, transition_id"
+        );
+        $db->exec(
+            'UPDATE pending_reviews AS review
+             JOIN workflow_review_round_backfill AS legacy
+               ON legacy.file_id = review.file_id AND legacy.transition_id = review.transition_id
+             SET review.review_round_id = legacy.review_round_id,
+                 review.is_legacy_round = 1,
+                 review.legacy_round_ambiguous = (legacy.had_pending = 1 AND legacy.had_terminal = 1)
+             WHERE review.review_round_id IS NULL'
+        );
+        $db->exec('DROP TEMPORARY TABLE workflow_review_round_backfill');
+
+        $unassigned = (int)$db->query('SELECT COUNT(*) FROM pending_reviews WHERE review_round_id IS NULL')->fetchColumn();
+        if ($unassigned !== 0) throw new RuntimeException('Legacy workflow review rounds could not be assigned safely.');
+        $db->exec('ALTER TABLE pending_reviews MODIFY review_round_id CHAR(36) NOT NULL');
+
+        $indexExists = $db->prepare(
+            'SELECT 1 FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ? LIMIT 1'
+        );
+        $indexExists->execute(['pending_reviews', 'uq_pending_review_round_assignee']);
+        if (!$indexExists->fetchColumn()) {
+            $db->exec(
+                'ALTER TABLE pending_reviews
+                 ADD UNIQUE KEY uq_pending_review_round_assignee
+                   (file_id, transition_id, gate_id, review_round_id, assigned_to)'
+            );
+        }
+        $indexExists->execute(['pending_reviews', 'uq_pending_review_assignee']);
+        if ($indexExists->fetchColumn()) $db->exec('ALTER TABLE pending_reviews DROP INDEX uq_pending_review_assignee');
+
+        $indexExists->execute(['pending_reviews', 'idx_pending_review_round_scope']);
+        if (!$indexExists->fetchColumn()) {
+            $db->exec(
+                'ALTER TABLE pending_reviews
+                 ADD INDEX idx_pending_review_round_scope
+                   (file_id, transition_id, review_round_id, gate_id, status)'
+            );
         }
     }
 
