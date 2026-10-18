@@ -6,6 +6,7 @@ require dirname(__DIR__) . '/src/FileCheckin.php';
 require_once dirname(__DIR__) . '/src/FileCheckout.php';
 require dirname(__DIR__) . '/src/Migrator.php';
 require dirname(__DIR__) . '/src/FileReferences.php';
+require dirname(__DIR__) . '/src/FileRevisionHistory.php';
 require dirname(__DIR__) . '/src/Totp.php';
 require dirname(__DIR__) . '/src/Installation.php';
 require dirname(__DIR__) . '/src/DatabaseLifecycle.php';
@@ -16,6 +17,7 @@ use BluePlm\Migrator;
 use BluePlm\FileCheckout;
 use BluePlm\CheckoutLeaseFailure;
 use BluePlm\FileReferences;
+use BluePlm\FileRevisionHistory;
 use BluePlm\Installation;
 use BluePlm\Runtime;
 use BluePlm\DatabaseLifecycle;
@@ -2484,16 +2486,7 @@ try {
         Runtime::respond(201, ['id' => $fileId, 'created' => true]);
     }
     if ($method === 'GET' && preg_match('#^/files/([0-9a-f-]{36})/revisions$#i', $path, $matches)) {
-        $fileId = $matches[1];
-        $file = $db->prepare('SELECT vault_id FROM files WHERE id = ? AND organization_id = ? AND deleted_at IS NULL'); $file->execute([$fileId, $principal['organizationId']]); $row = $file->fetch();
-        if (!$row) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'File not found.']);
-        Runtime::requireVault($db, $principal, $row['vault_id']);
-        $query = $db->prepare('SELECT id, revision_number AS revisionNumber, content_hash AS contentHash, storage_relative_path AS storageRelativePath, size_bytes AS sizeBytes, comment, part_number AS partNumber, description, revision_label AS revision, custom_properties AS customProperties, created_at AS createdAt, checked_in_by AS checkedInBy FROM file_revisions WHERE file_id = ? ORDER BY revision_number DESC');
-        $query->execute([$fileId]);
-        $revisions = $query->fetchAll();
-        foreach ($revisions as &$revisionRow) $revisionRow['customProperties'] = $revisionRow['customProperties'] === null ? null : json_decode($revisionRow['customProperties'], false, 512, JSON_THROW_ON_ERROR);
-        unset($revisionRow);
-        Runtime::respond(200, ['revisions' => $revisions]);
+        Runtime::respond(200, ['revisions' => FileRevisionHistory::list($db, $principal, strtolower($matches[1]))]);
     }
     if ($method === 'POST' && preg_match('#^/files/([0-9a-f-]{36})/rollback-target$#i', $path, $matches)) {
         $body = Runtime::jsonBody(); $targetVersion = $body['targetVersion'] ?? null; if (!is_int($targetVersion) || $targetVersion < 1) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'targetVersion must be a positive integer.']); $comment = is_string($body['comment'] ?? null) ? substr($body['comment'], 0, 4096) : null;
