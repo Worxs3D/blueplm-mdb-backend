@@ -11,11 +11,13 @@ require dirname(__DIR__) . '/src/Installation.php';
 require dirname(__DIR__) . '/src/DatabaseLifecycle.php';
 require dirname(__DIR__) . '/src/BundleManifest.php';
 require dirname(__DIR__) . '/src/ColorSwatches.php';
+require dirname(__DIR__) . '/src/ProfileSummary.php';
 
 use BluePlm\Migrator;
 use BluePlm\FileCheckout;
 use BluePlm\CheckoutLeaseFailure;
 use BluePlm\FileReferences;
+use BluePlm\ProfileSummary;
 use BluePlm\Installation;
 use BluePlm\Runtime;
 use BluePlm\DatabaseLifecycle;
@@ -1119,6 +1121,9 @@ try {
         $query = $db->prepare('SELECT u.id, u.email, u.display_name AS displayName, m.role, u.created_at AS createdAt FROM users u JOIN organization_memberships m ON m.user_id = u.id WHERE m.organization_id = ? AND u.disabled_at IS NULL ORDER BY u.display_name, u.email');
         $query->execute([$principal['organizationId']]);
         Runtime::respond(200, ['users' => $query->fetchAll()]);
+    }
+    if ($method === 'GET' && preg_match('#^/users/([0-9a-f-]{36})/profile/summary$#i', $path, $matches)) {
+        ProfileSummary::respond($db, $principal, strtolower($matches[1]));
     }
     if ($method === 'GET' && preg_match('#^/users/([0-9a-f-]{36})/profile$#i', $path, $matches)) {
         $targetId = $matches[1];
