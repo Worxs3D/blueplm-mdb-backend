@@ -11,11 +11,13 @@ require dirname(__DIR__) . '/src/Installation.php';
 require dirname(__DIR__) . '/src/DatabaseLifecycle.php';
 require dirname(__DIR__) . '/src/BundleManifest.php';
 require dirname(__DIR__) . '/src/ColorSwatches.php';
+require dirname(__DIR__) . '/src/UserAvatars.php';
 require dirname(__DIR__) . '/src/JobTitles.php';
 require dirname(__DIR__) . '/src/WorkflowReviewRounds.php';
 
 use BluePlm\Migrator;
 use BluePlm\FileCheckout;
+use BluePlm\UserAvatars;
 use BluePlm\CheckoutLeaseFailure;
 use BluePlm\FileReferences;
 use BluePlm\Installation;
@@ -497,6 +499,7 @@ try {
         Runtime::respond(200, ['user' => Runtime::principal($db, $env)]);
     }
     $principal = Runtime::principal($db, $env);
+    UserAvatars::dispatch($db, $principal, $method, $path);
 
     /**
      * Redeem one device challenge for one exact backup action.  The challenge
@@ -2615,6 +2618,8 @@ try {
         Runtime::respond(204);
     }
     Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'API route not found.']);
+} catch (\BluePlm\UserAvatarFailure $error) {
+    Runtime::respond($error->httpStatus, ['error' => $error->errorCode, 'message' => $error->getMessage()]);
 } catch (Throwable $error) {
     error_log('[BluePLM PHP API] ' . $error->getMessage());
     Runtime::respond(500, ['error' => 'INTERNAL_ERROR', 'message' => 'The API could not process this request.']);
