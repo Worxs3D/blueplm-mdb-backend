@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { runCheckoutRequestIdRecoveryTests } from './checkout-request-id-recovery.mjs'
 import { runCheckinReviewRegressionTests } from './checkin-review-regressions.mjs'
+import { runFileRevisionCommentIntegration } from './file-revision-comment-integration.mjs'
 import {
   assertColorSwatchesReadOnly,
   runColorSwatchesIntegration,
@@ -104,12 +105,7 @@ async function waitForHealth() {
         assert.equal(health.bundleDigest, null)
         assert.equal(health.bundleVersion, null)
         assert.equal(health.bundleReleaseVersion, null)
-        const databaseProbe = await fetch(`${server}/installer/database-status`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ installationToken: 'invalid' }),
-        })
-        if (databaseProbe.status === 403) return
+        return
       }
     } catch (error) {
       lastError = error
@@ -1012,6 +1008,13 @@ for (const removedPortal of ['/setup/', '/admin/']) {
 }
 
 stagePendingEnvironment()
+const deniedDatabaseStatus = await fetch(`${server}/installer/database-status`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ installationToken: 'invalid' }),
+})
+assert.equal(deniedDatabaseStatus.status, 403)
+stagePendingEnvironment()
 const detected = await request('/installer/database-status', {
   method: 'POST',
   body: JSON.stringify({ installationToken }),
@@ -1532,5 +1535,16 @@ await runCheckoutRequestIdRecoveryTests({
   duplicatePart, imported, workspace, token, updatedMemberLogin, vault, foreignOrgId, foreignUser, sameHashRequest,
 })
 await runCheckinReviewRegressionTests({ request, requestStatus, imported, vault, workspace, token })
+await runFileRevisionCommentIntegration({
+  request,
+  requestStatus,
+  ownerToken: token,
+  memberToken: updatedMemberLogin.token,
+  memberId: createdUser.id,
+  foreignToken: foreignLogin.token,
+  vault,
+  vaultRoot,
+  workspace,
+})
 
 console.log('PHP API, installer lifecycle, MariaDB, and network vault integration passed.')

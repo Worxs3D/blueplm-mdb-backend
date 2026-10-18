@@ -73,6 +73,75 @@ export async function runCheckinReviewRegressionTests(context) {
     assert.equal(importedFile.created, true)
     let revisions = (await request(`/files/${importedFile.id}/revisions`, {}, token)).revisions
     assert.equal(revisions[0].revisionNumber, 1)
+    const revisionAuthorFailures = []
+    const originalAuthorId = queryTestDatabase(`SELECT checked_in_by FROM file_revisions WHERE file_id = '${importedFile.id}' AND revision_number = 1;`)
+    const originalRevisionId = queryTestDatabase(`SELECT id FROM file_revisions WHERE file_id = '${importedFile.id}' AND revision_number = 1;`)
+    const organizationId = queryTestDatabase(`SELECT organization_id FROM files WHERE id = '${importedFile.id}';`)
+    const sameOrganizationAuthorId = randomUUID()
+    const sameOrganizationAuthorEmail = `revision-author-${randomUUID()}@example.invalid`
+    const otherOrganizationId = randomUUID()
+    const otherOrganizationSlug = `revision-author-${randomUUID()}`
+    const otherOrganizationAuthorId = randomUUID()
+    const otherOrganizationAuthorEmail = `revision-author-${randomUUID()}@example.invalid`
+    const readerPassword = 'Revision reader test password 123!'
+    const readerEmail = `revision-reader-${randomUUID()}@example.invalid`
+    const reader = await request('/users', {
+      method: 'POST',
+      body: JSON.stringify({ email: readerEmail, displayName: 'Revision Reader', password: readerPassword, role: 'member' }),
+    }, token)
+    const foreignReaderPassword = 'Foreign revision reader test password 123!'
+    const foreignReaderEmail = `foreign-revision-reader-${randomUUID()}@example.invalid`
+    const foreignReader = await request('/users', {
+      method: 'POST',
+      body: JSON.stringify({ email: foreignReaderEmail, displayName: 'Foreign Revision Reader', password: foreignReaderPassword, role: 'member' }),
+    }, token)
+    queryTestDatabase(`INSERT INTO users (id, email, display_name, password_hash) VALUES ('${sameOrganizationAuthorId}', '${sameOrganizationAuthorEmail}', 'Same Organization Author', 'not-used-test-hash'); INSERT INTO organization_memberships (organization_id, user_id, role) VALUES ('${organizationId}', '${sameOrganizationAuthorId}', 'member');`)
+    try {
+      queryTestDatabase(`INSERT INTO vault_access (vault_id, user_id, granted_by) SELECT '${vault.id}', '${reader.id}', user_id FROM organization_memberships WHERE organization_id = '${organizationId}' AND role = 'owner' LIMIT 1;`)
+      const memberLogin = await request('/auth/login', {
+        method: 'POST', body: JSON.stringify({ email: readerEmail, password: readerPassword }),
+      })
+      queryTestDatabase(`UPDATE file_revisions SET checked_in_by = '${sameOrganizationAuthorId}' WHERE file_id = '${importedFile.id}' AND revision_number = 1;`)
+      revisions = (await request(`/files/${importedFile.id}/revisions`, {}, token)).revisions
+      assert.equal(revisions[0].checkedInBy, sameOrganizationAuthorId)
+      assert.equal(revisions[0].checkedInByName, 'Same Organization Author')
+      assert.equal(Object.hasOwn(revisions[0], 'email'), false)
+      assert.equal(JSON.stringify(revisions[0]).includes(sameOrganizationAuthorEmail), false)
+      assert.equal(revisions[0].id, originalRevisionId)
+      assert.equal(revisions[0].revisionNumber, 1)
+      const memberRevisions = (await request(`/files/${importedFile.id}/revisions`, {}, memberLogin.token)).revisions
+      const memberIdentity = await request('/auth/me', {}, memberLogin.token)
+      assert.equal(memberIdentity.user.role, 'member')
+      assert.equal(memberRevisions[0].checkedInBy, sameOrganizationAuthorId)
+      assert.equal(memberRevisions[0].checkedInByName, 'Same Organization Author')
+      assert.equal(Object.hasOwn(memberRevisions[0], 'email'), false)
+      assert.equal(JSON.stringify(memberRevisions[0]).includes(sameOrganizationAuthorEmail), false)
+      assert.equal(memberRevisions[0].id, originalRevisionId)
+      assert.equal((await requestStatus(`/users/${sameOrganizationAuthorId}/profile`, {}, memberLogin.token)).status, 403)
+
+      queryTestDatabase(`INSERT INTO organizations (id, name, slug) VALUES ('${otherOrganizationId}', 'Revision Author Test Organization', '${otherOrganizationSlug}'); DELETE FROM organization_memberships WHERE user_id = '${foreignReader.id}'; INSERT INTO organization_memberships (organization_id, user_id, role) VALUES ('${otherOrganizationId}', '${foreignReader.id}', 'member');`)
+      const foreignLogin = await request('/auth/login', {
+        method: 'POST', body: JSON.stringify({ email: foreignReaderEmail, password: foreignReaderPassword }),
+      })
+      assert.equal((await requestStatus(`/files/${importedFile.id}/revisions`, {}, foreignLogin.token)).status, 404)
+
+      queryTestDatabase(`DELETE FROM organization_memberships WHERE organization_id = '${organizationId}' AND user_id = '${sameOrganizationAuthorId}';`)
+      revisions = (await request(`/files/${importedFile.id}/revisions`, {}, token)).revisions
+      assert.equal(revisions[0].checkedInBy, sameOrganizationAuthorId)
+      assert.equal(revisions[0].checkedInByName, null)
+
+      queryTestDatabase(`INSERT INTO users (id, email, display_name, password_hash) VALUES ('${otherOrganizationAuthorId}', '${otherOrganizationAuthorEmail}', 'Other Organization Author', 'not-used-test-hash'); INSERT INTO organization_memberships (organization_id, user_id, role) VALUES ('${otherOrganizationId}', '${otherOrganizationAuthorId}', 'member'); UPDATE file_revisions SET checked_in_by = '${otherOrganizationAuthorId}' WHERE file_id = '${importedFile.id}' AND revision_number = 1;`)
+      revisions = (await request(`/files/${importedFile.id}/revisions`, {}, token)).revisions
+      assert.equal(revisions[0].checkedInBy, otherOrganizationAuthorId)
+      assert.equal(revisions[0].checkedInByName, null)
+      assert.equal(Object.hasOwn(revisions[0], 'email'), false)
+      assert.equal(JSON.stringify(revisions[0]).includes(otherOrganizationAuthorEmail), false)
+    } catch (error) {
+      revisionAuthorFailures.push(error instanceof Error ? error.message : String(error))
+    } finally {
+      queryTestDatabase(`UPDATE file_revisions SET checked_in_by = '${originalAuthorId}' WHERE file_id = '${importedFile.id}' AND revision_number = 1; DELETE FROM vault_access WHERE vault_id = '${vault.id}' AND user_id = '${reader.id}'; DELETE FROM sessions WHERE user_id IN ('${reader.id}', '${foreignReader.id}'); DELETE FROM organization_memberships WHERE user_id IN ('${reader.id}', '${foreignReader.id}', '${sameOrganizationAuthorId}', '${otherOrganizationAuthorId}'); DELETE FROM users WHERE id IN ('${reader.id}', '${foreignReader.id}', '${sameOrganizationAuthorId}', '${otherOrganizationAuthorId}'); DELETE FROM organizations WHERE id = '${otherOrganizationId}';`)
+    }
+    assert.deepEqual(revisionAuthorFailures, [])
     const metadataFailures = []
     if (revisions[0].partNumber !== partNumber) metadataFailures.push(`initial revision partNumber was ${String(revisions[0].partNumber)}`)
 
