@@ -16,6 +16,7 @@ require dirname(__DIR__) . '/src/ColorSwatches.php';
 require dirname(__DIR__) . '/src/ProfileSummary.php';
 require dirname(__DIR__) . '/src/ProfileContributions.php';
 require dirname(__DIR__) . '/src/UserAvatars.php';
+require dirname(__DIR__) . '/src/OrganizationLogos.php';
 require dirname(__DIR__) . '/src/JobTitles.php';
 require dirname(__DIR__) . '/src/WorkflowReviewRounds.php';
 require dirname(__DIR__) . '/src/RFQReads.php';
@@ -24,6 +25,7 @@ require dirname(__DIR__) . '/src/RFQWrites.php';
 use BluePlm\Migrator;
 use BluePlm\FileCheckout;
 use BluePlm\UserAvatars;
+use BluePlm\OrganizationLogos;
 use BluePlm\CheckoutLeaseFailure;
 use BluePlm\FileRevisionComment;
 use BluePlm\FileRevisionCommentFailure;
@@ -558,6 +560,7 @@ try {
     }
     $principal = Runtime::principal($db, $env);
     UserAvatars::dispatch($db, $principal, $method, $path);
+    OrganizationLogos::dispatch($db, $principal, $method, $path);
 
     /**
      * Redeem one device challenge for one exact backup action.  The challenge
@@ -2068,7 +2071,18 @@ try {
         Runtime::respond(204);
     }
     if ($method === 'GET' && $path === '/organizations/current/profile') {
-        $q=$db->prepare('SELECT logo_storage_path,phone,website,contact_email FROM organizations WHERE id=?');$q->execute([$principal['organizationId']]);Runtime::respond(200,['profile'=>$q->fetch()?:null]);
+        $q = $db->prepare(
+            'SELECT o.logo_storage_path, o.phone, o.website, o.contact_email,
+                    (o.logo_storage_path IS NOT NULL AND o.logo_storage_path <> \'\') OR l.organization_id IS NOT NULL AS logo_configured,
+                    l.asset_ref AS logo_asset_ref
+             FROM organizations o
+             LEFT JOIN organization_logos l ON l.organization_id = o.id
+             WHERE o.id = ?'
+        );
+        $q->execute([$principal['organizationId']]);
+        $profile = $q->fetch(PDO::FETCH_ASSOC) ?: null;
+        if (is_array($profile)) $profile['logo_configured'] = (bool)$profile['logo_configured'];
+        Runtime::respond(200, ['profile' => $profile]);
     }
     if ($method === 'PATCH' && $path === '/organizations/current/profile') {
         if (!in_array($principal['role'], ['owner','admin'], true)) Runtime::respond(403,['error'=>'FORBIDDEN','message'=>'Administrator role required.']);$b=Runtime::jsonBody();$map=['phone'=>'phone','website'=>'website','contactEmail'=>'contact_email','logoStoragePath'=>'logo_storage_path'];$sets=[];$values=[];foreach($map as $input=>$column)if(array_key_exists($input,$b)){$sets[]="$column=?";$values[]=$b[$input]===null?null:(is_string($b[$input])?substr($b[$input],0,2048):null);}if(!$sets)Runtime::respond(400,['error'=>'INVALID_REQUEST','message'=>'At least one profile field is required.']);$values[]=$principal['organizationId'];$db->prepare('UPDATE organizations SET '.implode(',',$sets).' WHERE id=?')->execute($values);Runtime::respond(200,['success'=>true]);
@@ -2686,6 +2700,8 @@ try {
     }
     Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'API route not found.']);
 } catch (\BluePlm\UserAvatarFailure $error) {
+    Runtime::respond($error->httpStatus, ['error' => $error->errorCode, 'message' => $error->getMessage()]);
+} catch (\BluePlm\OrganizationLogoFailure $error) {
     Runtime::respond($error->httpStatus, ['error' => $error->errorCode, 'message' => $error->getMessage()]);
 } catch (Throwable $error) {
     error_log('[BluePLM PHP API] ' . $error->getMessage());
