@@ -246,8 +246,9 @@ try {
     assert.equal(/[zZ]|[+-]\d{2}:?\d{2}$/u.test(item.createdAt), false)
   }
   assert.equal(summary.body.activity.recent.some(item => item.type === 'review.rejected' && item.targetLabel === expected.visibleFileName), true, 'The rejected-review event resolves its label from payload.fileId for its actor.')
-  assert.equal(summary.body.ownEcos.length, 5)
-  assert.deepEqual(summary.body.ownEcos.map(eco => eco.ecoNumber), expected.ecoNumbers, 'Only the five most recent ECOs created by this profile user should be returned.')
+  assert.equal(summary.body.ownEcos.length, 10)
+  assert.deepEqual(summary.body.ownEcos.map(eco => eco.ecoNumber), expected.ecoNumbers, 'The profile list is the ten most recent unique ECOs created by this user or linked through an accessible file.')
+  assert.equal(new Set(summary.body.ownEcos.map(eco => eco.id)).size, 10, 'An ECO both created and linked by the user must appear only once.')
   assert.deepEqual(Object.keys(summary.body.ownEcos[0]).sort(), ['createdAt', 'ecoNumber', 'id', 'status', 'title'])
   for (const eco of summary.body.ownEcos) assert.match(eco.createdAt, databaseDateTime)
   assert.deepEqual(summary.body.deviceLastSeen, { status: 'recorded', at: expected.deviceLastSeen })
@@ -258,7 +259,9 @@ try {
   assert.equal(memberSummary.status, 200)
   assert.equal(memberSummary.body.activity.totalCount, expected.memberExpectedCount, 'A member sees only their own events on accessible files plus their own non-file activity.')
   assert.deepEqual(memberSummary.body.deviceLastSeen, { status: 'not-recorded' })
-  assert.deepEqual(memberSummary.body.ownEcos.map(eco => eco.ecoNumber), [expected.memberEcoNumber], 'A member profile includes the member’s own ECO, not the owner’s ECOs.')
+  assert.deepEqual(memberSummary.body.ownEcos.map(eco => eco.ecoNumber), expected.memberExpectedEcoNumbers, 'A member profile includes creator ECOs and target-linked ECOs on files they can access, in fixture timestamp order.')
+  assert.equal(memberSummary.body.ownEcos.some(eco => eco.ecoNumber === expected.memberHiddenEcoNumber), false, 'A member must not learn ECO metadata through an inaccessible vault file.')
+  assert.equal(memberSummary.body.ownEcos.some(eco => eco.ecoNumber === 'PROFILE-MEMBER-FOREIGN-LINKED'), false, 'A cross-organization file/ECO association must not cross the profile boundary.')
   assert.equal(memberSummary.body.activity.recent.some(item => item.targetLabel === expected.visibleFileName), true)
   assert.equal(memberSummary.body.activity.recent.some(item => item.targetLabel === expected.hiddenFileName), false, 'An inaccessible-vault filename must not be disclosed.')
   const memberRejected = memberSummary.body.activity.recent.filter(item => item.type === 'review.rejected')
@@ -268,7 +271,8 @@ try {
   const ownerMemberSummary = await request(`/users/${memberId}/profile/summary`, {}, ownerToken)
   assert.equal(ownerMemberSummary.status, 200)
   assert.equal(ownerMemberSummary.body.activity.totalCount, '6', 'An owner may inspect same-organization file and rejected-review events.')
-  assert.deepEqual(ownerMemberSummary.body.ownEcos.map(eco => eco.ecoNumber), [expected.memberEcoNumber], 'An owner view still reports the target member’s own ECOs.')
+  assert.deepEqual(ownerMemberSummary.body.ownEcos.map(eco => eco.ecoNumber), expected.ownerViewMemberExpectedEcoNumbers, 'An owner can see the target member’s creator ECOs and linked ECO metadata in both same-organization vaults.')
+  assert.equal(ownerMemberSummary.body.ownEcos.some(eco => eco.ecoNumber === 'PROFILE-MEMBER-FOREIGN-LINKED'), false, 'Even an owner must not receive a linked ECO from a different organization.')
   assert.equal(ownerMemberSummary.body.activity.recent.some(item => item.targetLabel === expected.visibleFileName), true)
   assert.equal(ownerMemberSummary.body.activity.recent.some(item => item.targetLabel === expected.hiddenFileName), true, 'An owner may inspect both same-organization vaults.')
   const ownerViewRejected = ownerMemberSummary.body.activity.recent.filter(item => item.type === 'review.rejected').map(item => item.targetLabel).sort()
@@ -299,7 +303,7 @@ try {
   }, null, 2) + '\n', 'utf8')
   if (projectStarted) {
     try {
-      runDocker([...compose, 'down', '--remove-orphans'])
+      runDocker([...compose, 'down'])
     } catch {
       console.error('Exact owned Compose project cleanup reported an error; inspect its saved run evidence.')
       process.exitCode = 1

@@ -135,13 +135,27 @@ final class ProfileSummary
                 ];
             }
 
+            $fileAccessPredicate = self::fileAccessPredicate($principal);
             $ecoQuery = $db->prepare(
-                'SELECT id, eco_number AS ecoNumber, title, status,
-                        DATE_FORMAT(created_at, \'%Y-%m-%d %H:%i:%s.%f\') AS createdAt
-                 FROM ecos WHERE organization_id = ? AND created_by = ?
-                 ORDER BY created_at DESC, id DESC LIMIT 5'
+                "SELECT e.id, e.eco_number AS ecoNumber, e.title, e.status,
+                        DATE_FORMAT(e.created_at, '%Y-%m-%d %H:%i:%s.%f') AS createdAt
+                 FROM ecos e
+                 WHERE e.organization_id = ? AND (
+                     e.created_by = ? OR EXISTS (
+                         SELECT 1 FROM file_ecos fe
+                         JOIN files f ON f.id = fe.file_id
+                         WHERE fe.eco_id = e.id AND fe.created_by = ?
+                           AND f.organization_id = e.organization_id
+                           AND ({$fileAccessPredicate})
+                     )
+                 )
+                 ORDER BY e.created_at DESC, e.id DESC LIMIT 10"
             );
-            $ecoQuery->execute([$principal['organizationId'], $targetId]);
+            $ecoParameters = [$principal['organizationId'], $targetId, $targetId];
+            if (!in_array($principal['role'], ['owner', 'admin'], true)) {
+                array_push($ecoParameters, $principal['userId'], $principal['userId']);
+            }
+            $ecoQuery->execute($ecoParameters);
             $ownEcos = [];
             foreach ($ecoQuery->fetchAll() as $row) {
                 if (!is_string($row['id'] ?? null) || !is_string($row['ecoNumber'] ?? null)
@@ -202,14 +216,20 @@ final class ProfileSummary
     private static function fileVisibilityPredicate(array $principal): string
     {
         $fileId = self::eventFileIdExpression();
-        $access = in_array($principal['role'], ['owner', 'admin'], true)
+        $access = self::fileAccessPredicate($principal);
+        return "((e.type NOT LIKE 'file.%' AND e.type <> 'review.rejected') OR EXISTS (
+            SELECT 1 FROM files f WHERE f.id = {$fileId} AND f.organization_id = e.organization_id AND ({$access})
+        ))";
+    }
+
+    /** @param array<string, mixed> $principal */
+    private static function fileAccessPredicate(array $principal): string
+    {
+        return in_array($principal['role'], ['owner', 'admin'], true)
             ? '1 = 1'
             : 'EXISTS (SELECT 1 FROM vault_access va WHERE va.vault_id = f.vault_id AND va.user_id = ?)'
                 . ' OR EXISTS (SELECT 1 FROM team_vault_access tva JOIN team_members tm ON tm.team_id = tva.team_id'
                 . ' WHERE tva.vault_id = f.vault_id AND tm.user_id = ?)';
-        return "((e.type NOT LIKE 'file.%' AND e.type <> 'review.rejected') OR EXISTS (
-            SELECT 1 FROM files f WHERE f.id = {$fileId} AND f.organization_id = e.organization_id AND ({$access})
-        ))";
     }
 
     private static function eventFileIdExpression(): string

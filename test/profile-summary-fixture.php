@@ -68,6 +68,10 @@ function seedProfileSummary(PDO $db, string $organizationId, string $ownerId, st
             password_hash(bin2hex(random_bytes(24)), PASSWORD_DEFAULT),
         ]);
         $db->prepare('INSERT INTO organization_memberships (organization_id, user_id, role) VALUES (?, ?, \'member\')')->execute([$otherOrganizationId, $foreignUserId]);
+        $foreignVaultId = fixtureUuid();
+        $db->prepare('INSERT INTO vaults (id, organization_id, name, network_root) VALUES (?, ?, ?, ?)')->execute([$foreignVaultId, $otherOrganizationId, 'Profile fixture foreign vault', 'fixture-foreign-root']);
+        $foreignFileId = fixtureUuid();
+        $insertFile->execute([$foreignFileId, $otherOrganizationId, $foreignVaultId, 'ProfileFixture/foreign.txt', 'foreign-profile-file.txt', 'private-marker/foreign', str_repeat('c', 64)]);
 
         $insertEvent = $db->prepare('INSERT INTO events (organization_id, type, aggregate_id, payload, created_at) VALUES (?, ?, ?, ?, ?)');
         $ownerDays = [];
@@ -141,10 +145,34 @@ function seedProfileSummary(PDO $db, string $organizationId, string $ownerId, st
         $insertEco = $db->prepare('INSERT INTO ecos (id, organization_id, eco_number, title, status, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)');
         for ($index = 1; $index <= 6; $index++) {
             $ecoNumber = 'PROFILE-OWNER-' . $index;
-            $insertEco->execute([fixtureUuid(), $organizationId, $ecoNumber, 'Fixture ECO ' . $index, 'open', $ownerId, fixtureTimestamp($now->modify('-' . ($index - 1) . ' days'))]);
-            $ecoIds[] = $ecoNumber;
+            $ecoId = fixtureUuid();
+            $insertEco->execute([$ecoId, $organizationId, $ecoNumber, 'Fixture ECO ' . $index, 'open', $ownerId, fixtureTimestamp($now->modify('-' . ($index - 1) . ' days'))]);
+            $ecoIds[] = ['id' => $ecoId, 'number' => $ecoNumber];
         }
-        $insertEco->execute([fixtureUuid(), $organizationId, 'PROFILE-MEMBER-1', 'Member Fixture ECO', 'open', $memberId, fixtureTimestamp($now)]);
+        $memberEcoId = fixtureUuid();
+        $insertEco->execute([$memberEcoId, $organizationId, 'PROFILE-MEMBER-1', 'Member Fixture ECO', 'open', $memberId, fixtureTimestamp($now)]);
+
+        $insertFileEco = $db->prepare('INSERT INTO file_ecos (id, file_id, eco_id, created_by) VALUES (?, ?, ?, ?)');
+        $insertFileEco->execute([fixtureUuid(), $visibleFileId, $ecoIds[0]['id'], $ownerId]);
+        $ownerAssociatedEcoNumbers = [];
+        for ($index = 1; $index <= 5; $index++) {
+            $ecoId = fixtureUuid();
+            $ecoNumber = 'PROFILE-OWNER-LINKED-' . $index;
+            $insertEco->execute([$ecoId, $organizationId, $ecoNumber, 'Linked ECO ' . $index, 'open', $memberId, fixtureTimestamp($now->modify('-' . ($index + 5) . ' days'))]);
+            $insertFileEco->execute([fixtureUuid(), $visibleFileId, $ecoId, $ownerId]);
+            $ownerAssociatedEcoNumbers[] = $ecoNumber;
+        }
+
+        $memberVisibleEcoId = fixtureUuid();
+        $insertEco->execute([$memberVisibleEcoId, $organizationId, 'PROFILE-MEMBER-LINKED-VISIBLE', 'Member visible linked ECO', 'open', $ownerId, fixtureTimestamp($now->modify('-11 days'))]);
+        $insertFileEco->execute([fixtureUuid(), $visibleFileId, $memberVisibleEcoId, $memberId]);
+        $memberHiddenEcoId = fixtureUuid();
+        $insertEco->execute([$memberHiddenEcoId, $organizationId, 'PROFILE-MEMBER-LINKED-HIDDEN', 'Member hidden linked ECO', 'open', $ownerId, fixtureTimestamp($now->modify('-12 days'))]);
+        $insertFileEco->execute([fixtureUuid(), $hiddenFileId, $memberHiddenEcoId, $memberId]);
+
+        $foreignEcoId = fixtureUuid();
+        $insertEco->execute([$foreignEcoId, $otherOrganizationId, 'PROFILE-MEMBER-FOREIGN-LINKED', 'Foreign linked ECO', 'open', $memberId, fixtureTimestamp($now)]);
+        $insertFileEco->execute([fixtureUuid(), $foreignFileId, $foreignEcoId, $memberId]);
 
         $insertDevice = $db->prepare('INSERT INTO device_sessions (id, user_id, organization_id, machine_id, last_seen) VALUES (?, ?, ?, ?, ?)');
         $insertDevice->execute([fixtureUuid(), $ownerId, $organizationId, 'profile-fixture-device-old', fixtureTimestamp($now->modify('-10 minutes'))]);
@@ -164,8 +192,12 @@ function seedProfileSummary(PDO $db, string $organizationId, string $ownerId, st
             'memberExpectedCount' => '4',
             'visibleFileName' => 'visible-profile-file.txt',
             'hiddenFileName' => 'hidden-profile-file.txt',
-            'ecoNumbers' => array_slice($ecoIds, 0, 5),
+            'ecoNumbers' => array_merge(array_column($ecoIds, 'number'), array_slice($ownerAssociatedEcoNumbers, 0, 4)),
             'memberEcoNumber' => 'PROFILE-MEMBER-1',
+            'memberVisibleEcoNumber' => 'PROFILE-MEMBER-LINKED-VISIBLE',
+            'memberHiddenEcoNumber' => 'PROFILE-MEMBER-LINKED-HIDDEN',
+            'memberExpectedEcoNumbers' => array_merge(['PROFILE-MEMBER-1'], $ownerAssociatedEcoNumbers, ['PROFILE-MEMBER-LINKED-VISIBLE']),
+            'ownerViewMemberExpectedEcoNumbers' => array_merge(['PROFILE-MEMBER-1'], $ownerAssociatedEcoNumbers, ['PROFILE-MEMBER-LINKED-VISIBLE', 'PROFILE-MEMBER-LINKED-HIDDEN']),
             'deviceLastSeen' => fixtureTimestamp($latestDeviceSeen) . '000',
         ];
     } catch (Throwable $error) {

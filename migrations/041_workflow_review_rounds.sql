@@ -1,0 +1,4 @@
+-- Assign a server-owned review-round id to every persisted review row.
+-- Historical round boundaries cannot be reconstructed from the old schema;
+-- the custom Migrator step preserves rows and flags mixed pending/terminal
+-- buckets so the runtime can fail closed rather than merge old decisions.
