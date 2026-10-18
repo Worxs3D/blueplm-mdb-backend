@@ -61,6 +61,7 @@ async function login(email, password) {
 const installationToken = 'integration-installation-token-must-be-at-least-32-chars'
 const ownerPassword = 'RFQ draft owner password 123!'
 const memberPassword = 'RFQ draft member password 123!'
+const teamMemberPassword = 'RFQ draft team member password 123!'
 const blockedPassword = 'RFQ draft blocked password 123!'
 const viewerPassword = 'RFQ draft viewer password 123!'
 composeExec('api', ['sh', '-c', 'cp /app/test/install-env.fixture /app/.env.install && chown www-data:www-data /app/.env.install'])
@@ -83,9 +84,11 @@ async function createUser(email, password, role = 'member') {
   return request('/users', { method: 'POST', body: JSON.stringify({ email, displayName: email.split('@')[0], password, role }) }, ownerToken)
 }
 const member = await createUser('rfq-draft-member@example.test', memberPassword)
+const teamMember = await createUser('rfq-draft-team-member@example.test', teamMemberPassword)
 const blocked = await createUser('rfq-draft-blocked@example.test', blockedPassword)
 const viewer = await createUser('rfq-draft-viewer@example.test', viewerPassword, 'viewer')
 const memberSession = await login('rfq-draft-member@example.test', memberPassword)
+const teamMemberSession = await login('rfq-draft-team-member@example.test', teamMemberPassword)
 const blockedSession = await login('rfq-draft-blocked@example.test', blockedPassword)
 const viewerSession = await login('rfq-draft-viewer@example.test', viewerPassword)
 const fixtureJson = composeExec('api', ['php', 'test/rfq-write-fixtures.php'], {
@@ -95,6 +98,9 @@ const fixtureJson = composeExec('api', ['php', 'test/rfq-write-fixtures.php'], {
 })
 const fixtures = JSON.parse(fixtureJson)
 await request('/module-access/rfq', { method: 'PUT', body: JSON.stringify({ teamIds: [], userIds: [member.id] }) }, ownerToken)
+const team = await request('/teams', { method: 'POST', body: JSON.stringify({ name: 'RFQ Supplier Writers', color: '#335577', icon: 'truck' }) }, ownerToken)
+await request(`/teams/${team.id}/members`, { method: 'POST', body: JSON.stringify({ userId: teamMember.id }) }, ownerToken)
+await request('/module-access/rfq', { method: 'PUT', body: JSON.stringify({ teamIds: [team.id], userIds: [member.id] }) }, ownerToken)
 
 assert.equal((await requestStatus('/rfqs', { method: 'POST', body: JSON.stringify({ rfqNumber: 'NO-AUTH', title: 'No auth' }) })).status, 401)
 const denied = await requestStatus('/rfqs', { method: 'POST', body: JSON.stringify({ rfqNumber: 'DENIED', title: 'Denied' }) }, blockedSession.token)
@@ -109,6 +115,78 @@ assert.equal(readOnly.body.error, 'READ_ONLY_ROLE')
 const readOnlyItem = await requestStatus(`/rfqs/${fixtures.draftRfq}/items/${fixtures.existingItem}`, { method: 'DELETE' }, viewerSession.token)
 assert.equal(readOnlyItem.status, 403)
 assert.equal(readOnlyItem.body.error, 'READ_ONLY_ROLE')
+
+const supplierPath = (id) => `/rfqs/${id}/suppliers`
+const parallelSupplierAttempts = await Promise.all([
+  requestStatus(supplierPath(fixtures.parallelRfq), { method: 'POST', body: JSON.stringify({ supplierId: fixtures.parallelSupplier }) }, ownerToken),
+  requestStatus(supplierPath(fixtures.parallelRfq), { method: 'POST', body: JSON.stringify({ supplierId: fixtures.parallelSupplier }) }, ownerToken),
+])
+assert.deepEqual(parallelSupplierAttempts.map((result) => result.status).sort((left, right) => left - right), [201, 409])
+const parallelSuccess = parallelSupplierAttempts.find((result) => result.status === 201)
+assert.ok(parallelSuccess?.body?.rfqSupplier?.id)
+const parallelDetail = await request(`/rfqs/${fixtures.parallelRfq}?supplierLimit=10`, {}, ownerToken)
+assert.equal(parallelDetail.rfq.supplierCount, 1)
+assert.equal(parallelDetail.suppliers.length, 1)
+assert.equal(parallelDetail.suppliers[0].id, parallelSuccess.body.rfqSupplier.id)
+
+const invalidSupplierBody = await requestStatus(supplierPath(fixtures.draftRfq), { method: 'POST', body: JSON.stringify({ supplierId: 'not-a-uuid' }) }, ownerToken)
+assert.equal(invalidSupplierBody.status, 400)
+assert.equal(invalidSupplierBody.body.error, 'INVALID_REQUEST')
+const extraSupplierBody = await requestStatus(supplierPath(fixtures.draftRfq), { method: 'POST', body: JSON.stringify({ supplierId: fixtures.activeUnapprovedSupplier, sentAt: null }) }, ownerToken)
+assert.equal(extraSupplierBody.status, 400)
+assert.equal(extraSupplierBody.body.error, 'INVALID_REQUEST')
+assert.equal((await requestStatus(supplierPath(fixtures.draftRfq), { method: 'POST', body: JSON.stringify({}) }, ownerToken)).status, 400)
+const inactiveSupplier = await requestStatus(supplierPath(fixtures.draftRfq), { method: 'POST', body: JSON.stringify({ supplierId: fixtures.inactiveSupplier }) }, ownerToken)
+assert.equal(inactiveSupplier.status, 404)
+const unknownSupplier = await requestStatus(supplierPath(fixtures.draftRfq), { method: 'POST', body: JSON.stringify({ supplierId: 'd5c4fb86-e07f-4fc7-afb4-2e82f90de127' }) }, ownerToken)
+assert.equal(unknownSupplier.status, inactiveSupplier.status)
+assert.equal(unknownSupplier.body.error, inactiveSupplier.body.error)
+const foreignSupplier = await requestStatus(supplierPath(fixtures.draftRfq), { method: 'POST', body: JSON.stringify({ supplierId: fixtures.foreignSupplier }) }, ownerToken)
+assert.equal(foreignSupplier.status, 404)
+assert.equal(foreignSupplier.body.error, unknownSupplier.body.error)
+assert.doesNotMatch(JSON.stringify(foreignSupplier.body), /Foreign Secret Supplier Name/)
+
+const directAdded = await request(supplierPath(fixtures.draftRfq), { method: 'POST', body: JSON.stringify({ supplierId: fixtures.activeUnapprovedSupplier }) }, memberSession.token)
+assert.equal(directAdded.rfqSupplier.supplierId, fixtures.activeUnapprovedSupplier)
+assert.equal(directAdded.rfqSupplier.supplier.name, 'Active Unapproved Supplier')
+assert.equal(directAdded.rfq.status, 'draft')
+assert.equal((await requestStatus(supplierPath(fixtures.draftRfq), { method: 'POST', body: JSON.stringify({ supplierId: fixtures.activeUnapprovedSupplier }) }, ownerToken)).status, 409)
+const secondAdded = await request(supplierPath(fixtures.draftRfq), { method: 'POST', body: JSON.stringify({ supplierId: fixtures.preexistingSupplier }) }, ownerToken)
+assert.equal(secondAdded.rfqSupplier.supplier.name, 'Preexisting Supplier')
+const pageTwo = await request(`/rfqs/${fixtures.draftRfq}?supplierPage=2&supplierLimit=1`, {}, ownerToken)
+assert.equal(pageTwo.suppliers.length, 1)
+assert.equal(pageTwo.suppliers[0].id, secondAdded.rfqSupplier.id)
+
+const teamAdded = await request(supplierPath(fixtures.teamRfq), { method: 'POST', body: JSON.stringify({ supplierId: fixtures.activeUnapprovedSupplier }) }, teamMemberSession.token)
+assert.equal(teamAdded.rfqSupplier.supplierId, fixtures.activeUnapprovedSupplier)
+const blockedSupplierWrite = await requestStatus(supplierPath(fixtures.teamRfq), { method: 'POST', body: JSON.stringify({ supplierId: fixtures.preexistingSupplier }) }, blockedSession.token)
+assert.equal(blockedSupplierWrite.status, 403)
+assert.equal(blockedSupplierWrite.body.error, 'MODULE_ACCESS_DENIED')
+
+const sentRfqAddition = await request(supplierPath(fixtures.sentRfq), { method: 'POST', body: JSON.stringify({ supplierId: fixtures.preexistingSupplier }) }, ownerToken)
+assert.equal(sentRfqAddition.rfq.status, 'sent')
+const releaseFirst = await request(supplierPath(fixtures.releasedEmptyRfq), { method: 'POST', body: JSON.stringify({ supplierId: fixtures.activeUnapprovedSupplier }) }, ownerToken)
+assert.equal(releaseFirst.rfq.status, 'ready')
+const releaseExisting = await request(supplierPath(fixtures.releasedHasSupplierRfq), { method: 'POST', body: JSON.stringify({ supplierId: fixtures.activeUnapprovedSupplier }) }, ownerToken)
+assert.equal(releaseExisting.rfq.status, 'sent')
+const unreleased = await request(supplierPath(fixtures.unreleasedRfq), { method: 'POST', body: JSON.stringify({ supplierId: fixtures.activeUnapprovedSupplier }) }, ownerToken)
+assert.equal(unreleased.rfq.status, 'draft')
+
+assert.equal((await requestStatus(`/rfqs/${fixtures.draftRfq}/suppliers/not-a-uuid`, { method: 'DELETE' }, ownerToken)).status, 400)
+assert.equal((await requestStatus(`/rfqs/${fixtures.draftRfq}/suppliers/${fixtures.sentAssociation}`, { method: 'DELETE' }, ownerToken)).status, 204)
+const sentDelete = await requestStatus(`/rfqs/${fixtures.sentRfq}/suppliers/${fixtures.sentAssociation}`, { method: 'DELETE' }, ownerToken)
+assert.equal(sentDelete.status, 409)
+assert.equal(sentDelete.body.error, 'RFQ_SUPPLIER_ALREADY_SENT')
+const unknownRfqId = 'd5c4fb86-e07f-4fc7-afb4-2e82f90de127'
+const foreignAssociationDelete = await requestStatus(`/rfqs/${fixtures.foreignRfq}/suppliers/${fixtures.foreignSupplierAssociation}`, { method: 'DELETE' }, ownerToken)
+const unknownRfqAssociationDelete = await requestStatus(`/rfqs/${unknownRfqId}/suppliers/${fixtures.foreignSupplierAssociation}`, { method: 'DELETE' }, ownerToken)
+assert.equal(foreignAssociationDelete.status, 404)
+assert.equal(unknownRfqAssociationDelete.status, 404)
+assert.deepEqual(foreignAssociationDelete.body, unknownRfqAssociationDelete.body)
+assert.equal((await requestStatus(`/rfqs/${fixtures.draftRfq}/suppliers/${directAdded.rfqSupplier.id}`, { method: 'DELETE' }, memberSession.token)).status, 204)
+assert.equal((await requestStatus(`/rfqs/${fixtures.draftRfq}/suppliers/${directAdded.rfqSupplier.id}`, { method: 'DELETE' }, memberSession.token)).status, 204)
+assert.equal((await requestStatus(`/rfqs/${fixtures.draftRfq}/suppliers/${secondAdded.rfqSupplier.id}`, { method: 'DELETE' }, ownerToken)).status, 204)
+assert.equal((await request(`/rfqs/${fixtures.draftRfq}`, {}, ownerToken)).rfq.status, 'draft')
 
 const clientNumber = await requestStatus('/rfqs', { method: 'POST', body: JSON.stringify({ rfqNumber: 'CLIENT-NUMBER', title: 'Client number must be rejected' }) }, ownerToken)
 assert.equal(clientNumber.status, 400)

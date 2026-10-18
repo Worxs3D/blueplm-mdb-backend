@@ -28,6 +28,11 @@ $ids = [
     'fileAccessible' => Runtime::uuid(), 'filePrivate' => Runtime::uuid(), 'fileForeign' => Runtime::uuid(), 'fileDeleted' => Runtime::uuid(),
     'foreignAddress' => Runtime::uuid(), 'billingAddress' => Runtime::uuid(), 'shippingAddress' => Runtime::uuid(),
     'draftRfq' => Runtime::uuid(), 'sentRfq' => Runtime::uuid(), 'foreignRfq' => Runtime::uuid(), 'existingItem' => Runtime::uuid(),
+    'activeUnapprovedSupplier' => Runtime::uuid(), 'inactiveSupplier' => Runtime::uuid(), 'foreignSupplier' => Runtime::uuid(),
+    'sentAssociation' => Runtime::uuid(), 'releasedEmptyRfq' => Runtime::uuid(), 'releasedHasSupplierRfq' => Runtime::uuid(),
+    'unreleasedRfq' => Runtime::uuid(), 'teamRfq' => Runtime::uuid(), 'parallelRfq' => Runtime::uuid(),
+    'preexistingSupplier' => Runtime::uuid(), 'parallelSupplier' => Runtime::uuid(),
+    'foreignSupplierAssociation' => Runtime::uuid(),
 ];
 $db->beginTransaction();
 try {
@@ -57,6 +62,28 @@ try {
     $rfq->execute([$ids['draftRfq'], $organizationId, 'RFQ-WRITE-DRAFT', 'RFQ Write Draft Fixture', 'draft', $ownerId, $ownerId]);
     $rfq->execute([$ids['sentRfq'], $organizationId, 'RFQ-WRITE-SENT', 'RFQ Write Sent Fixture', 'sent', $ownerId, $ownerId]);
     $rfq->execute([$ids['foreignRfq'], $ids['foreignOrg'], 'RFQ-WRITE-FOREIGN', 'RFQ Write Foreign Fixture', 'draft', null, null]);
+    $db->prepare('INSERT INTO rfqs (id, organization_id, rfq_number, title, status, release_files_generated, created_by, updated_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+        ->execute([$ids['releasedEmptyRfq'], $organizationId, 'RFQ-WRITE-RELEASED-EMPTY', 'RFQ Write Released Empty Fixture', 'draft', 1, $ownerId, $ownerId]);
+    $db->prepare('INSERT INTO rfqs (id, organization_id, rfq_number, title, status, release_files_generated, created_by, updated_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+        ->execute([$ids['releasedHasSupplierRfq'], $organizationId, 'RFQ-WRITE-RELEASED-HAS', 'RFQ Write Released Existing Fixture', 'sent', 1, $ownerId, $ownerId]);
+    $db->prepare('INSERT INTO rfqs (id, organization_id, rfq_number, title, status, release_files_generated, created_by, updated_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+        ->execute([$ids['unreleasedRfq'], $organizationId, 'RFQ-WRITE-UNRELEASED', 'RFQ Write Unreleased Fixture', 'draft', 0, $ownerId, $ownerId]);
+    $db->prepare('INSERT INTO rfqs (id, organization_id, rfq_number, title, status, created_by, updated_by) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        ->execute([$ids['teamRfq'], $organizationId, 'RFQ-WRITE-TEAM', 'RFQ Write Team Fixture', 'draft', $ownerId, $ownerId]);
+    $db->prepare('INSERT INTO rfqs (id, organization_id, rfq_number, title, status, created_by, updated_by) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        ->execute([$ids['parallelRfq'], $organizationId, 'RFQ-WRITE-PARALLEL', 'RFQ Write Parallel Fixture', 'draft', $ownerId, $ownerId]);
+    $supplier = $db->prepare('INSERT INTO suppliers (id, organization_id, name, code, contact_name, contact_email, is_active, is_approved, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
+    $supplier->execute([$ids['activeUnapprovedSupplier'], $organizationId, 'Active Unapproved Supplier', 'RFQ-WRITE-ACTIVE', 'Active Contact', 'active@example.test', 1, 0, $ownerId]);
+    $supplier->execute([$ids['inactiveSupplier'], $organizationId, 'RFQ-WRITE-INACTIVE', 'RFQ-WRITE-INACTIVE', 'Inactive Contact', 'inactive@example.test', 0, 1, $ownerId]);
+    $supplier->execute([$ids['foreignSupplier'], $ids['foreignOrg'], 'Foreign Secret Supplier Name', 'RFQ-WRITE-FOREIGN', 'Foreign Contact', 'foreign@example.test', 1, 1, $ownerId]);
+    $supplier->execute([$ids['preexistingSupplier'], $organizationId, 'Preexisting Supplier', 'RFQ-WRITE-PREEXISTING', 'Existing Contact', 'existing@example.test', 1, 1, $ownerId]);
+    $supplier->execute([$ids['parallelSupplier'], $organizationId, 'Parallel Supplier', 'RFQ-WRITE-PARALLEL-SUPPLIER', 'Parallel Contact', 'parallel@example.test', 1, 1, $ownerId]);
+    $db->prepare('INSERT INTO rfq_suppliers (id, organization_id, rfq_id, supplier_id, sent_at) VALUES (?, ?, ?, ?, UTC_TIMESTAMP(3))')
+        ->execute([$ids['sentAssociation'], $organizationId, $ids['sentRfq'], $ids['activeUnapprovedSupplier']]);
+    $db->prepare('INSERT INTO rfq_suppliers (id, organization_id, rfq_id, supplier_id) VALUES (?, ?, ?, ?)')
+        ->execute([Runtime::uuid(), $organizationId, $ids['releasedHasSupplierRfq'], $ids['preexistingSupplier']]);
+    $db->prepare('INSERT INTO rfq_suppliers (id, organization_id, rfq_id, supplier_id) VALUES (?, ?, ?, ?)')
+        ->execute([$ids['foreignSupplierAssociation'], $ids['foreignOrg'], $ids['foreignRfq'], $ids['foreignSupplier']]);
     $year = (int)$db->query('SELECT YEAR(NOW())')->fetchColumn();
     $rfq->execute([Runtime::uuid(), $organizationId, 'RFQ-' . $year . '-0007', 'RFQ Write Number History', 'completed', $ownerId, $ownerId]);
     $rfq->execute([Runtime::uuid(), $ids['foreignOrg'], 'RFQ-' . $year . '-0007', 'RFQ Write Foreign Number History', 'completed', $ownerId, $ownerId]);

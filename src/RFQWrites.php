@@ -17,6 +17,14 @@ final class RFQWrites
         if ($path === '/rfqs' && $method === 'POST') {
             self::create($db, $principal);
         }
+        if (preg_match('#^/rfqs/([^/]+)/suppliers(?:/([^/]+))?$#D', $path, $matches) === 1
+            && in_array($method, ['POST', 'DELETE'], true)) {
+            $rfqId = self::pathUuid($matches[1], 'RFQ');
+            $associationId = isset($matches[2]) ? self::pathUuid($matches[2], 'RFQ supplier') : null;
+            if ($method === 'POST' && $associationId === null) self::addSupplier($db, $principal, $rfqId);
+            if ($method === 'DELETE' && $associationId !== null) self::removeSupplier($db, $principal, $rfqId, $associationId);
+            self::respondError($db, 404, 'NOT_FOUND', 'RFQ supplier route not found.');
+        }
         if (preg_match('#^/rfqs/([^/]+)/items(?:/([^/]+))?$#D', $path, $matches) === 1
             && in_array($method, ['POST', 'PATCH', 'DELETE'], true)) {
             $rfqId = self::pathUuid($matches[1], 'RFQ');
@@ -185,6 +193,127 @@ final class RFQWrites
             throw $error;
         }
         Runtime::respond(204);
+    }
+
+    /** @param array<string, mixed> $principal */
+    private static function addSupplier(PDO $db, array $principal, string $rfqId): never
+    {
+        self::requireModuleAccess($db, $principal);
+        $body = self::body(['supplierId']);
+        $supplierId = self::requiredUuid($body, 'supplierId');
+        $db->beginTransaction();
+        try {
+            $rfqLock = $db->prepare('SELECT id, status, release_files_generated FROM rfqs WHERE id = ? AND organization_id = ? FOR UPDATE');
+            $rfqLock->execute([$rfqId, $principal['organizationId']]);
+            $rfq = $rfqLock->fetch(PDO::FETCH_ASSOC);
+            if (!$rfq) self::respondError($db, 404, 'NOT_FOUND', 'RFQ not found.');
+
+            $supplierQuery = $db->prepare('SELECT id FROM suppliers WHERE id = ? AND organization_id = ? AND is_active = TRUE FOR UPDATE');
+            $supplierQuery->execute([$supplierId, $principal['organizationId']]);
+            if (!$supplierQuery->fetchColumn()) self::respondError($db, 404, 'NOT_FOUND', 'Supplier not found.');
+
+            $countQuery = $db->prepare('SELECT COUNT(*) FROM rfq_suppliers WHERE organization_id = ? AND rfq_id = ?');
+            $countQuery->execute([$principal['organizationId'], $rfqId]);
+            $previousCount = (int)$countQuery->fetchColumn();
+            $associationId = Runtime::uuid();
+            $db->prepare('INSERT INTO rfq_suppliers (id, organization_id, rfq_id, supplier_id) VALUES (?, ?, ?, ?)')
+                ->execute([$associationId, $principal['organizationId'], $rfqId, $supplierId]);
+
+            $status = (string)$rfq['status'];
+            if ((bool)$rfq['release_files_generated'] && $previousCount === 0) {
+                $db->prepare('UPDATE rfqs SET status = \'ready\' WHERE id = ? AND organization_id = ?')
+                    ->execute([$rfqId, $principal['organizationId']]);
+                $status = 'ready';
+            }
+            $db->commit();
+        } catch (PDOException $error) {
+            if ($db->inTransaction()) $db->rollBack();
+            if ($error->getCode() === '23000') self::respondError($db, 409, 'RFQ_SUPPLIER_CONFLICT', 'This supplier is already assigned to the RFQ.');
+            throw $error;
+        } catch (\Throwable $error) {
+            if ($db->inTransaction()) $db->rollBack();
+            throw $error;
+        }
+
+        $readback = self::rfqSupplierQuery($db, $principal['organizationId'], $rfqId, $associationId);
+        if (!$readback) throw new \RuntimeException('The inserted RFQ supplier could not be read back.');
+        Runtime::respond(201, ['rfqSupplier' => self::rfqSupplierResponse($readback), 'rfq' => ['id' => $rfqId, 'status' => $status]]);
+    }
+
+    /** @param array<string, mixed> $principal */
+    private static function removeSupplier(PDO $db, array $principal, string $rfqId, string $associationId): never
+    {
+        self::requireModuleAccess($db, $principal);
+        $db->beginTransaction();
+        try {
+            $rfqLock = $db->prepare('SELECT id FROM rfqs WHERE id = ? AND organization_id = ? FOR UPDATE');
+            $rfqLock->execute([$rfqId, $principal['organizationId']]);
+            if (!$rfqLock->fetchColumn()) self::respondError($db, 404, 'NOT_FOUND', 'RFQ not found.');
+
+            $association = $db->prepare('SELECT id, sent_at FROM rfq_suppliers WHERE id = ? AND rfq_id = ? AND organization_id = ? FOR UPDATE');
+            $association->execute([$associationId, $rfqId, $principal['organizationId']]);
+            $row = $association->fetch(PDO::FETCH_ASSOC);
+            if ($row && $row['sent_at'] !== null) self::respondError($db, 409, 'RFQ_SUPPLIER_ALREADY_SENT', 'A sent RFQ supplier cannot be removed.');
+            if ($row) {
+                $db->prepare('DELETE FROM rfq_suppliers WHERE id = ? AND rfq_id = ? AND organization_id = ?')
+                    ->execute([$associationId, $rfqId, $principal['organizationId']]);
+            }
+            $db->commit();
+        } catch (\Throwable $error) {
+            if ($db->inTransaction()) $db->rollBack();
+            throw $error;
+        }
+        Runtime::respond(204);
+    }
+
+    /** @return array<string, mixed>|false */
+    private static function rfqSupplierQuery(PDO $db, string $organizationId, string $rfqId, string $associationId): array|false
+    {
+        $query = $db->prepare(
+            'SELECT rs.id, rs.rfq_id, rs.supplier_id, rs.sent_at, rs.sent_by, rs.sent_via,
+                    rs.viewed_at, rs.responded_at, rs.quoted_at, rs.declined_at, rs.declined_reason,
+                    rs.response_status, rs.total_quoted_amount, rs.currency, rs.lead_time_days,
+                    rs.is_selected, rs.selected_at, rs.selected_by, rs.notes, rs.created_at,
+                    s.id AS linked_supplier_id, s.name AS linked_supplier_name,
+                    s.code AS linked_supplier_code, s.contact_email AS linked_supplier_contact_email,
+                    s.contact_name AS linked_supplier_contact_name
+             FROM rfq_suppliers rs
+             JOIN suppliers s ON s.id = rs.supplier_id AND s.organization_id = rs.organization_id
+             WHERE rs.organization_id = ? AND rs.rfq_id = ? AND rs.id = ?'
+        );
+        $query->execute([$organizationId, $rfqId, $associationId]);
+        return $query->fetch(PDO::FETCH_ASSOC);
+    }
+
+    /** @param array<string, mixed> $row @return array<string, mixed> */
+    private static function rfqSupplierResponse(array $row): array
+    {
+        return [
+            'id' => (string)$row['id'], 'rfqId' => (string)$row['rfq_id'], 'supplierId' => (string)$row['supplier_id'],
+            'sentAt' => $row['sent_at'] !== null ? (string)$row['sent_at'] : null,
+            'sentBy' => $row['sent_by'] !== null ? (string)$row['sent_by'] : null,
+            'sentVia' => $row['sent_via'] !== null ? (string)$row['sent_via'] : null,
+            'viewedAt' => $row['viewed_at'] !== null ? (string)$row['viewed_at'] : null,
+            'respondedAt' => $row['responded_at'] !== null ? (string)$row['responded_at'] : null,
+            'quotedAt' => $row['quoted_at'] !== null ? (string)$row['quoted_at'] : null,
+            'declinedAt' => $row['declined_at'] !== null ? (string)$row['declined_at'] : null,
+            'declinedReason' => $row['declined_reason'] !== null ? (string)$row['declined_reason'] : null,
+            'responseStatus' => (string)$row['response_status'],
+            'totalQuotedAmount' => $row['total_quoted_amount'] !== null ? (string)$row['total_quoted_amount'] : null,
+            'currency' => (string)$row['currency'],
+            'leadTimeDays' => $row['lead_time_days'] !== null ? (int)$row['lead_time_days'] : null,
+            'isSelected' => (bool)$row['is_selected'],
+            'selectedAt' => $row['selected_at'] !== null ? (string)$row['selected_at'] : null,
+            'selectedBy' => $row['selected_by'] !== null ? (string)$row['selected_by'] : null,
+            'notes' => $row['notes'] !== null ? (string)$row['notes'] : null,
+            'createdAt' => (string)$row['created_at'],
+            'supplier' => [
+                'id' => (string)$row['linked_supplier_id'], 'name' => (string)$row['linked_supplier_name'],
+                'code' => $row['linked_supplier_code'] !== null ? (string)$row['linked_supplier_code'] : null,
+                'contactEmail' => $row['linked_supplier_contact_email'] !== null ? (string)$row['linked_supplier_contact_email'] : null,
+                'contactName' => $row['linked_supplier_contact_name'] !== null ? (string)$row['linked_supplier_contact_name'] : null,
+            ],
+        ];
     }
 
     /** @param array<string, mixed> $principal @return array<string, mixed> */
