@@ -4,6 +4,7 @@ declare(strict_types=1);
 require dirname(__DIR__) . '/src/Runtime.php';
 require dirname(__DIR__) . '/src/FileCheckin.php';
 require_once dirname(__DIR__) . '/src/FileCheckout.php';
+require_once dirname(__DIR__) . '/src/FileRevisionComment.php';
 require dirname(__DIR__) . '/src/Migrator.php';
 require dirname(__DIR__) . '/src/FileReferences.php';
 require dirname(__DIR__) . '/src/FileRevisionHistory.php';
@@ -20,6 +21,8 @@ use BluePlm\Migrator;
 use BluePlm\FileCheckout;
 use BluePlm\UserAvatars;
 use BluePlm\CheckoutLeaseFailure;
+use BluePlm\FileRevisionComment;
+use BluePlm\FileRevisionCommentFailure;
 use BluePlm\FileReferences;
 use BluePlm\FileRevisionHistory;
 use BluePlm\Installation;
@@ -2299,6 +2302,13 @@ try {
             throw $error;
         }
         Runtime::respond(201, ['id' => $fileId, 'created' => true]);
+    }
+    if ($method === 'PATCH' && preg_match('#^/files/([0-9a-f-]{36})/revisions/([0-9a-f-]{36})/comment$#i', $path, $matches)) {
+        try {
+            Runtime::respond(200, FileRevisionComment::update($db, $env, $principal, strtolower($matches[1]), strtolower($matches[2]), Runtime::jsonBody()));
+        } catch (FileRevisionCommentFailure $error) {
+            Runtime::respond($error->status, ['error' => $error->errorCode, 'message' => $error->getMessage()]);
+        }
     }
     if ($method === 'GET' && preg_match('#^/files/([0-9a-f-]{36})/revisions$#i', $path, $matches)) {
         Runtime::respond(200, ['revisions' => FileRevisionHistory::list($db, $principal, strtolower($matches[1]))]);

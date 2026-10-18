@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { runCheckoutRequestIdRecoveryTests } from './checkout-request-id-recovery.mjs'
 import { runCheckinReviewRegressionTests } from './checkin-review-regressions.mjs'
+import { runFileRevisionCommentIntegration } from './file-revision-comment-integration.mjs'
 import {
   assertColorSwatchesReadOnly,
   runColorSwatchesIntegration,
@@ -1534,5 +1535,16 @@ await runCheckoutRequestIdRecoveryTests({
   duplicatePart, imported, workspace, token, updatedMemberLogin, vault, foreignOrgId, foreignUser, sameHashRequest,
 })
 await runCheckinReviewRegressionTests({ request, requestStatus, imported, vault, workspace, token })
+await runFileRevisionCommentIntegration({
+  request,
+  requestStatus,
+  ownerToken: token,
+  memberToken: updatedMemberLogin.token,
+  memberId: createdUser.id,
+  foreignToken: foreignLogin.token,
+  vault,
+  vaultRoot,
+  workspace,
+})
 
 console.log('PHP API, installer lifecycle, MariaDB, and network vault integration passed.')
