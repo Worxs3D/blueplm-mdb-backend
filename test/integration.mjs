@@ -105,12 +105,7 @@ async function waitForHealth() {
         assert.equal(health.bundleDigest, null)
         assert.equal(health.bundleVersion, null)
         assert.equal(health.bundleReleaseVersion, null)
-        const databaseProbe = await fetch(`${server}/installer/database-status`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ installationToken: 'invalid' }),
-        })
-        if (databaseProbe.status === 403) return
+        return
       }
     } catch (error) {
       lastError = error
@@ -1012,6 +1007,13 @@ for (const removedPortal of ['/setup/', '/admin/']) {
   assert.equal(response.headers.get('content-type'), 'application/json; charset=utf-8')
 }
 
+stagePendingEnvironment()
+const deniedDatabaseStatus = await fetch(`${server}/installer/database-status`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ installationToken: 'invalid' }),
+})
+assert.equal(deniedDatabaseStatus.status, 403)
 stagePendingEnvironment()
 const detected = await request('/installer/database-status', {
   method: 'POST',
