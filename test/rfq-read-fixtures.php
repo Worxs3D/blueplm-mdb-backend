@@ -45,6 +45,7 @@ $ids = [
     'itemPrivate' => Runtime::uuid(),
     'itemDeleted' => Runtime::uuid(),
     'itemForeign' => Runtime::uuid(),
+    'itemUnlinked' => Runtime::uuid(),
     'rfqSupplier' => Runtime::uuid(),
     'rfqSupplierDeclined' => Runtime::uuid(),
     'rfqSupplierPending' => Runtime::uuid(),
@@ -95,13 +96,14 @@ try {
     $rfq->execute([$ids['rfqForeign'], $ids['foreignOrg'], 'RFQ-FOREIGN-001', 'RFQ FOREIGN SECRET', null, 'draft', null, null, null, null, null]);
 
     $item = $db->prepare(
-        'INSERT INTO rfq_items (id, organization_id, rfq_id, line_number, file_id, part_number, description, revision, quantity, sw_configuration, step_storage_path, pdf_storage_path, attachments, created_at, updated_at, sort_order)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        'INSERT INTO rfq_items (id, organization_id, rfq_id, line_number, file_id, part_number, description, revision, quantity, sw_configuration, release_files_status, release_files_error, step_file_generated, step_file_path, step_storage_path, step_file_size, pdf_file_generated, pdf_file_path, pdf_storage_path, pdf_file_size, attachments, created_at, updated_at, sort_order)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
     );
-    $item->execute([$ids['itemAccessible'], $orgId, $ids['rfqPrimary'], 1, $ids['fileAccessible'], 'RFQ-ACCESS', 'Accessible part snapshot', 'C', 4, '  Mirror Left - 2x  ', 'rfq-release/step/access.step', null, json_encode([['name' => 'Spec.pdf', 'path' => 'Attachments/Spec.pdf', 'size' => 1234, 'storage_path' => 'rfq-attachments/spec.pdf']], JSON_THROW_ON_ERROR), '2026-10-03 08:09:10.111', '2026-10-04 09:10:11.222', 1]);
-    $item->execute([$ids['itemPrivate'], $orgId, $ids['rfqPrimary'], 2, $ids['filePrivate'], 'RFQ-PRIVATE', 'Private part snapshot', 'R8', 2, 'Alternate Fixture Config', null, 'rfq-release/pdf/private.pdf', json_encode([['name' => 'No storage key.txt', 'path' => 'Attachments/No storage key.txt', 'size' => 17]], JSON_THROW_ON_ERROR), '2026-10-05 10:11:12.333', '2026-10-06 11:12:13.444', 2]);
-    $item->execute([$ids['itemDeleted'], $orgId, $ids['rfqPrimary'], 3, $ids['fileDeleted'], 'RFQ-DELETED', 'Deleted part snapshot', 'A', 1, null, null, null, '[]', '2026-10-07 12:13:14.555', '2026-10-08 13:14:15.666', 3]);
-    $item->execute([$ids['itemForeign'], $orgId, $ids['rfqPrimary'], 4, $ids['fileForeign'], 'RFQ-FOREIGN', 'Foreign file snapshot', 'D', 1, null, null, null, null, '2026-10-09 14:15:16.777', '2026-10-10 15:16:17.888', 4]);
+    $item->execute([$ids['itemAccessible'], $orgId, $ids['rfqPrimary'], 1, $ids['fileAccessible'], 'RFQ-ACCESS', 'Accessible part snapshot', 'C', 4, '  Mirror Left - 2x  ', 'complete', null, 1, 'rfq-release/step/access.step', 'rfq-release/step/access.step', 4321, 1, 'rfq-release/pdf/access.pdf', 'rfq-release/pdf/access.pdf', 8765, json_encode([['name' => 'Spec.pdf', 'path' => 'Attachments/Spec.pdf', 'size' => 1234, 'storage_path' => 'rfq-attachments/spec.pdf']], JSON_THROW_ON_ERROR), '2026-10-03 08:09:10.111', '2026-10-04 09:10:11.222', 1]);
+    $item->execute([$ids['itemPrivate'], $orgId, $ids['rfqPrimary'], 2, $ids['filePrivate'], 'RFQ-PRIVATE', 'Private part snapshot', 'R8', 2, 'Alternate Fixture Config', 'complete', 'Private release error', 1, 'private/step.step', 'rfq-release/step/private.step', 2345, 1, 'private.pdf', 'rfq-release/pdf/private.pdf', 6789, json_encode([['name' => 'No storage key.txt', 'path' => 'Attachments/No storage key.txt', 'size' => 17]], JSON_THROW_ON_ERROR), '2026-10-05 10:11:12.333', '2026-10-06 11:12:13.444', 2]);
+    $item->execute([$ids['itemDeleted'], $orgId, $ids['rfqPrimary'], 3, $ids['fileDeleted'], 'RFQ-DELETED', 'Deleted part snapshot', 'A', 1, null, 'complete', 'Deleted release error', 1, 'deleted/step.step', 'rfq-release/step/deleted.step', 2345, 1, 'deleted.pdf', 'rfq-release/pdf/deleted.pdf', 6789, json_encode([['name' => 'Deleted secret.pdf', 'path' => 'Attachments/deleted.pdf', 'size' => 17, 'storage_path' => 'rfq-attachments/deleted.pdf']], JSON_THROW_ON_ERROR), '2026-10-07 12:13:14.555', '2026-10-08 13:14:15.666', 3]);
+    $item->execute([$ids['itemForeign'], $orgId, $ids['rfqPrimary'], 4, $ids['fileForeign'], 'RFQ-FOREIGN', 'Foreign file snapshot', 'D', 1, null, 'complete', 'Foreign release error', 1, 'foreign/step.step', 'rfq-release/step/foreign.step', 3456, 1, 'foreign.pdf', 'rfq-release/pdf/foreign.pdf', 7890, json_encode([['name' => 'Foreign secret.pdf', 'path' => 'Attachments/foreign.pdf', 'size' => 27, 'storage_path' => 'rfq-attachments/foreign.pdf']], JSON_THROW_ON_ERROR), '2026-10-09 14:15:16.777', '2026-10-10 15:16:17.888', 4]);
+    $item->execute([$ids['itemUnlinked'], $orgId, $ids['rfqPrimary'], 5, null, 'RFQ-UNLINKED', 'Unlinked part snapshot', 'E', 1, null, 'complete', 'Unlinked release error', 1, 'unlinked/step.step', 'rfq-release/step/unlinked.step', 4567, 1, 'unlinked.pdf', 'rfq-release/pdf/unlinked.pdf', 8901, json_encode([['name' => 'Unlinked secret.pdf', 'path' => 'Attachments/unlinked.pdf', 'size' => 37, 'storage_path' => 'rfq-attachments/unlinked.pdf']], JSON_THROW_ON_ERROR), '2026-10-11 16:17:18.999', '2026-10-12 17:18:19.000', 5]);
 
     $association = $db->prepare(
         'INSERT INTO rfq_suppliers (id, organization_id, rfq_id, supplier_id, sent_at, viewed_at, responded_at, quoted_at, declined_at, declined_reason, response_status, total_quoted_amount, currency, lead_time_days, is_selected, selected_at, selected_by, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
