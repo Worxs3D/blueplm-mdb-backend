@@ -7,6 +7,7 @@ import { join, resolve } from 'node:path'
 import { runCheckoutRequestIdRecoveryTests } from './checkout-request-id-recovery.mjs'
 import { runCheckinReviewRegressionTests } from './checkin-review-regressions.mjs'
 import { runFileRevisionCommentIntegration } from './file-revision-comment-integration.mjs'
+import { runFolderRenameIntegration } from './folder-rename.integration.mjs'
 import { runOrganizationLogoIntegration } from './organization-logo-integration.mjs'
 import {
   assertColorSwatchesReadOnly,
@@ -1580,5 +1581,7 @@ await runFileRevisionCommentIntegration({
   vaultRoot,
   workspace,
 })
+
+await runFolderRenameIntegration({ request, requestStatus, token, vault, workspace })
 
 console.log('PHP API, installer lifecycle, MariaDB, and network vault integration passed.')

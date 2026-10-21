@@ -2484,19 +2484,155 @@ try {
     if ($method === 'PATCH' && preg_match('#^/folders/([0-9a-f-]{36})$#i', $path, $matches)) {
         $body = Runtime::jsonBody();
         if (!is_string($body['folderPath'] ?? null)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'folderPath is required.']);
-        $folderPath = ltrim(str_replace('\\', '/', trim($body['folderPath'])), '/');
-        if ($folderPath === '' || str_contains($folderPath, '../')) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'folderPath must be a normalized vault-relative path.']);
-        $query = $db->prepare('SELECT vault_id FROM folders WHERE id = ? AND organization_id = ? AND deleted_at IS NULL');
-        $query->execute([$matches[1], $principal['organizationId']]); $folder = $query->fetch();
-        if (!$folder) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Folder not found.']);
-        Runtime::requireVault($db, $principal, $folder['vault_id']);
+        $folderPath = \BluePlm\VaultRelativePath::normalize($body['folderPath']);
+        if ($folderPath === null || strlen($folderPath) > 2048) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'folderPath must be a normalized vault-relative path.']);
+
+        $lookup = $db->prepare('SELECT vault_id FROM folders WHERE id = ? AND organization_id = ? AND deleted_at IS NULL');
+        $lookup->execute([$matches[1], $principal['organizationId']]); $folderLookup = $lookup->fetch();
+        if (!$folderLookup) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Folder not found.']);
+        Runtime::requireVault($db, $principal, $folderLookup['vault_id']);
+
+        $db->beginTransaction();
         try {
-            $db->prepare('UPDATE folders SET folder_path = ? WHERE id = ?')->execute([$folderPath, $matches[1]]);
+            // The vault row serializes subtree moves and blocks new FK-backed
+            // folder/file inserts until the path set is committed.
+            $vaultLock = $db->prepare('SELECT id FROM vaults WHERE id = ? AND organization_id = ? FOR UPDATE');
+            $vaultLock->execute([$folderLookup['vault_id'], $principal['organizationId']]);
+            if (!$vaultLock->fetch()) {
+                $db->rollBack();
+                Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Folder not found.']);
+            }
+            Runtime::requireVault($db, $principal, $folderLookup['vault_id']);
+
+            $rootQuery = $db->prepare('SELECT id, vault_id, folder_path FROM folders WHERE id = ? AND organization_id = ? AND vault_id = ? AND deleted_at IS NULL FOR UPDATE');
+            $rootQuery->execute([$matches[1], $principal['organizationId'], $folderLookup['vault_id']]);
+            $rootFolder = $rootQuery->fetch();
+            if (!$rootFolder) {
+                $db->rollBack();
+                Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Folder not found.']);
+            }
+            $oldPath = $rootFolder['folder_path'];
+            if ($folderPath === $oldPath) {
+                $db->commit();
+                Runtime::respond(200, ['success' => true]);
+            }
+            $folderPattern = strtr($oldPath, ['!' => '!!', '%' => '!%', '_' => '!_']) . '/%';
+            $selfSubtreeQuery = $db->prepare("SELECT 1 WHERE CONVERT(? USING utf8mb4) COLLATE utf8mb4_unicode_ci LIKE CONVERT(? USING utf8mb4) COLLATE utf8mb4_unicode_ci ESCAPE '!'");
+            $selfSubtreeQuery->execute([$folderPath, $folderPattern]);
+            if ($selfSubtreeQuery->fetchColumn()) {
+                $db->rollBack();
+                Runtime::respond(409, ['error' => 'INVALID_MOVE', 'message' => 'A folder cannot be moved into its own subtree.']);
+            }
+
+            // The path columns use utf8mb4_unicode_ci. Find the descendant
+            // boundary by slash segment, not by byte length: collation-equal
+            // prefixes may have different UTF-8 byte representations.
+            $suffixAfterPrefix = static function (string $candidate, string $prefix, bool $isPrefixPath): ?string {
+                if ($isPrefixPath) return '';
+                $separatorOrdinal = substr_count($prefix, '/') + 1;
+                $offset = 0;
+                $separator = false;
+                for ($index = 0; $index < $separatorOrdinal; $index++) {
+                    $separator = strpos($candidate, '/', $offset);
+                    if ($separator === false) return null;
+                    $offset = $separator + 1;
+                }
+                return substr($candidate, $separator);
+            };
+
+            $folderQuery = $db->prepare("SELECT id, folder_path, CASE WHEN folder_path = ? THEN 1 ELSE 0 END AS prefix_is_path FROM folders WHERE vault_id = ? AND organization_id = ? AND (folder_path = ? OR folder_path LIKE ? ESCAPE '!') ORDER BY folder_path, id FOR UPDATE");
+            $folderQuery->execute([$oldPath, $rootFolder['vault_id'], $principal['organizationId'], $oldPath, $folderPattern]);
+            $folderRows = $folderQuery->fetchAll();
+            $folderChanges = [];
+            foreach ($folderRows as $row) {
+                $suffix = $suffixAfterPrefix($row['folder_path'], $oldPath, (int)$row['prefix_is_path'] === 1);
+                if ($suffix === null) throw new RuntimeException('A matched descendant folder path has no expected segment boundary.');
+                $folderChanges[] = ['id' => $row['id'], 'path' => $folderPath . $suffix];
+            }
+            foreach ($folderChanges as $change) {
+                if (strlen($change['path']) > 2048) {
+                    $db->rollBack();
+                    Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A descendant folder path exceeds the supported length.']);
+                }
+            }
+
+            $fileQuery = $db->prepare("SELECT id, canonical_path, CASE WHEN active_canonical_path = ? THEN 1 ELSE 0 END AS prefix_is_path FROM files WHERE vault_id = ? AND organization_id = ? AND deleted_at IS NULL AND (active_canonical_path = ? OR active_canonical_path LIKE ? ESCAPE '!') ORDER BY canonical_path, id FOR UPDATE");
+            $fileQuery->execute([$oldPath, $rootFolder['vault_id'], $principal['organizationId'], $oldPath, $folderPattern]);
+            $fileRows = $fileQuery->fetchAll();
+            $fileChanges = [];
+            foreach ($fileRows as $row) {
+                $suffix = $suffixAfterPrefix($row['canonical_path'], $oldPath, (int)$row['prefix_is_path'] === 1);
+                if ($suffix === null) throw new RuntimeException('A matched descendant file path has no expected segment boundary.');
+                $fileChanges[] = ['id' => $row['id'], 'path' => $folderPath . $suffix];
+            }
+            foreach ($fileChanges as $change) {
+                if (strlen($change['path']) > 2048) {
+                    $db->rollBack();
+                    Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A descendant file path exceeds the supported length.']);
+                }
+            }
+
+            $checkPathCollisions = static function (string $table, string $column, array $paths, array $movingIds, bool $activeOnly) use ($db, $principal, $rootFolder): bool {
+                $paths = array_values(array_unique($paths));
+                if ($paths === []) return false;
+                $pathSlots = implode(', ', array_fill(0, count($paths), '?'));
+                $activeClause = $activeOnly ? ' AND deleted_at IS NULL' : '';
+                $query = $db->prepare("SELECT id FROM {$table} WHERE organization_id = ? AND vault_id = ?{$activeClause} AND {$column} IN ({$pathSlots}) FOR UPDATE");
+                $query->execute([$principal['organizationId'], $rootFolder['vault_id'], ...$paths]);
+                foreach ($query->fetchAll() as $row) {
+                    if (!in_array($row['id'], $movingIds, true)) return true;
+                }
+                return false;
+            };
+
+            $folderIds = array_column($folderChanges, 'id');
+            $folderPaths = array_column($folderChanges, 'path');
+            $fileIds = array_column($fileChanges, 'id');
+            $filePaths = array_column($fileChanges, 'path');
+            if ($checkPathCollisions('folders', 'folder_path', $folderPaths, $folderIds, false)
+                || $checkPathCollisions('files', 'canonical_path', $folderPaths, $fileIds, true)
+                || $checkPathCollisions('files', 'canonical_path', $filePaths, $fileIds, true)
+                || $checkPathCollisions('folders', 'folder_path', $filePaths, $folderIds, false)) {
+                $db->rollBack();
+                Runtime::respond(409, ['error' => 'PATH_EXISTS', 'message' => 'A folder or file already exists at a destination path.']);
+            }
+
+            if ($folderPaths !== [] && $filePaths !== []) {
+                $folderPathSelect = implode(' UNION ALL ', array_fill(0, count($folderPaths), "SELECT CAST(? AS CHAR(2048)) COLLATE utf8mb4_unicode_ci AS path"));
+                $filePathSelect = implode(' UNION ALL ', array_fill(0, count($filePaths), "SELECT CAST(? AS CHAR(2048)) COLLATE utf8mb4_unicode_ci AS path"));
+                $crossTypeCollision = $db->prepare("SELECT 1 FROM ({$folderPathSelect}) AS folder_paths INNER JOIN ({$filePathSelect}) AS file_paths ON folder_paths.path = file_paths.path LIMIT 1");
+                $crossTypeCollision->execute([...$folderPaths, ...$filePaths]);
+                if ($crossTypeCollision->fetch()) {
+                    $db->rollBack();
+                    Runtime::respond(409, ['error' => 'PATH_EXISTS', 'message' => 'A folder or file already exists at a destination path.']);
+                }
+            }
+
+            if ($fileIds !== []) {
+                $fileSlots = implode(', ', array_fill(0, count($fileIds), '?'));
+                $checkoutQuery = $db->prepare("SELECT file_id, token_hash, (expires_at > UTC_TIMESTAMP(3)) AS lease_active FROM checkouts WHERE file_id IN ({$fileSlots}) ORDER BY file_id FOR UPDATE");
+                $checkoutQuery->execute($fileIds);
+                foreach ($checkoutQuery->fetchAll() as $checkout) {
+                    if ((int)$checkout['lease_active'] === 1) {
+                        $db->rollBack();
+                        Runtime::respond(409, ['error' => 'CHECKED_OUT', 'message' => 'A file in this folder has an active checkout.']);
+                    }
+                    \BluePlm\FileCheckout::markTerminalByHash($db, $checkout['file_id'], $checkout['token_hash'], 'expired');
+                    $db->prepare('DELETE FROM checkouts WHERE file_id = ?')->execute([$checkout['file_id']]);
+                }
+            }
+
+            $updateFolder = $db->prepare('UPDATE folders SET folder_path = ? WHERE id = ? AND vault_id = ? AND organization_id = ?');
+            foreach ($folderChanges as $change) $updateFolder->execute([$change['path'], $change['id'], $rootFolder['vault_id'], $principal['organizationId']]);
+            $updateFile = $db->prepare('UPDATE files SET canonical_path = ?, file_name = ? WHERE id = ? AND vault_id = ? AND organization_id = ? AND deleted_at IS NULL');
+            foreach ($fileChanges as $change) $updateFile->execute([$change['path'], basename($change['path']), $change['id'], $rootFolder['vault_id'], $principal['organizationId']]);
+            $db->commit();
         } catch (Throwable $error) {
-            if ($error instanceof PDOException && $error->getCode() === '23000') Runtime::respond(409, ['error' => 'PATH_EXISTS', 'message' => 'A folder already exists at this path.']);
+            if ($db->inTransaction()) $db->rollBack();
+            if ($error instanceof \PDOException && $error->getCode() === '23000') Runtime::respond(409, ['error' => 'PATH_EXISTS', 'message' => 'A folder or file already exists at a destination path.']);
             throw $error;
         }
-        Runtime::respond(200, ['success' => true]);
+        Runtime::respond(200, ['success' => true, 'updatedFolders' => count($folderChanges), 'updatedFiles' => count($fileChanges)]);
     }
     if ($method === 'DELETE' && preg_match('#^/folders/([0-9a-f-]{36})$#i', $path, $matches)) {
         $query = $db->prepare('SELECT vault_id, folder_path FROM folders WHERE id = ? AND organization_id = ? AND deleted_at IS NULL');
