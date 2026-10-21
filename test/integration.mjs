@@ -107,6 +107,7 @@ async function waitForHealth() {
       const health = await request('/health')
       if (health.ok === true && health.supabase === false && health.apiVersion === 2) {
         assert.ok(health.capabilities.includes('backup'))
+        assert.ok(health.capabilities.includes('folderSubtreeRename'))
         // A fresh/legacy deployment has no identity until the desktop installer
         // publishes one; clients must classify this as unknown, never current.
         assert.equal(health.bundleDigest, null)

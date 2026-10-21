@@ -102,6 +102,30 @@ export async function runFolderRenameIntegration({ request, requestStatus, token
     assert.ok((await folders()).some((row) => row.id === reverseChild.id && row.folder_path === reverseDestination + '/child'))
     assert.ok((await files()).some((row) => row.id === reverseFile.id && row.canonicalPath === reverseDestination + '/child/reverse.sldprt'))
 
+    const sharpSForwardRoot = (await createFolder(unicodePrefix + '/straße')).folder
+    const sharpSForwardChild = (await createFolder(unicodePrefix + '/strasse/child')).folder
+    const sharpSForwardFile = await importFile(unicodePrefix + '/strasse/child/forward.sldprt')
+    const sharpSEquivalentSelfMove = await patchFolder(sharpSForwardRoot.id, unicodePrefix + '/strasse/child')
+    assert.equal(sharpSEquivalentSelfMove.status, 409)
+    assert.equal(sharpSEquivalentSelfMove.body.error, 'INVALID_MOVE')
+    const sharpSForwardDestination = unicodePrefix + '/unicode-forward-renamed'
+    const sharpSForwardMove = await patchFolder(sharpSForwardRoot.id, sharpSForwardDestination)
+    assert.equal(sharpSForwardMove.status, 200)
+    assert.ok((await folders()).some((row) => row.id === sharpSForwardChild.id && row.folder_path === sharpSForwardDestination + '/child'))
+    assert.ok((await files()).some((row) => row.id === sharpSForwardFile.id && row.canonicalPath === sharpSForwardDestination + '/child/forward.sldprt'))
+
+    const sharpSReverseRoot = (await createFolder(unicodePrefix + '/strasse')).folder
+    const sharpSReverseChild = (await createFolder(unicodePrefix + '/straße/child')).folder
+    const sharpSReverseFile = await importFile(unicodePrefix + '/straße/child/reverse.sldprt')
+    const sharpSReverseSelfMove = await patchFolder(sharpSReverseRoot.id, unicodePrefix + '/straße/child')
+    assert.equal(sharpSReverseSelfMove.status, 409)
+    assert.equal(sharpSReverseSelfMove.body.error, 'INVALID_MOVE')
+    const sharpSReverseDestination = unicodePrefix + '/unicode-reverse-renamed'
+    const sharpSReverseMove = await patchFolder(sharpSReverseRoot.id, sharpSReverseDestination)
+    assert.equal(sharpSReverseMove.status, 200)
+    assert.ok((await folders()).some((row) => row.id === sharpSReverseChild.id && row.folder_path === sharpSReverseDestination + '/child'))
+    assert.ok((await files()).some((row) => row.id === sharpSReverseFile.id && row.canonicalPath === sharpSReverseDestination + '/child/reverse.sldprt'))
+
     const caseRoot = (await createFolder(unicodePrefix + '/CaseRoot')).folder
     const caseChild = (await createFolder(unicodePrefix + '/caseroot/Nested')).folder
     const caseFile = await importFile(unicodePrefix + '/CASEROOT/nested/Part.sldprt')

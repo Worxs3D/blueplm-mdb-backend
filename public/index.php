@@ -365,7 +365,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'OPTIONS') Runtime::respond(204);
 try {
     $manifest = BundleManifest::read($root);
     if ($path === '/health') {
-        $capabilities = ['backup'];
+        $capabilities = ['backup', 'folderSubtreeRename'];
         try {
             if (FileCheckout::supportsRequestIds(Runtime::database($env, 3))) $capabilities[] = 'checkoutRequestIdempotency';
         } catch (Throwable) {
@@ -2516,12 +2516,17 @@ try {
                 $db->commit();
                 Runtime::respond(200, ['success' => true]);
             }
-            $folderPattern = strtr($oldPath, ['!' => '!!', '%' => '!%', '_' => '!_']) . '/%';
-            $selfSubtreeQuery = $db->prepare("SELECT 1 WHERE CONVERT(? USING utf8mb4) COLLATE utf8mb4_unicode_ci LIKE CONVERT(? USING utf8mb4) COLLATE utf8mb4_unicode_ci ESCAPE '!'");
-            $selfSubtreeQuery->execute([$folderPath, $folderPattern]);
-            if ($selfSubtreeQuery->fetchColumn()) {
-                $db->rollBack();
-                Runtime::respond(409, ['error' => 'INVALID_MOVE', 'message' => 'A folder cannot be moved into its own subtree.']);
+            $oldPathSegments = explode('/', $oldPath);
+            $destinationSegments = explode('/', $folderPath);
+            $oldPathSegmentCount = count($oldPathSegments);
+            if (count($destinationSegments) > $oldPathSegmentCount) {
+                $destinationPrefix = implode('/', array_slice($destinationSegments, 0, $oldPathSegmentCount));
+                $selfSubtreeQuery = $db->prepare("SELECT CONVERT(? USING utf8mb4) COLLATE utf8mb4_unicode_ci = CONVERT(? USING utf8mb4) COLLATE utf8mb4_unicode_ci");
+                $selfSubtreeQuery->execute([$destinationPrefix, $oldPath]);
+                if ($selfSubtreeQuery->fetchColumn()) {
+                    $db->rollBack();
+                    Runtime::respond(409, ['error' => 'INVALID_MOVE', 'message' => 'A folder cannot be moved into its own subtree.']);
+                }
             }
 
             // The path columns use utf8mb4_unicode_ci. Find the descendant
@@ -2540,8 +2545,8 @@ try {
                 return substr($candidate, $separator);
             };
 
-            $folderQuery = $db->prepare("SELECT id, folder_path, CASE WHEN folder_path = ? THEN 1 ELSE 0 END AS prefix_is_path FROM folders WHERE vault_id = ? AND organization_id = ? AND (folder_path = ? OR folder_path LIKE ? ESCAPE '!') ORDER BY folder_path, id FOR UPDATE");
-            $folderQuery->execute([$oldPath, $rootFolder['vault_id'], $principal['organizationId'], $oldPath, $folderPattern]);
+            $folderQuery = $db->prepare("SELECT id, folder_path, CASE WHEN folder_path = ? THEN 1 ELSE 0 END AS prefix_is_path FROM folders WHERE vault_id = ? AND organization_id = ? AND (folder_path = ? OR ((CHAR_LENGTH(folder_path) - CHAR_LENGTH(REPLACE(folder_path, '/', ''))) >= ? AND CONVERT(SUBSTRING_INDEX(folder_path, '/', ?) USING utf8mb4) COLLATE utf8mb4_unicode_ci = CONVERT(? USING utf8mb4) COLLATE utf8mb4_unicode_ci)) ORDER BY folder_path, id FOR UPDATE");
+            $folderQuery->execute([$oldPath, $rootFolder['vault_id'], $principal['organizationId'], $oldPath, $oldPathSegmentCount, $oldPathSegmentCount, $oldPath]);
             $folderRows = $folderQuery->fetchAll();
             $folderChanges = [];
             foreach ($folderRows as $row) {
@@ -2556,8 +2561,8 @@ try {
                 }
             }
 
-            $fileQuery = $db->prepare("SELECT id, canonical_path, CASE WHEN active_canonical_path = ? THEN 1 ELSE 0 END AS prefix_is_path FROM files WHERE vault_id = ? AND organization_id = ? AND deleted_at IS NULL AND (active_canonical_path = ? OR active_canonical_path LIKE ? ESCAPE '!') ORDER BY canonical_path, id FOR UPDATE");
-            $fileQuery->execute([$oldPath, $rootFolder['vault_id'], $principal['organizationId'], $oldPath, $folderPattern]);
+            $fileQuery = $db->prepare("SELECT id, canonical_path, CASE WHEN active_canonical_path = ? THEN 1 ELSE 0 END AS prefix_is_path FROM files WHERE vault_id = ? AND organization_id = ? AND deleted_at IS NULL AND (active_canonical_path = ? OR ((CHAR_LENGTH(active_canonical_path) - CHAR_LENGTH(REPLACE(active_canonical_path, '/', ''))) >= ? AND CONVERT(SUBSTRING_INDEX(active_canonical_path, '/', ?) USING utf8mb4) COLLATE utf8mb4_unicode_ci = CONVERT(? USING utf8mb4) COLLATE utf8mb4_unicode_ci)) ORDER BY canonical_path, id FOR UPDATE");
+            $fileQuery->execute([$oldPath, $rootFolder['vault_id'], $principal['organizationId'], $oldPath, $oldPathSegmentCount, $oldPathSegmentCount, $oldPath]);
             $fileRows = $fileQuery->fetchAll();
             $fileChanges = [];
             foreach ($fileRows as $row) {
