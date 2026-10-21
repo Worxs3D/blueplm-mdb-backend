@@ -7,6 +7,7 @@ import { join, resolve } from 'node:path'
 import { runCheckoutRequestIdRecoveryTests } from './checkout-request-id-recovery.mjs'
 import { runCheckinReviewRegressionTests } from './checkin-review-regressions.mjs'
 import { runFileRevisionCommentIntegration } from './file-revision-comment-integration.mjs'
+import { runFolderRenameIntegration } from './folder-rename.integration.mjs'
 import { runOrganizationLogoIntegration } from './organization-logo-integration.mjs'
 import {
   assertColorSwatchesReadOnly,
@@ -106,6 +107,7 @@ async function waitForHealth() {
       const health = await request('/health')
       if (health.ok === true && health.supabase === false && health.apiVersion === 2) {
         assert.ok(health.capabilities.includes('backup'))
+        assert.ok(health.capabilities.includes('folderSubtreeRename'))
         // A fresh/legacy deployment has no identity until the desktop installer
         // publishes one; clients must classify this as unknown, never current.
         assert.equal(health.bundleDigest, null)
@@ -1580,5 +1582,7 @@ await runFileRevisionCommentIntegration({
   vaultRoot,
   workspace,
 })
+
+await runFolderRenameIntegration({ request, requestStatus, token, vault, workspace })
 
 console.log('PHP API, installer lifecycle, MariaDB, and network vault integration passed.')
