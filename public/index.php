@@ -1566,8 +1566,12 @@ try {
         Runtime::respond(200, ['teams' => $query->fetchAll()]);
     }
     if ($method === 'GET' && preg_match('#^/teams/([0-9a-f-]{36})/members$#i', $path, $matches)) {
-        $query = $db->prepare('SELECT tm.user_id AS userId, tm.created_at AS addedAt, u.email, u.display_name AS displayName, m.role FROM team_members tm JOIN teams t ON t.id = tm.team_id JOIN users u ON u.id = tm.user_id JOIN organization_memberships m ON m.user_id = u.id AND m.organization_id = t.organization_id WHERE tm.team_id = ? AND t.organization_id = ? ORDER BY u.display_name, u.email'); $query->execute([$matches[1], $principal['organizationId']]);
-        Runtime::respond(200, ['members' => $query->fetchAll()]);
+        $query = $db->prepare('SELECT tm.user_id AS userId, tm.created_at AS addedAt, u.email, u.display_name AS displayName, m.role, tm.is_team_admin AS isTeamAdmin FROM team_members tm JOIN teams t ON t.id = tm.team_id JOIN users u ON u.id = tm.user_id JOIN organization_memberships m ON m.user_id = u.id AND m.organization_id = t.organization_id WHERE tm.team_id = ? AND t.organization_id = ? ORDER BY u.display_name, u.email'); $query->execute([$matches[1], $principal['organizationId']]);
+        $members = array_map(static function (array $member): array {
+            $member['isTeamAdmin'] = (bool) $member['isTeamAdmin'];
+            return $member;
+        }, $query->fetchAll());
+        Runtime::respond(200, ['members' => $members]);
     }
     if ($method === 'POST' && preg_match('#^/teams/([0-9a-f-]{36})/members$#i', $path, $matches)) {
         if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
