@@ -2,6 +2,8 @@
 declare(strict_types=1);
 
 require dirname(__DIR__) . '/src/Runtime.php';
+require dirname(__DIR__) . '/src/VaultRelativePath.php';
+require dirname(__DIR__) . '/src/AdminOnlyFolders.php';
 require dirname(__DIR__) . '/src/FileCheckin.php';
 require_once dirname(__DIR__) . '/src/FileCheckout.php';
 require_once dirname(__DIR__) . '/src/FileRevisionComment.php';
@@ -23,6 +25,7 @@ require dirname(__DIR__) . '/src/RFQReads.php';
 require dirname(__DIR__) . '/src/RFQWrites.php';
 
 use BluePlm\Migrator;
+use BluePlm\AdminOnlyFolders;
 use BluePlm\FileCheckout;
 use BluePlm\UserAvatars;
 use BluePlm\OrganizationLogos;
@@ -1685,6 +1688,33 @@ try {
         $db->prepare('INSERT INTO organization_settings (organization_id, default_new_user_team_id) VALUES (?, ?) ON DUPLICATE KEY UPDATE default_new_user_team_id = VALUES(default_new_user_team_id)')->execute([$principal['organizationId'], $teamId]);
         Runtime::emitEvent($db, $principal['organizationId'], 'organization.default_team_updated', $principal['organizationId'], ['defaultNewUserTeamId' => $teamId, 'updatedBy' => $principal['userId']]);
         Runtime::respond(200, ['defaultNewUserTeamId' => $teamId]);
+    }
+    if ($method === 'GET' && $path === '/organizations/current/settings/admin-only-folders') {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        try {
+            $query = $db->prepare('SELECT admin_only_folders FROM organization_settings WHERE organization_id = ?');
+            $query->execute([$principal['organizationId']]);
+            $value = $query->fetchColumn();
+            if (!is_string($value)) throw new \UnexpectedValueException('Organization folder policy is not initialized.');
+            $folders = AdminOnlyFolders::fromStored($value);
+        } catch (\UnexpectedValueException) {
+            Runtime::respond(503, ['error' => 'POLICY_UNINITIALIZED', 'message' => 'Organization folder policy is unavailable.']);
+        }
+        Runtime::respond(200, ['value' => $folders]);
+    }
+    if ($method === 'PUT' && $path === '/organizations/current/settings/admin-only-folders') {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        try {
+            $body = Runtime::jsonBodyValue();
+            if (!$body instanceof \stdClass || !property_exists($body, 'value')) throw new \InvalidArgumentException('A value array is required.');
+            $folders = AdminOnlyFolders::fromRequest($body->value);
+        } catch (\JsonException|\InvalidArgumentException) {
+            Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'value must be an array of safe vault-relative folder paths.']);
+        }
+        $encoded = json_encode($folders, JSON_THROW_ON_ERROR);
+        $db->prepare('INSERT INTO organization_settings (organization_id, admin_only_folders) VALUES (?, ?) ON DUPLICATE KEY UPDATE admin_only_folders = VALUES(admin_only_folders)')
+            ->execute([$principal['organizationId'], $encoded]);
+        Runtime::respond(200, ['value' => $folders]);
     }
     if ($method === 'GET' && preg_match('#^/organizations/current/settings/(serialization|export|rfq|auth-providers|modules)$#', $path, $matches)) {
         $columns = [

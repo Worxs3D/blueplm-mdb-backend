@@ -35,6 +35,8 @@ final class Migrator
             try {
                 if ($migration === '029_module_defaults.sql') {
                     self::ensureModuleDefaultsColumns($db);
+                } elseif ($migration === '049_admin_only_folders.sql') {
+                    self::ensureAdminOnlyFoldersPolicy($db);
                 } elseif ($migration === '035_checkin_metadata_idempotency.sql') {
                     self::ensureCheckinMetadataColumns($db);
                     $db->exec($sql);
@@ -269,6 +271,29 @@ final class Migrator
                 $db->exec("ALTER TABLE `{$table}` ADD COLUMN `{$column}` {$definition}");
             }
         }
+    }
+
+    private static function ensureAdminOnlyFoldersPolicy(PDO $db): void
+    {
+        $exists = $db->prepare(
+            'SELECT 1 FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?'
+        );
+        $exists->execute(['organization_settings', 'admin_only_folders']);
+        if (!$exists->fetchColumn()) {
+            $db->exec('ALTER TABLE organization_settings ADD COLUMN admin_only_folders JSON NULL');
+        }
+
+        // This feature had no prior MDB storage. Initialize only during migration;
+        // request-time reads deliberately treat NULL/missing policy as uninitialized.
+        $db->exec(
+            'INSERT INTO organization_settings (organization_id, admin_only_folders)
+             SELECT o.id, JSON_ARRAY()
+             FROM organizations o
+             LEFT JOIN organization_settings s ON s.organization_id = o.id
+             WHERE s.organization_id IS NULL'
+        );
+        $db->exec('UPDATE organization_settings SET admin_only_folders = JSON_ARRAY() WHERE admin_only_folders IS NULL');
     }
 
     private static function addForeignKeyIfMissing(PDO $db, string $name, string $statement): void

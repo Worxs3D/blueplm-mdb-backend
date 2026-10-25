@@ -276,6 +276,14 @@ final class Runtime
         return $decoded;
     }
 
+    /** Decode any JSON value while preserving object-versus-array identity. */
+    public static function jsonBodyValue(): mixed
+    {
+        $raw = file_get_contents('php://input');
+        if ($raw === false || trim($raw) === '') throw new \InvalidArgumentException('A JSON body is required.');
+        return json_decode($raw, false, 512, JSON_THROW_ON_ERROR);
+    }
+
     /** @param array<string, string> $env */
     public static function sendCors(array $env): void
     {
