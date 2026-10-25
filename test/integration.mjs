@@ -1254,6 +1254,12 @@ assert.equal(
   ).exists,
   true,
 )
+const scanWithTrashedPart = await request('/organizations/current/serialization/files', {}, token)
+assert.ok(scanWithTrashedPart.files.some((file) => file.partNumber === 'PN-TRASH-RESERVED'))
+assert.equal(
+  (await request('/organizations/current/serialization/files', {}, foreignLogin.token)).files.some((file) => file.partNumber === 'PN-TRASH-RESERVED'),
+  false,
+)
 await request(`/files/${trashReservedPart.id}/restore`, { method: 'POST' }, token)
 const referencedPart = await request(
   '/files/import',
