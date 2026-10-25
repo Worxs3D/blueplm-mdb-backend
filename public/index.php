@@ -1789,7 +1789,7 @@ try {
     }
     if ($method === 'GET' && $path === '/organizations/current/serialization/files') {
         if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
-        $query = $db->prepare('SELECT part_number AS partNumber, canonical_path AS filePath FROM files WHERE organization_id = ? AND part_number IS NOT NULL AND deleted_at IS NULL ORDER BY part_number');
+        $query = $db->prepare('SELECT part_number AS partNumber, canonical_path AS filePath FROM files WHERE organization_id = ? AND part_number IS NOT NULL ORDER BY part_number');
         $query->execute([$principal['organizationId']]);
         Runtime::respond(200, ['files' => $query->fetchAll()]);
     }
