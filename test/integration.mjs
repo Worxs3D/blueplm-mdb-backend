@@ -23,6 +23,11 @@ const server = process.env.BLUEPLM_PHP_TEST_SERVER ?? 'http://127.0.0.1:18080'
 const installationToken = 'integration-installation-token-must-be-at-least-32-chars'
 const password = 'Integration password 123!'
 const expectedOwner = process.env.BLUEPLM_EXPECTED_ROOT
+const preinstalledTest = process.env.BLUEPLM_PHP_PREINSTALLED_TEST === '1'
+assert.ok(
+  process.env.BLUEPLM_PHP_PREINSTALLED_TEST === undefined || preinstalledTest,
+  'BLUEPLM_PHP_PREINSTALLED_TEST must be omitted or exactly 1',
+)
 assert.ok(expectedOwner, 'BLUEPLM_EXPECTED_ROOT must identify the approved PHP owner worktree')
 const actualOwner = execFileSync('git', ['rev-parse', '--show-toplevel'], { cwd: process.cwd(), encoding: 'utf8' }).trim()
 assert.equal(resolve(process.cwd()), resolve(expectedOwner), 'test process CWD must be the approved PHP owner')
@@ -153,22 +158,26 @@ const deniedInstall = await fetch(`${server}/installer/commit`, {
 assert.equal(deniedInstall.status, 403)
 assert.equal((await deniedInstall.json()).databaseCommitState, 'not-committed')
 stagePendingEnvironment()
-const interruptedInstall = await requestStatus('/installer/commit', {
-  method: 'POST',
-  body: JSON.stringify({
-    installationToken,
-    action: 'install',
-    bootstrap: {
-      organizationName: 'Integration Org',
-      organizationSlug: 'Invalid Slug',
-      email: 'owner@example.test',
-      displayName: 'Owner',
-      password,
-    },
-  }),
-})
-assert.equal(interruptedInstall.status, 400)
-assert.equal(interruptedInstall.body.databaseCommitState, 'unknown')
+if (preinstalledTest) {
+  console.log('NOT RUN: cold-install invalid-slug 400/unknown check (preinstalled test fixture).')
+} else {
+  const interruptedInstall = await requestStatus('/installer/commit', {
+    method: 'POST',
+    body: JSON.stringify({
+      installationToken,
+      action: 'install',
+      bootstrap: {
+        organizationName: 'Integration Org',
+        organizationSlug: 'Invalid Slug',
+        email: 'owner@example.test',
+        displayName: 'Owner',
+        password,
+      },
+    }),
+  })
+  assert.equal(interruptedInstall.status, 400)
+  assert.equal(interruptedInstall.body.databaseCommitState, 'unknown')
+}
 stagePendingEnvironment()
 const installed = await request('/installer/commit', {
   method: 'POST',
@@ -567,7 +576,23 @@ await request(
 const userTeams = await request(`/users/${createdUser.id}/teams`, {}, token)
 assert.ok(userTeams.teams.some((team) => team.id === createdTeam.id))
 const teamMembers = await request(`/teams/${createdTeam.id}/members`, {}, token)
-assert.ok(teamMembers.members.some((member) => member.userId === createdUser.id))
+const createdTeamMember = teamMembers.members.find((member) => member.userId === createdUser.id)
+assert.ok(createdTeamMember)
+assert.equal(createdTeamMember.isTeamAdmin, false)
+assert.equal(typeof createdTeamMember.isTeamAdmin, 'boolean')
+execFileSync('docker', [
+  'compose', '-f', 'docker-compose.test.yml', 'exec', '-T', 'mariadb',
+  'mariadb', '-uroot', '-proot-test-password', 'blueplm', '-e',
+  `UPDATE team_members SET is_team_admin = 1 WHERE team_id = '${createdTeam.id}' AND user_id = '${createdUser.id}'`,
+], { cwd: process.cwd(), stdio: 'pipe' })
+const promotedTeamMember = (await request(`/teams/${createdTeam.id}/members`, {}, token)).members.find((member) => member.userId === createdUser.id)
+assert.equal(promotedTeamMember.isTeamAdmin, true)
+assert.equal(typeof promotedTeamMember.isTeamAdmin, 'boolean')
+assert.equal((await requestStatus(`/teams/${createdTeam.id}/module-defaults`, {
+  method: 'PUT',
+  body: JSON.stringify({ defaults: teamDefaults }),
+}, updatedMemberLogin.token)).status, 403)
+assert.deepEqual((await request(`/teams/${createdTeam.id}/members`, {}, foreignLogin.token)).members, [])
 const memberProfile = await request(`/users/${createdUser.id}/profile`, {}, token)
 assert.equal(memberProfile.user.id, createdUser.id)
 assert.ok(memberProfile.user.teams.some((team) => team.id === createdTeam.id))
@@ -1577,6 +1602,25 @@ await runCheckoutRequestIdRecoveryTests({
   duplicatePart, imported, workspace, token, updatedMemberLogin, vault, foreignOrgId, foreignUser, sameHashRequest,
 })
 await runCheckinReviewRegressionTests({ request, requestStatus, imported, vault, workspace, token })
+
+// Simulate an existing team_members table with rows from before migration 048.
+// Reapply the real migration through the maintenance route and verify legacy
+// rows receive the database default, without changing member-write behavior.
+execFileSync('docker', [
+  'compose', '-f', 'docker-compose.test.yml', 'exec', '-T', 'mariadb',
+  'mariadb', '-uroot', '-proot-test-password', 'blueplm', '-e',
+  'ALTER TABLE team_members DROP COLUMN is_team_admin; DELETE FROM schema_migrations WHERE migration = \'048_team_member_admin_flag.sql\'',
+], { cwd: process.cwd(), stdio: 'pipe' })
+const migratedTeamAdminFlag = await request('/admin/migrate', {
+  method: 'POST',
+  body: JSON.stringify({ maintenanceToken: 'integration-maintenance-token-must-be-at-least-32-chars' }),
+})
+assert.ok(migratedTeamAdminFlag.applied.includes('048_team_member_admin_flag.sql'))
+const legacyTeamMember = (await request(`/teams/${createdTeam.id}/members`, {}, token)).members.find((member) => member.userId === createdUser.id)
+assert.ok(legacyTeamMember, 'Legacy team-member fixture must exist before revision-comment deletion')
+assert.equal(legacyTeamMember.isTeamAdmin, false)
+assert.equal(typeof legacyTeamMember.isTeamAdmin, 'boolean')
+
 await runFileRevisionCommentIntegration({
   request,
   requestStatus,
