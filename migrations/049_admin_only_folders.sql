@@ -1,0 +1,2 @@
+-- Applied by Migrator::ensureAdminOnlyFoldersPolicy() so partially adopted
+-- legacy schemas can safely replay the column check and explicit defaulting.

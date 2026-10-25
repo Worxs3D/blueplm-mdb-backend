@@ -120,7 +120,7 @@ final class Installation
             $db->prepare('INSERT INTO organizations (id, name, slug) VALUES (?, ?, ?)')->execute([$organizationId, $organizationName, $slug]);
             $db->prepare('INSERT INTO users (id, email, display_name, password_hash) VALUES (?, ?, ?, ?)')->execute([$userId, $email, $displayName, Runtime::passwordHash($password)]);
             $db->prepare("INSERT INTO organization_memberships (organization_id, user_id, role) VALUES (?, ?, 'owner')")->execute([$organizationId, $userId]);
-            $db->prepare('INSERT INTO organization_settings (organization_id) VALUES (?)')->execute([$organizationId]);
+            $db->prepare('INSERT INTO organization_settings (organization_id, admin_only_folders) VALUES (?, ?)')->execute([$organizationId, '[]']);
             if ($vaultName !== '') {
                 $vaultId = Runtime::uuid();
                 $db->prepare('INSERT INTO vaults (id, organization_id, name, network_root) VALUES (?, ?, ?, ?)')
