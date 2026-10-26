@@ -1,0 +1,1 @@
+-- Applied by Migrator::ensureVaultMetadata() with column/constraint guards.

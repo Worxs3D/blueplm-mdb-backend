@@ -83,6 +83,32 @@ function supplierUrl(array $body, string $key): ?string
     return $value;
 }
 
+function vaultDescription(array $body, string $key, bool $required = false): ?string
+{
+    if (!array_key_exists($key, $body)) {
+        if ($required) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => "$key is required."]);
+        return null;
+    }
+    if ($body[$key] === null) return null;
+    if (!is_string($body[$key])) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => "$key must be a string or null."]);
+    if (preg_match('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/', $body[$key])) {
+        Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => "$key must not contain control characters."]);
+    }
+    $value = trim($body[$key]);
+    if (strlen($value) > 2000) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => "$key must be at most 2000 bytes."]);
+    return $value === '' ? null : $value;
+}
+
+function vaultName(array $body, string $key): string
+{
+    if (!is_string($body[$key] ?? null) || preg_match('/[\x00-\x1F\x7F]/', $body[$key])) {
+        Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => "$key must be a non-empty string without control characters."]);
+    }
+    $value = trim($body[$key]);
+    if ($value === '' || strlen($value) > 200) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => "$key must be a non-empty string up to 200 bytes."]);
+    return $value;
+}
+
 /** @return array<string, mixed> */
 function decodeOrganizationSetting(mixed $value): array
 {
@@ -2176,33 +2202,144 @@ try {
     }
     if ($method === 'GET' && $path === '/vaults') {
         if (in_array($principal['role'], ['owner', 'admin'], true)) {
-            $query = $db->prepare("SELECT id, name, network_root AS networkRoot, 'network' AS storageProvider, created_at AS createdAt FROM vaults WHERE organization_id = ? ORDER BY name");
+            $query = $db->prepare("SELECT v.id, v.name, v.description, v.network_root AS networkRoot, 'network' AS storageProvider, v.created_at AS createdAt, (s.default_vault_id = v.id) AS isDefault FROM vaults v LEFT JOIN organization_settings s ON s.organization_id = v.organization_id WHERE v.organization_id = ? ORDER BY v.name");
             $query->execute([$principal['organizationId']]);
         } elseif ($principal['role'] === 'guest') {
             $query = $db->prepare(
-                "SELECT v.id, v.name, v.network_root AS networkRoot, 'network' AS storageProvider, v.created_at AS createdAt FROM vaults v
+                "SELECT v.id, v.name, v.description, v.network_root AS networkRoot, 'network' AS storageProvider, v.created_at AS createdAt, (s.default_vault_id = v.id) AS isDefault FROM vaults v
                  JOIN vault_access a ON a.vault_id = v.id AND a.user_id = ?
+                 LEFT JOIN organization_settings s ON s.organization_id = v.organization_id
                  WHERE v.organization_id = ? ORDER BY v.name"
             );
             $query->execute([$principal['userId'], $principal['organizationId']]);
         } else {
             $query = $db->prepare(
-                "SELECT DISTINCT v.id, v.name, v.network_root AS networkRoot, 'network' AS storageProvider, v.created_at AS createdAt FROM vaults v
+                "SELECT DISTINCT v.id, v.name, v.description, v.network_root AS networkRoot, 'network' AS storageProvider, v.created_at AS createdAt, (s.default_vault_id = v.id) AS isDefault FROM vaults v
                  LEFT JOIN vault_access a ON a.vault_id = v.id AND a.user_id = ?
                  LEFT JOIN team_vault_access ta ON ta.vault_id = v.id
                  LEFT JOIN team_members tm ON tm.team_id = ta.team_id AND tm.user_id = ?
+                 LEFT JOIN organization_settings s ON s.organization_id = v.organization_id
                  WHERE v.organization_id = ? AND (a.user_id IS NOT NULL OR tm.user_id IS NOT NULL) ORDER BY v.name"
             );
             $query->execute([$principal['userId'], $principal['userId'], $principal['organizationId']]);
         }
-        Runtime::respond(200, ['vaults' => $query->fetchAll()]);
+        $vaults = $query->fetchAll();
+        foreach ($vaults as &$vault) $vault['isDefault'] = (bool)$vault['isDefault'];
+        unset($vault);
+        Runtime::respond(200, ['vaults' => $vaults]);
     }
     if ($method === 'POST' && $path === '/vaults') {
         if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
-        $body = Runtime::jsonBody(); $name = is_string($body['name'] ?? null) ? trim($body['name']) : ''; $provider = $body['storageProvider'] ?? 'network'; $networkRoot = is_string($body['networkRoot'] ?? null) ? trim($body['networkRoot']) : '';
-        if ($name === '' || strlen($name) > 200 || $provider !== 'network') Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid network vault name is required.']);
+        $body = Runtime::jsonBody(); $name = vaultName($body, 'name'); $provider = $body['storageProvider'] ?? 'network'; $networkRoot = is_string($body['networkRoot'] ?? null) ? trim($body['networkRoot']) : '';
+        if ($provider !== 'network') Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'A valid network vault name is required.']);
         if ($networkRoot === '' || strlen($networkRoot) > 1024) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'networkRoot is required for a network vault.']);
-        $id = Runtime::uuid(); $db->prepare('INSERT INTO vaults (id, organization_id, name, network_root) VALUES (?, ?, ?, ?)')->execute([$id, $principal['organizationId'], $name, $networkRoot]); Runtime::respond(201, ['id' => $id, 'name' => $name, 'networkRoot' => $networkRoot, 'storageProvider' => 'network', 'createdAt' => gmdate('c')]);
+        $description = vaultDescription($body, 'description');
+        $id = Runtime::uuid();
+        $isDefault = false;
+        $db->beginTransaction();
+        try {
+            $organization = $db->prepare('SELECT id FROM organizations WHERE id = ? FOR UPDATE');
+            $organization->execute([$principal['organizationId']]);
+            if (!$organization->fetch()) {
+                $db->rollBack();
+                Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Organization not found.']);
+            }
+
+            $vaultCount = $db->prepare('SELECT COUNT(*) FROM vaults WHERE organization_id = ?');
+            $vaultCount->execute([$principal['organizationId']]);
+            $isFirstVault = (int)$vaultCount->fetchColumn() === 0;
+            $currentDefault = $db->prepare('SELECT default_vault_id FROM organization_settings WHERE organization_id = ? FOR UPDATE');
+            $currentDefault->execute([$principal['organizationId']]);
+            $currentDefaultId = $currentDefault->fetchColumn();
+            $isDefault = $isFirstVault && ($currentDefaultId === false || $currentDefaultId === null);
+
+            $db->prepare('INSERT INTO vaults (id, organization_id, name, description, network_root) VALUES (?, ?, ?, ?, ?)')->execute([$id, $principal['organizationId'], $name, $description, $networkRoot]);
+            if ($isDefault) {
+                $db->prepare('INSERT INTO organization_settings (organization_id, default_vault_id) VALUES (?, ?) ON DUPLICATE KEY UPDATE default_vault_id = COALESCE(default_vault_id, VALUES(default_vault_id))')->execute([$principal['organizationId'], $id]);
+            }
+            $db->commit();
+        } catch (PDOException $error) {
+            if ($db->inTransaction()) $db->rollBack();
+            if ($error->getCode() === '23000') Runtime::respond(409, ['error' => 'ALREADY_EXISTS', 'message' => 'A vault with this name already exists.']);
+            throw $error;
+        } catch (Throwable $error) {
+            if ($db->inTransaction()) $db->rollBack();
+            throw $error;
+        }
+        Runtime::respond(201, ['id' => $id, 'name' => $name, 'description' => $description, 'networkRoot' => $networkRoot, 'storageProvider' => 'network', 'isDefault' => $isDefault, 'createdAt' => gmdate('c')]);
+    }
+    if ($method === 'PATCH' && preg_match('#^/vaults/([0-9a-f-]{36})$#i', $path, $matches)) {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $body = Runtime::jsonBody();
+        if (array_diff(array_keys($body), ['name', 'description']) !== []) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'Only name and description may be updated.']);
+        if ($body === []) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'At least one vault field is required.']);
+        $vaultId = strtolower($matches[1]);
+        $current = $db->prepare('SELECT id, name, description, network_root AS networkRoot, created_at AS createdAt FROM vaults WHERE id = ? AND organization_id = ?');
+        $current->execute([$vaultId, $principal['organizationId']]);
+        $vault = $current->fetch();
+        if (!$vault) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Vault not found.']);
+
+        $updates = []; $values = [];
+        if (array_key_exists('name', $body)) {
+            $name = vaultName($body, 'name');
+            $updates[] = 'name = ?'; $values[] = $name;
+        }
+        if (array_key_exists('description', $body)) {
+            $description = vaultDescription($body, 'description', true);
+            $updates[] = 'description = ?'; $values[] = $description;
+        }
+        $values[] = $vaultId; $values[] = $principal['organizationId'];
+        try {
+            $db->prepare('UPDATE vaults SET ' . implode(', ', $updates) . ' WHERE id = ? AND organization_id = ?')->execute($values);
+        } catch (PDOException $error) {
+            if ($error->getCode() === '23000') Runtime::respond(409, ['error' => 'ALREADY_EXISTS', 'message' => 'A vault with this name already exists.']);
+            throw $error;
+        }
+        $updated = $db->prepare('SELECT id, name, description, network_root AS networkRoot, created_at AS createdAt FROM vaults WHERE id = ? AND organization_id = ?');
+        $updated->execute([$vaultId, $principal['organizationId']]);
+        Runtime::respond(200, ['vault' => $updated->fetch()]);
+    }
+    if ($method === 'GET' && $path === '/organizations/current/default-vault') {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $query = $db->prepare('SELECT default_vault_id FROM organization_settings WHERE organization_id = ?');
+        $query->execute([$principal['organizationId']]);
+        $vaultId = $query->fetchColumn();
+        Runtime::respond(200, ['vaultId' => $vaultId === false ? null : $vaultId]);
+    }
+    if ($method === 'PUT' && $path === '/organizations/current/default-vault') {
+        if (!in_array($principal['role'], ['owner', 'admin'], true)) Runtime::respond(403, ['error' => 'FORBIDDEN', 'message' => 'Administrator role required.']);
+        $body = Runtime::jsonBody();
+        if (array_diff(array_keys($body), ['vaultId']) !== [] || !array_key_exists('vaultId', $body)) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'vaultId is required and must be a vault ID or null.']);
+        $vaultId = $body['vaultId'] ?? null;
+        if ($vaultId !== null && (!is_string($vaultId) || !preg_match('/^[0-9a-f-]{36}$/i', $vaultId))) Runtime::respond(400, ['error' => 'INVALID_REQUEST', 'message' => 'vaultId must be a vault ID or null.']);
+        $db->beginTransaction();
+        try {
+            $organization = $db->prepare('SELECT id FROM organizations WHERE id = ? FOR UPDATE');
+            $organization->execute([$principal['organizationId']]);
+            if (!$organization->fetch()) {
+                $db->rollBack();
+                Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Organization not found.']);
+            }
+            if ($vaultId !== null) {
+                $vault = $db->prepare('SELECT id FROM vaults WHERE id = ? AND organization_id = ? FOR UPDATE');
+                $vault->execute([$vaultId, $principal['organizationId']]);
+                if (!$vault->fetch()) {
+                    $db->rollBack();
+                    Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'Vault not found.']);
+                }
+            }
+            $db->prepare('INSERT INTO organization_settings (organization_id, default_vault_id) VALUES (?, ?) ON DUPLICATE KEY UPDATE default_vault_id = VALUES(default_vault_id)')->execute([$principal['organizationId'], $vaultId]);
+            Runtime::emitEvent($db, $principal['organizationId'], 'organization.default_vault_updated', $principal['organizationId'], ['vaultId' => $vaultId, 'updatedBy' => $principal['userId']]);
+            $db->commit();
+        } catch (PDOException $error) {
+            if ($db->inTransaction()) $db->rollBack();
+            if ($vaultId !== null && $error->getCode() === '23000') Runtime::respond(409, ['error' => 'VAULT_CHANGED', 'message' => 'The selected vault is no longer available. Reload the vault list and try again.']);
+            throw $error;
+        } catch (Throwable $error) {
+            if ($db->inTransaction()) $db->rollBack();
+            throw $error;
+        }
+        Runtime::respond(200, ['vaultId' => $vaultId]);
     }
     if ($method === 'GET' && $path === '/suppliers') {
         $query = $db->prepare('SELECT id, name, code, contact_email, contact_phone, website, city, state, country, is_active, is_approved, erp_id, erp_synced_at, created_at FROM suppliers WHERE organization_id = ? AND is_active = TRUE ORDER BY name');

@@ -37,6 +37,8 @@ final class Migrator
                     self::ensureModuleDefaultsColumns($db);
                 } elseif ($migration === '049_admin_only_folders.sql') {
                     self::ensureAdminOnlyFoldersPolicy($db);
+                } elseif ($migration === '050_vault_metadata.sql') {
+                    self::ensureVaultMetadata($db);
                 } elseif ($migration === '035_checkin_metadata_idempotency.sql') {
                     self::ensureCheckinMetadataColumns($db);
                     $db->exec($sql);
@@ -294,6 +296,32 @@ final class Migrator
              WHERE s.organization_id IS NULL'
         );
         $db->exec('UPDATE organization_settings SET admin_only_folders = JSON_ARRAY() WHERE admin_only_folders IS NULL');
+    }
+
+    private static function ensureVaultMetadata(PDO $db): void
+    {
+        $columnExists = $db->prepare(
+            'SELECT 1 FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ? LIMIT 1'
+        );
+        $columnExists->execute(['vaults', 'description']);
+        if (!$columnExists->fetchColumn()) $db->exec('ALTER TABLE vaults ADD COLUMN description TEXT NULL');
+
+        $columnExists->execute(['organization_settings', 'default_vault_id']);
+        if (!$columnExists->fetchColumn()) $db->exec('ALTER TABLE organization_settings ADD COLUMN default_vault_id CHAR(36) NULL');
+
+        $constraintExists = $db->prepare(
+            'SELECT 1 FROM information_schema.TABLE_CONSTRAINTS
+             WHERE CONSTRAINT_SCHEMA = DATABASE() AND TABLE_NAME = ? AND CONSTRAINT_NAME = ? LIMIT 1'
+        );
+        $constraintExists->execute(['organization_settings', 'fk_organization_settings_default_vault']);
+        if (!$constraintExists->fetchColumn()) {
+            $db->exec(
+                'ALTER TABLE organization_settings
+                 ADD CONSTRAINT fk_organization_settings_default_vault
+                 FOREIGN KEY (default_vault_id) REFERENCES vaults(id) ON DELETE SET NULL'
+            );
+        }
     }
 
     private static function addForeignKeyIfMissing(PDO $db, string $name, string $statement): void
