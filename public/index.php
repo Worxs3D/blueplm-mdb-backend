@@ -23,6 +23,7 @@ require dirname(__DIR__) . '/src/JobTitles.php';
 require dirname(__DIR__) . '/src/WorkflowReviewRounds.php';
 require dirname(__DIR__) . '/src/RFQReads.php';
 require dirname(__DIR__) . '/src/RFQWrites.php';
+require dirname(__DIR__) . '/src/VaultLifecycle.php';
 
 use BluePlm\Migrator;
 use BluePlm\AdminOnlyFolders;
@@ -44,6 +45,8 @@ use BluePlm\ColorSwatches;
 use BluePlm\ProfileContributions;
 use BluePlm\RFQReads;
 use BluePlm\RFQWrites;
+use BluePlm\VaultLifecycle;
+use BluePlm\VaultLifecycleFailure;
 use BluePlm\JobTitles;
 use BluePlm\WorkflowReviewRounds;
 
@@ -2199,6 +2202,33 @@ try {
     }
     if ($method === 'GET' && preg_match('#^/files/([0-9a-f-]{36})/ecos$#i', $path, $matches)) {
         $file = $db->prepare('SELECT vault_id FROM files WHERE id = ? AND organization_id = ? AND deleted_at IS NULL'); $file->execute([$matches[1], $principal['organizationId']]); $fileRow = $file->fetch(); if (!$fileRow) Runtime::respond(404, ['error' => 'NOT_FOUND', 'message' => 'File not found.']); Runtime::requireVault($db, $principal, $fileRow['vault_id']); $query = $db->prepare('SELECT fe.id, fe.notes, fe.created_at, e.id AS eco_id, e.eco_number, e.title, e.status FROM file_ecos fe JOIN ecos e ON e.id = fe.eco_id WHERE fe.file_id = ? AND e.organization_id = ?'); $query->execute([$matches[1], $principal['organizationId']]); Runtime::respond(200, ['ecos' => $query->fetchAll()]);
+    }
+    if ($method === 'GET' && preg_match('#^/vault-lifecycle-operations/([0-9a-f-]{36})$#i', $path, $matches)) {
+        try {
+            Runtime::respond(200, VaultLifecycle::status($db, $principal, strtolower($matches[1])));
+        } catch (VaultLifecycleFailure $error) {
+            $response = ['error' => $error->errorCode, 'message' => $error->getMessage()];
+            if ($error->operationId !== null) $response['operationId'] = $error->operationId;
+            Runtime::respond($error->status, $response);
+        }
+    }
+    if ($method === 'POST' && preg_match('#^/vaults/([0-9a-f-]{36})/clear$#i', $path, $matches)) {
+        try {
+            Runtime::respond(200, VaultLifecycle::execute($db, $principal, 'clear', strtolower($matches[1]), VaultLifecycle::requestBody()));
+        } catch (VaultLifecycleFailure $error) {
+            $response = ['error' => $error->errorCode, 'message' => $error->getMessage()];
+            if ($error->operationId !== null) $response['operationId'] = $error->operationId;
+            Runtime::respond($error->status, $response);
+        }
+    }
+    if ($method === 'DELETE' && preg_match('#^/vaults/([0-9a-f-]{36})$#i', $path, $matches)) {
+        try {
+            Runtime::respond(200, VaultLifecycle::execute($db, $principal, 'delete', strtolower($matches[1]), VaultLifecycle::requestBody()));
+        } catch (VaultLifecycleFailure $error) {
+            $response = ['error' => $error->errorCode, 'message' => $error->getMessage()];
+            if ($error->operationId !== null) $response['operationId'] = $error->operationId;
+            Runtime::respond($error->status, $response);
+        }
     }
     if ($method === 'GET' && $path === '/vaults') {
         if (in_array($principal['role'], ['owner', 'admin'], true)) {
